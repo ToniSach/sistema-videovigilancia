@@ -1,0 +1,90 @@
+# ==========================================
+# SISTEMA NVR - GITIGNORE
+# ==========================================
+
+# ----- Datos Sensibles -----
+.env
+.env.local
+.env.production
+*.key
+*.pem
+secrets/
+config/local_config.yaml
+
+# ----- Base de Datos y Archivos Binarios -----
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+data/surveillance.db
+data/surveillance.db-journal
+
+# ----- Grabaciones y Media (NUNCA subir videos) -----
+recordings/
+snapshots/
+clips/
+videos/
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.h264
+*.h265
+
+# ----- Modelos de IA (muy pesados) -----
+*.pt
+*.onnx
+*.engine
+*.tflite
+models/yolo/*
+!models/yolo/.gitkeep
+
+# ----- Python Cache -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ----- Logs -----
+*.log
+logs/
+logs/*.log
+
+# ----- IDEs y OS -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----- Testing -----
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+
+# ----- Qt/PySide -----
+*.pyc
+*.qmlc
+*.jsc
