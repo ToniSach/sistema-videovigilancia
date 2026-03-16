@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, Response, make_response
+from flask import Blueprint, request, jsonify, Response
 from flask_jwt_extended import jwt_required, decode_token
 from ...container import get_container
 from ...streaming.mjpeg_streamer import mjpeg_streamer
@@ -11,7 +11,11 @@ logger = logging.getLogger(__name__)
 
 def _get_service():
     """Helper para obtener el CameraService del contenedor."""
-    return get_container().get("camera_service")
+    service = get_container().get("camera_service")
+    if service is None:
+        logger.error("CameraService no está registrado en el contenedor")
+        raise RuntimeError("Servicio de cámaras no disponible")
+    return service
 
 
 @cameras_bp.route("/", methods=["GET"])
@@ -148,7 +152,7 @@ def discover_cameras():
 def get_camera_stream(camera_id: int):
     """
     Endpoint de streaming MJPEG.
-    NO requiere JWT en cookie/header, sino token en query param para compatibilidad con <img> tags.
+    NO requiere JWT en cookie/header, sino token en query param.
     """
     try:
         # Validar token manualmente desde query param
@@ -158,7 +162,6 @@ def get_camera_stream(camera_id: int):
             return jsonify({"success": False, "error": "Token requerido"}), 401
 
         try:
-            # Verificar token
             decode_token(token)
         except Exception:
             return jsonify({"success": False, "error": "Token inválido"}), 401

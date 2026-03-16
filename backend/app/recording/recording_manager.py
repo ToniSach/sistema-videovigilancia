@@ -8,17 +8,17 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-from ..events.event_manager import EventManager, EventData, event_manager
-from ..database.repositories.recording_repository import RecordingRepository
-from ..database.repositories.event_repository import EventRepository
-from ..database.models import Recording
-from ..config import settings
+from backend.app.events.event_manager import EventManager, EventData, event_manager
+from backend.app.database.repositories.recording_repository import RecordingRepository
+from backend.app.database.repositories.event_repository import EventRepository
+from backend.app.database.models import Recording
+from backend.app.config import settings
 
 
 class RecordingManager:
-    PRE_BUFFER_SIZE = 150  # ~5 segundos a 30fps
-    EVENT_RECORDING_DURATION = 10  # segundos post-evento
-    CONTINUOUS_SEGMENT_DURATION = 120  # segundos (2 minutos)
+    PRE_BUFFER_SIZE = 150
+    EVENT_RECORDING_DURATION = 10
+    CONTINUOUS_SEGMENT_DURATION = 120
 
     def __init__(self, recording_repo: RecordingRepository, event_repo: Optional[EventRepository] = None):
         self._recording_repo = recording_repo
@@ -26,20 +26,16 @@ class RecordingManager:
         self._recordings_dir = settings.RECORDINGS_PATH
         os.makedirs(self._recordings_dir, exist_ok=True)
 
-        # Pre-event buffers: camera_id → deque de (frame np.ndarray, timestamp float)
         self._pre_buffers: Dict[int, collections.deque] = {}
         self._pre_buffer_lock = threading.Lock()
 
-        # Estado de grabaciones de evento activas
         self._event_recordings: Dict[int, Dict] = {}
         self._event_recordings_lock = threading.Lock()
 
-        # Grabaciones continuas activas
         self._continuous_threads: Dict[int, threading.Thread] = {}
         self._continuous_running: Dict[int, bool] = {}
         self._continuous_lock = threading.Lock()
 
-        # Suscribirse a eventos
         event_manager.subscribe("motion", self._on_event)
         event_manager.subscribe("person", self._on_event)
         event_manager.subscribe("vehicle", self._on_event)
@@ -88,6 +84,7 @@ class RecordingManager:
 
     def _record_event_clip(self, camera_id: int, event_data: EventData) -> None:
         try:
+            # ✅ CORREGIDO: Usar camera_id en lugar de camera_name inexistente
             logging.info(f"Iniciando grabación de evento {event_data.event_type} para cámara {camera_id}")
 
             with self._pre_buffer_lock:

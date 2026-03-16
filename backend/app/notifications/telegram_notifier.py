@@ -6,9 +6,9 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from ..events.event_manager import EventManager, EventData, event_manager
-from ..database.models import SystemConfig
-from ..database.connection import db_manager
+from backend.app.events.event_manager import EventManager, EventData, event_manager
+from backend.app.database.models import SystemConfig
+from backend.app.database.connection import db_manager
 
 
 class TelegramNotifier:
@@ -24,29 +24,32 @@ class TelegramNotifier:
         logging.info("TelegramNotifier inicializado")
 
     def _load_config(self) -> None:
+        """Carga configuración desde SystemConfig (tabla key-value)"""
         try:
-            with db_manager.session_scope() as session:
-                config = session.query(SystemConfig).first()
-                if config:
-                    self._bot_token = config.telegram_bot_token or ""
-                    self._chat_id = config.telegram_chat_id or ""
-                    self._enabled = getattr(config, 'telegram_enabled', False)
+            with db_manager.get_session() as session:
+                configs = session.query(SystemConfig).all()
+                config_dict = {c.key: c.value for c in configs}
+                
+                self._bot_token = config_dict.get("telegram_bot_token", "")
+                self._chat_id = config_dict.get("telegram_chat_id", "")
+                self._enabled = config_dict.get("telegram_enabled", "false").lower() == "true"
 
-                    self._notify_types = set()
-                    if getattr(config, 'notify_person', True):
-                        self._notify_types.add("person")
-                    if getattr(config, 'notify_vehicle', True):
-                        self._notify_types.add("vehicle")
-                    if getattr(config, 'notify_motion', False):
-                        self._notify_types.add("motion")
-                    if getattr(config, 'notify_offline', True):
-                        self._notify_types.add("camera_offline")
-                    if getattr(config, 'notify_tampering', True):
-                        self._notify_types.add("tampering")
+                self._notify_types = set()
+                if config_dict.get("notify_person", "true").lower() == "true":
+                    self._notify_types.add("person")
+                if config_dict.get("notify_vehicle", "true").lower() == "true":
+                    self._notify_types.add("vehicle")
+                if config_dict.get("notify_motion", "false").lower() == "true":
+                    self._notify_types.add("motion")
+                if config_dict.get("notify_offline", "true").lower() == "true":
+                    self._notify_types.add("camera_offline")
+                if config_dict.get("notify_tampering", "true").lower() == "true":
+                    self._notify_types.add("tampering")
 
-                    logging.info(f"Config Telegram cargada: enabled={self._enabled}")
+                logging.info(f"Config Telegram cargada: enabled={self._enabled}")
         except Exception as e:
             logging.error(f"Error cargando config Telegram: {e}")
+            self._enabled = False
 
     def reload_config(self) -> None:
         with self._lock:
@@ -85,22 +88,16 @@ class TelegramNotifier:
         datetime_str = dt.strftime("%Y-%m-%d %H:%M:%S")
 
         message = (
-            f"{emoji} *Alerta de videovigilancia*
-
-"
-            f"Cámara: {event_data.camera_name}
-"
-            f"Tipo: {event_data.event_type}
-"
-            f"Hora: {datetime_str}
-"
+            f"{emoji} *Alerta de videovigilancia*\n\n"
+            f"Cámara ID: {event_data.camera_id}\n"
+            f"Tipo: {event_data.event_type}\n"
+            f"Hora: {datetime_str}\n"
             f"Confianza: {event_data.confidence:.0%}"
         )
 
         if event_data.metadata:
             for key, value in event_data.metadata.items():
-                message += f"
-{key}: {value}"
+                message += f"\n{key}: {value}"
 
         snapshot_path = event_data.metadata.get("snapshot_path") if event_data.metadata else None
         if snapshot_path and os.path.exists(snapshot_path):

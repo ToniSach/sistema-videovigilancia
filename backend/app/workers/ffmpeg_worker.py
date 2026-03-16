@@ -4,6 +4,7 @@ import numpy as np
 import logging
 import time
 import os
+import shutil
 from enum import Enum
 
 from ..database.models import Camera
@@ -17,22 +18,15 @@ class WorkerStatus(Enum):
     RECONNECTING = "reconnecting"
     STOPPED = "stopped"
     ERROR = "error"
+    FFMPEG_NOT_FOUND = "ffmpeg_not_found"
 
 
 class FFmpegWorker:
     """
-    Worker que ejecuta FFmpeg para capturar stream RTSP y alimentar el frame buffer.
-    Implementa reconexión automática y watchdog de frames.
+    Worker que ejecuta FFmpeg para capturar stream RTSP.
     """
 
     def __init__(self, camera: Camera, frame_buffer: CircularFrameBuffer):
-        """
-        Inicializa el worker FFmpeg.
-
-        Args:
-            camera: Instancia del modelo Camera con configuración
-            frame_buffer: Buffer donde depositar los frames capturados
-        """
         self.camera = camera
         self.frame_buffer = frame_buffer
         self.status = WorkerStatus.STARTING
@@ -41,34 +35,74 @@ class FFmpegWorker:
         self._running = False
         self._reconnect_attempts = 0
         self.MAX_RECONNECT = 10
-        self.WATCHDOG_TIMEOUT = 30  # Segundos sin frame antes de reiniciar
+        self.WATCHDOG_TIMEOUT = 30
         self._last_frame_time = time.time()
         self._logger = logging.getLogger(f"{__name__}.Cam{camera.id}")
+        
+        # Calcular tamaño de frame
+        self._frame_size = camera.resolution_width * camera.resolution_height * 3
+        
+        # ✅ Verificar FFmpeg al inicio
+        self._ffmpeg_path = self._find_ffmpeg_executable()
+        if not self._ffmpeg_path:
+            self.status = WorkerStatus.FFMPEG_NOT_FOUND
+            self._logger.error("FFmpeg no encontrado. Instale FFmpeg y añádalo al PATH del sistema.")
 
-        # Calcular tamaño de frame esperado
-        self._frame_size = camera.resolution_width * camera.resolution_height * 3  # BGR24 = 3 bytes/pixel
+    def _find_ffmpeg_executable(self) -> str | None:
+        """
+        Busca el ejecutable de FFmpeg en el sistema.
+        Retorna la ruta completa o None si no se encuentra.
+        """
+        # 1. Buscar en PATH
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path:
+            return ffmpeg_path
+            
+        # 2. Buscar en ubicaciones comunes de Windows
+        common_windows_paths = [
+            r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+            r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+            r"C:\ffmpeg\bin\ffmpeg.exe",
+            r"C:\Users\%USERNAME%\ffmpeg\bin\ffmpeg.exe",
+            r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",  # Chocolatey
+            r"C:\ProgramData\scoop\shims\ffmpeg.exe",      # Scoop
+        ]
+        
+        for path in common_windows_paths:
+            expanded_path = os.path.expandvars(path)
+            if os.path.exists(expanded_path):
+                self._logger.info(f"FFmpeg encontrado en: {expanded_path}")
+                return expanded_path
+                
+        return None
 
     def _build_ffmpeg_command(self) -> list[str]:
-        """
-        Construye el comando FFmpeg para capturar el stream.
-
-        Returns:
-            Lista de argumentos para subprocess
-        """
+        """Construye el comando FFmpeg."""
+        if not self._ffmpeg_path:
+            raise RuntimeError("FFmpeg no disponible")
+            
         return [
-            "ffmpeg",
+            self._ffmpeg_path,
             "-loglevel", "error",
-            "-rtsp_transport", "tcp",  # TCP para mayor estabilidad que UDP
+            "-rtsp_transport", "tcp",
             "-i", self.camera.rtsp_url,
-            "-vf", f"fps={self.camera.fps}",  # Forzar FPS objetivo
+            "-vf", f"fps={self.camera.fps}",
             "-f", "rawvideo",
-            "-pix_fmt", "bgr24",  # Formato compatible con OpenCV/numpy
-            "pipe:1"  # Salida a stdout
+            "-pix_fmt", "bgr24",
+            "pipe:1"
         ]
 
     def start(self) -> None:
-        """Inicia el worker en thread separado."""
+        """Inicia el worker."""
         if self._running:
+            return
+            
+        # ✅ Verificar FFmpeg antes de iniciar
+        if not self._ffmpeg_path:
+            self._logger.error("No se puede iniciar cámara: FFmpeg no está instalado")
+            self._logger.error("Descargue FFmpeg desde: https://www.gyan.dev/ffmpeg/builds/")
+            self._logger.error("O instale con: choco install ffmpeg   (si tiene Chocolatey)")
+            self.status = WorkerStatus.FFMPEG_NOT_FOUND
             return
 
         self._running = True
@@ -82,42 +116,35 @@ class FFmpegWorker:
         self._logger.info(f"Worker iniciado para cámara {self.camera.id}")
 
     def _worker_loop(self) -> None:
-        """
-        Loop principal del worker: mantiene FFmpeg corriendo con reconexión.
-        """
+        """Loop principal del worker."""
         while self._running and self._reconnect_attempts < self.MAX_RECONNECT:
             try:
                 self._start_ffmpeg()
 
-                # Si FFmpeg termina limpiamente y no estamos deteniendo, reconectar
                 if self._running:
                     self.status = WorkerStatus.RECONNECTING
                     self._reconnect_attempts += 1
-                    self._logger.warning(
-                        f"FFmpeg terminó, reintento {self._reconnect_attempts}/{self.MAX_RECONNECT}"
-                    )
+                    self._logger.warning(f"Reintento {self._reconnect_attempts}/{self.MAX_RECONNECT}")
                     time.sleep(5)
                 else:
                     break
 
+            except FileNotFoundError as e:
+                self._logger.error(f"FFmpeg no encontrado: {e}")
+                self.status = WorkerStatus.FFMPEG_NOT_FOUND
+                break  # No reintentar si falta FFmpeg
             except Exception as e:
                 self._logger.error(f"Error en worker loop: {e}")
                 self._reconnect_attempts += 1
                 if self._reconnect_attempts < self.MAX_RECONNECT:
                     time.sleep(5)
 
-        # Si agotamos intentos
         if self._reconnect_attempts >= self.MAX_RECONNECT:
             self.status = WorkerStatus.ERROR
-            self._logger.error("Máximos reintentos alcanzados, cámara offline")
-            # Aquí se podría emitir evento camera_offline
-        else:
-            self.status = WorkerStatus.STOPPED
+            self._logger.error("Máximos reintentos alcanzados")
 
     def _start_ffmpeg(self) -> None:
-        """
-        Inicia el proceso FFmpeg y lee frames desde stdout.
-        """
+        """Inicia el proceso FFmpeg."""
         cmd = self._build_ffmpeg_command()
         height = self.camera.resolution_height
         width = self.camera.resolution_width
@@ -127,7 +154,7 @@ class FFmpegWorker:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=self._frame_size * 2  # Buffer para 2 frames
+                bufsize=self._frame_size * 2
             )
 
             self.status = WorkerStatus.RUNNING
@@ -136,30 +163,28 @@ class FFmpegWorker:
 
             self._logger.info(f"FFmpeg iniciado para {self.camera.rtsp_url}")
 
-            # Loop de lectura de frames
             while self._running:
-                # Leer exactamente un frame completo
                 raw = self._process.stdout.read(self._frame_size)
 
                 if len(raw) < self._frame_size:
-                    # FFmpeg cerró o error
                     if self._process.poll() is not None:
-                        self._logger.warning("FFmpeg terminó inesperadamente")
+                        stderr = self._process.stderr.read().decode('utf-8', errors='ignore')
+                        if stderr:
+                            self._logger.error(f"FFmpeg error: {stderr}")
                         break
                     continue
 
-                # Convertir bytes a numpy array
                 frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
-
-                # Entregar al buffer
                 self.frame_buffer.put(frame)
                 self._last_frame_time = time.time()
 
-                # Watchdog: si no hay frames por mucho tiempo, reiniciar
                 if time.time() - self._last_frame_time > self.WATCHDOG_TIMEOUT:
-                    self._logger.error("Watchdog timeout - no hay frames nuevos")
+                    self._logger.error("Watchdog timeout - no hay frames")
                     break
 
+        except FileNotFoundError:
+            self._logger.error("FFmpeg executable no encontrado")
+            raise
         except Exception as e:
             self._logger.error(f"Error en FFmpeg: {e}")
             raise
@@ -173,7 +198,7 @@ class FFmpegWorker:
                 self._process = None
 
     def stop(self) -> None:
-        """Detiene el worker FFmpeg de manera ordenada."""
+        """Detiene el worker."""
         self._running = False
         self.status = WorkerStatus.STOPPED
 
@@ -192,16 +217,13 @@ class FFmpegWorker:
         self._logger.info(f"Worker detenido para cámara {self.camera.id}")
 
     def get_status(self) -> dict:
-        """
-        Retorna estado actual del worker.
-
-        Returns:
-            Diccionario con información de estado
-        """
+        """Retorna estado actual."""
         return {
             "camera_id": self.camera.id,
             "status": self.status.value,
             "reconnect_attempts": self._reconnect_attempts,
             "last_frame_time": self._last_frame_time,
-            "seconds_since_last_frame": time.time() - self._last_frame_time if self._last_frame_time else None
+            "seconds_since_last_frame": time.time() - self._last_frame_time if self._last_frame_time else None,
+            "ffmpeg_found": self._ffmpeg_path is not None,
+            "ffmpeg_path": self._ffmpeg_path
         }

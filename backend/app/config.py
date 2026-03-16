@@ -53,6 +53,9 @@ class Settings:
             self.SERVER_HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
             self.SERVER_PORT: int = int(os.getenv("SERVER_PORT", "5000"))
             
+            # Asegurar que los directorios existen
+            self._ensure_directories()
+            
             logger.info("Configuración cargada exitosamente")
             
         except ValueError as e:
@@ -62,6 +65,16 @@ class Settings:
             logger.error(f"Error inesperado al cargar configuración: {e}")
             raise
     
+    def _ensure_directories(self) -> None:
+        """Crea los directorios necesarios si no existen."""
+        # Directorio de base de datos
+        db_dir = os.path.dirname(self.DATABASE_PATH)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        
+        # Directorio de grabaciones
+        os.makedirs(self.RECORDINGS_PATH, exist_ok=True)
+    
     def get_database_url(self) -> str:
         """
         Genera la URL de conexión a la base de datos SQLite.
@@ -69,11 +82,6 @@ class Settings:
         Returns:
             str: URL de conexión SQLAlchemy (sqlite:///path/to/db)
         """
-        # Asegurar que el directorio de datos existe
-            db_dir = os.path.dirname(self.DATABASE_PATH)
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-        
         return f"sqlite:///{self.DATABASE_PATH}"
 
 

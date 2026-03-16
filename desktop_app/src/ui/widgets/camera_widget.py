@@ -1,9 +1,9 @@
-
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from PySide6.QtCore import Qt, QUrl, QTimer
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PySide6.QtGui import QPixmap
-from ...services.api_client import api_client
+# ✅ CORREGIDO: Import relativo
+from services.api_client import api_client
 
 class CameraWidget(QWidget):
     def __init__(self, camera_id: int, camera_name: str, parent=None):
@@ -68,11 +68,12 @@ class CameraWidget(QWidget):
 
         # Look for JPEG frames (start: 0xFFD8, end: 0xFFD9)
         while True:
-            start_idx = self._buffer.find(b'\\xff\\xd8')
+            # ✅ CORREGIDO: Bytes literales correctos
+            start_idx = self._buffer.find(b'\xff\xd8')
             if start_idx == -1:
                 break
 
-            end_idx = self._buffer.find(b'\\xff\\xd9', start_idx)
+            end_idx = self._buffer.find(b'\xff\xd9', start_idx)
             if end_idx == -1:
                 break
 

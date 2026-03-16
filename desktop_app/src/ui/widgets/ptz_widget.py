@@ -5,7 +5,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, QObject, Signal
 from PySide6.QtGui import QMouseEvent
-from ...services.api_client import api_client
+# ✅ CORREGIDO: Import relativo
+from services.api_client import api_client
 
 class PTZControlButton(QPushButton):
     def __init__(self, text, direction, parent=None):

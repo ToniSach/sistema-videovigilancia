@@ -1,4 +1,3 @@
-
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
     QPushButton, QComboBox, QLabel, QDialog,
@@ -6,10 +5,11 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QProgressDialog, QListWidget,
     QListWidgetItem, QMessageBox
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject
-from ..services.api_client import api_client
-from .widgets.camera_widget import CameraWidget
-from .widgets.ptz_widget import PTZWidget  # Se crea en el siguiente script
+from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QCoreApplication
+from PySide6.QtGui import QGuiApplication
+from ui.widgets.camera_widget import CameraWidget
+from ui.widgets.ptz_widget import PTZWidget
+from services.api_client import api_client
 
 class CameraCell(QWidget):
     camera_selected = Signal(int)
@@ -52,7 +52,6 @@ class CameraCell(QWidget):
         self._layout.addWidget(self._camera_widget)
         self._empty_widget.hide()
 
-        # Enable clicking to select
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def clear(self):
@@ -70,8 +69,6 @@ class CameraCell(QWidget):
         super().mousePressEvent(event)
 
     def _on_assign_clicked(self):
-        # This would open a dialog to select from available cameras
-        # Parent handles the actual assignment logic
         pass
 
 class Worker(QObject):
@@ -136,14 +133,13 @@ class CamerasView(QWidget):
             cell.camera_selected.connect(self._on_camera_selected)
             self._cells.append(cell)
 
-        self._update_grid_layout(1)  # Start with 1
+        self._update_grid_layout(1)
 
-        # PTZ Panel (bottom)
+        # PTZ Panel
         self._ptz_container = QWidget()
         ptz_layout = QVBoxLayout(self._ptz_container)
         ptz_label = QLabel("Controles PTZ")
         ptz_layout.addWidget(ptz_label)
-        # PTZWidget placeholder - se conectará cuando exista
         self._ptz_placeholder = QLabel("Seleccione una cámara con PTZ")
         ptz_layout.addWidget(self._ptz_placeholder)
         layout.addWidget(self._ptz_container)
@@ -152,12 +148,11 @@ class CamerasView(QWidget):
         # Refresh timer
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh_cameras)
-        self._refresh_timer.start(30000)  # 30 seconds
+        self._refresh_timer.start(30000)
 
         self.refresh_cameras()
 
     def _update_grid_layout(self, count: int):
-        # Clear grid
         while self._grid.count():
             item = self._grid.takeAt(0)
             if item.widget():
@@ -168,7 +163,7 @@ class CamerasView(QWidget):
             self._cells[0].show()
             for i in range(1, 4):
                 self._cells[i].hide()
-        else:  # 4 cameras
+        else:
             for i in range(4):
                 row = i // 2
                 col = i % 2
@@ -182,7 +177,6 @@ class CamerasView(QWidget):
             self._update_grid_layout(4)
 
     def refresh_cameras(self):
-        # Run in thread to avoid blocking
         self._thread = QThread()
         self._worker = Worker(api_client.get_cameras)
         self._worker.moveToThread(self._thread)
@@ -193,16 +187,21 @@ class CamerasView(QWidget):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
-    def _on_cameras_loaded(self, cameras: list):
+    def _on_cameras_loaded(self, response):
+        # Extraer lista del response
+        cameras = []
+        if isinstance(response, dict) and "data" in response:
+            cameras = response["data"]
+        elif isinstance(response, list):
+            cameras = response
+            
         if not isinstance(cameras, list):
             return
 
         active_cameras = [c for c in cameras if c.get("is_active")]
 
-        # Assign to cells
         for i, cell in enumerate(self._cells):
             if i < len(active_cameras):
-                # Only update if different camera
                 if cell.camera_id != active_cameras[i].get("id"):
                     cell.set_camera(active_cameras[i])
             else:
@@ -211,15 +210,18 @@ class CamerasView(QWidget):
 
     def _on_camera_selected(self, camera_id: int):
         self._active_camera_id = camera_id
-        # Show PTZ controls if camera has PTZ
-        # For now, just show container
         self._ptz_container.show()
-        # TODO: Initialize PTZWidget with camera_id when available
 
     def _on_discover(self):
-        progress = QProgressDialog("Buscando cámaras...", "Cancelar", 0, 0, self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.show()
+        # ✅ CORREGIDO: Crear diálogo de progreso que no bloquee
+        self._progress = QProgressDialog("Buscando cámaras ONVIF...", None, 0, 0, self)
+        self._progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._progress.setMinimumDuration(0)
+        self._progress.setValue(0)
+        self._progress.show()
+        
+        # Procesar eventos para mostrar el diálogo inmediatamente
+        QCoreApplication.processEvents()
 
         def discover():
             return api_client.discover_cameras()
@@ -229,13 +231,13 @@ class CamerasView(QWidget):
         self._discover_worker.moveToThread(self._discover_thread)
         self._discover_thread.started.connect(self._discover_worker.run)
 
-        def on_finished(cameras):
-            progress.close()
-            self._show_discover_results(cameras)
+        def on_finished(result):
+            self._progress.close()
+            self._on_discover_results(result)
             self._discover_thread.quit()
 
         def on_error(msg):
-            progress.close()
+            self._progress.close()
             QMessageBox.critical(self, "Error", f"Error al descubrir: {msg}")
             self._discover_thread.quit()
 
@@ -245,20 +247,28 @@ class CamerasView(QWidget):
         self._discover_thread.finished.connect(self._discover_thread.deleteLater)
         self._discover_thread.start()
 
-    def _show_discover_results(self, cameras: list):
+    def _on_discover_results(self, response):
+        cameras = []
+        if isinstance(response, dict) and "data" in response:
+            cameras = response["data"]
+        elif isinstance(response, list):
+            cameras = response
+            
         if not cameras:
-            QMessageBox.information(self, "Descubrimiento", "No se encontraron cámaras")
+            QMessageBox.information(self, "Descubrimiento", "No se encontraron cámaras en la red.")
             return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Cámaras descubiertas")
+        dialog.setWindowTitle(f"Cámaras descubiertas ({len(cameras)})")
         dialog.setMinimumSize(400, 300)
 
         layout = QVBoxLayout(dialog)
         list_widget = QListWidget()
 
         for cam in cameras:
-            item_text = f"{cam.get('name', 'Unknown')} - {cam.get('ip_address', 'No IP')}"
+            ip = cam.get('ip_address', cam.get('ip', 'No IP'))
+            name = cam.get('name', 'Unknown')
+            item_text = f"{name}\nIP: {ip}"
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, cam)
             list_widget.addItem(item)
@@ -280,13 +290,32 @@ class CamerasView(QWidget):
     def _add_discovered_camera(self, list_widget: QListWidget, dialog: QDialog):
         current = list_widget.currentItem()
         if not current:
+            QMessageBox.warning(self, "Atención", "Seleccione una cámara primero")
             return
 
         cam_data = current.data(Qt.ItemDataRole.UserRole)
         dialog.close()
 
-        # Add camera
-        result = api_client.add_camera(cam_data)
+        camera_payload = {
+            "name": cam_data.get('name', 'Cámara ONVIF'),
+            "ip_address": cam_data.get('ip_address', cam_data.get('ip', '')),
+            "rtsp_url": cam_data.get('rtsp_url', ''),
+            "onvif_url": cam_data.get('onvif_url', ''),
+            "username": cam_data.get('username', 'admin'),
+            "password": cam_data.get('password', 'admin'),
+            "profile_token": cam_data.get('profile_token', ''),
+            "is_active": True,
+            "has_ai": False,
+            "has_ptz": cam_data.get('has_ptz', False),
+            "has_leds": cam_data.get('has_leds', False),
+            "has_audio": cam_data.get('has_audio', False),
+            "is_dual_lens": False,
+            "fps": cam_data.get('fps', 15),
+            "resolution_width": cam_data.get('resolution_width', 1920),
+            "resolution_height": cam_data.get('resolution_height', 1080)
+        }
+
+        result = api_client.add_camera(camera_payload)
         if result:
             QMessageBox.information(self, "Éxito", "Cámara agregada correctamente")
             self.refresh_cameras()
@@ -327,10 +356,12 @@ class AddCameraDialog(QDialog):
         layout.addRow("ONVIF URL:", self.onvif_input)
 
         self.username_input = QLineEdit()
+        self.username_input.setText("admin")
         layout.addRow("Usuario:", self.username_input)
 
         self.password_input = QLineEdit()
         self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_input.setText("admin")
         layout.addRow("Contraseña:", self.password_input)
 
         self.active_check = QCheckBox("Activa")
