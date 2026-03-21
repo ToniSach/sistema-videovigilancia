@@ -88,3 +88,6 @@ htmlcov/
 *.pyc
 *.qmlc
 *.jsc
+backend/tests/img3.jpg
+backend/tests/img4.jpg
+backend/tests/img5.jpg
