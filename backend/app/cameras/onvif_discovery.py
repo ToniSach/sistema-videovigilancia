@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QCoreApplication
 from PySide6.QtGui import QGuiApplication
-from ui.widgets.camera_widget import CameraWidget
+#from ui.widgets.camera_widget import CameraWidget
 from ui.widgets.ptz_widget import PTZWidget
 from services.api_client import api_client
 
@@ -17,7 +17,7 @@ class CameraCell(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.camera_id: int | None = None
-        self._camera_widget: CameraWidget | None = None
+        #self._camera_widget: CameraWidget | None = None
 
         self.setMinimumSize(320, 240)
         self.setStyleSheet("background-color: #2a2a2a; border: 2px solid #444;")
@@ -45,7 +45,7 @@ class CameraCell(QWidget):
         self.clear()
         self.camera_id = camera_data.get("id")
         camera_name = camera_data.get("name", f"Cámara {self.camera_id}")
-        self._camera_widget = CameraWidget(self.camera_id, camera_name)
+        #self._camera_widget = CameraWidget(self.camera_id, camera_name)
         self._layout.addWidget(self._camera_widget)
         self._empty_widget.hide()
         self.setCursor(Qt.CursorShape.PointingHandCursor)

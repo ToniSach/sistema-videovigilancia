@@ -57,22 +57,31 @@ class AIService:
 
         logger.debug("Callback de eventos asignado a AIService")
 
-    def _handle_detection(self, camera_id: int, class_name: str, confidence: float, frame) -> None:
+    def _handle_detection(self, camera_id: int, class_name: str, confidence: float, frame, metadata: dict = None) -> None:
         """
         Handler interno para detecciones de schedulers.
-        Construye el evento y llama al callback del EventManager.
+        Recibe metadata con count (cantidad de objetos detectados).
         """
-
         if self._event_callback:
+            event_metadata = metadata or {}
+            event_metadata["detected_class"] = class_name
+            
+            # Si hay múltiples objetos, incluir el conteo en el mensaje
+            if metadata and metadata.get("count", 1) > 1:
+                event_metadata["object_count"] = metadata["count"]
+                logger.info(f"Detección múltiple: {metadata['count']} {class_name}s")
+            
             self._event_callback(
                 camera_id,
                 "ai_detection",
                 class_name,
                 confidence,
-                {"detected_class": class_name}
+                event_metadata
             )
 
     def activate_ai(self, camera_id: int, mode: str = "low_cpu") -> bool:
+        # Esto significa: si detecta una persona, espera 30s antes de alertar "persona" otra vez
+        scheduler = AIScheduler(camera_id, mode, cooldown_seconds=30)
         """
         Activa el procesamiento de IA para una cámara.
         
@@ -99,7 +108,7 @@ class AIService:
                 del self._schedulers[camera_id]
 
             # Crear nuevo scheduler
-            scheduler = AIScheduler(camera_id, mode)
+            scheduler = AIScheduler(camera_id, mode, cooldown_seconds=30)
 
             # Asignar callback si existe
             if self._event_callback:
