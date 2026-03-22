@@ -25,8 +25,8 @@ if str(project_dir) not in sys.path:
 # =============================================================================
 # CONFIGURACIÓN OBLIGATORIA - REEMPLAZA ESTOS VALORES
 # =============================================================================
-BOT_TOKEN = "8520537600:AAG2LQoESqyRZJsNr_WY3Y1fGCvvHFlFzvE"  # Tu token actual
-CHAT_ID = "1383506337"  # Tu Chat ID de @userinfobot
+BOT_TOKEN = "34567890"  # Tu token actual
+CHAT_ID = "3456789"  # Tu Chat ID de @userinfobot
 # =============================================================================
 
 if BOT_TOKEN == "TU_BOT_TOKEN_AQUI" or CHAT_ID == "TU_CHAT_ID_AQUI":
