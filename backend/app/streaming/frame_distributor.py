@@ -2,6 +2,7 @@ import threading
 import logging
 import time
 from typing import Callable, Dict
+from concurrent.futures import ThreadPoolExecutor
 
 from .frame_buffer import CircularFrameBuffer, FrameData
 
@@ -9,15 +10,16 @@ from .frame_buffer import CircularFrameBuffer, FrameData
 class FrameDistributor:
     """
     Distribuye frames desde el buffer a múltiples consumidores (subscribers).
-    Cada consumidor recibe los frames en un thread separado para no bloquear.
+    Usa ThreadPoolExecutor para limitar creación de threads y reutilizar workers.
     """
 
-    def __init__(self, camera_id: int):
+    def __init__(self, camera_id: int, max_workers: int = 4):
         """
         Inicializa el distribuidor de frames.
 
         Args:
             camera_id: ID de la cámara asociada
+            max_workers: Número máximo de threads workers para callbacks (default 4)
         """
         self.camera_id = camera_id
         self._consumers: Dict[str, Callable[[FrameData], None]] = {}
@@ -25,6 +27,8 @@ class FrameDistributor:
         self._running = False
         self._thread: threading.Thread | None = None
         self._logger = logging.getLogger(__name__)
+        # CORRECCIÓN: Pool de threads reutilizable en lugar de crear uno nuevo por frame
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"Distributor-{camera_id}")
 
     def register_consumer(self, name: str, callback: Callable[[FrameData], None]) -> None:
         """
@@ -89,18 +93,13 @@ class FrameDistributor:
                     with self._lock:
                         consumers_snapshot = dict(self._consumers)
 
-                    # Entregar a cada consumidor en thread separado para no bloquear
+                    # CORRECCIÓN: Usar executor en lugar de crear threads nuevos
                     for name, callback in consumers_snapshot.items():
                         try:
-                            consumer_thread = threading.Thread(
-                                target=callback,
-                                args=(frame_data,),
-                                daemon=True,
-                                name=f"Consumer-{name}-Cam{self.camera_id}"
-                            )
-                            consumer_thread.start()
+                            # Submit al pool de threads existente
+                            self._executor.submit(self._safe_callback, name, callback, frame_data)
                         except Exception as e:
-                            self._logger.error(f"Error al iniciar thread para consumer {name}: {e}")
+                            self._logger.error(f"Error al encolar callback para consumer {name}: {e}")
 
                 # Limitar a ~30fps máximo (33ms entre frames)
                 time.sleep(0.033)
@@ -109,9 +108,21 @@ class FrameDistributor:
                 self._logger.error(f"Error en distribution loop: {e}")
                 time.sleep(0.1)
 
+    def _safe_callback(self, name: str, callback: Callable[[FrameData], None], frame_data: FrameData) -> None:
+        """
+        Wrapper seguro para ejecutar callbacks sin propagar excepciones al executor.
+        """
+        try:
+            callback(frame_data)
+        except Exception as e:
+            self._logger.error(f"Error en consumer '{name}' de cámara {self.camera_id}: {e}")
+
     def stop(self) -> None:
-        """Detiene el distribuidor de frames."""
+        """Detiene el distribuidor de frames y libera recursos del pool."""
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
-            self._logger.info(f"FrameDistributor detenido para cámara {self.camera_id}")
+        
+        # CORRECCIÓN: Cerrar el executor limpiamente
+        self._executor.shutdown(wait=False)
+        self._logger.info(f"FrameDistributor detenido para cámara {self.camera_id}")

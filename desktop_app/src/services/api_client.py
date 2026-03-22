@@ -1,233 +1,221 @@
+"""
+Cliente HTTP para API backend con manejo de JWT y refresh automático.
+"""
+import json
+import logging
+from typing import Optional, Dict, Any, Callable
+from dataclasses import dataclass
 
 import requests
-import logging
-import threading
-from typing import Any
+from PySide6.QtCore import QObject, Signal, QThreadPool, QRunnable
 
-class APIClient:
+from desktop_app.src.config import config
+from desktop_app.src.models.user import AuthTokens, User
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class APIResponse:
+    """Respuesta estandarizada de API."""
+    success: bool
+    data: Any = None
+    error: Optional[str] = None
+    status_code: int = 200
+
+
+class APIWorker(QRunnable):
+    """Worker para requests HTTP en background."""
+    
+    def __init__(self, func: Callable, callback: Optional[Callable] = None):
+        super().__init__()
+        self.func = func
+        self.callback = callback
+        self.setAutoDelete(True)
+    
+    def run(self):
+        try:
+            result = self.func()
+            if self.callback:
+                self.callback(result)
+        except Exception as e:
+            logger.error(f"Error en APIWorker: {e}")
+            if self.callback:
+                self.callback(APIResponse(success=False, error=str(e), status_code=0))
+
+
+class APIClient(QObject):
+    """Cliente API singleton con manejo de tokens."""
+    
+    # Señales
+    auth_error = Signal()  # Token inválido, requerir re-login
+    request_error = Signal(str)  # Error general
+    
     _instance = None
-    _lock = threading.Lock()
-
+    
     def __new__(cls):
         if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
+            cls._instance = super().__new__(cls)
         return cls._instance
-
+    
     def __init__(self):
-        if hasattr(self, '_initialized') and self._initialized:
+        if hasattr(self, '_initialized'):
             return
+        super().__init__()
         self._initialized = True
-        self.base_url = "http://127.0.0.1:5000"
-        self.access_token: str | None = None
-        self.refresh_token: str | None = None
-        self._request_lock = threading.Lock()
-
-    def _headers(self) -> dict:
-        if self.access_token:
-            return {
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "application/json"
-            }
-        return {"Content-Type": "application/json"}
-
-    def _request(self, method: str, endpoint: str, **kwargs) -> dict | list | None:
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        })
+        self.tokens: Optional[AuthTokens] = None
+        self._thread_pool = QThreadPool.globalInstance()
+        self._base_url = config.API_BASE_URL
+        
+        logger.info("APIClient inicializado")
+    
+    def set_tokens(self, tokens: AuthTokens):
+        """Establece tokens de autenticación."""
+        self.tokens = tokens
+        self.session.headers["Authorization"] = f"Bearer {tokens.access_token}"
+    
+    def clear_tokens(self):
+        """Limpia tokens (logout)."""
+        self.tokens = None
+        self.session.headers.pop("Authorization", None)
+    
+    def _refresh_token_if_needed(self) -> bool:
+        """Intenta refrescar token si es necesario."""
+        if not self.tokens:
+            return False
+        
         try:
-            with self._request_lock:
-                response = requests.request(
-                    method,
-                    f"{self.base_url}{endpoint}",
-                    headers=self._headers(),
-                    timeout=10,
-                    **kwargs
-                )
-
-                if response.status_code == 401 and self.refresh_token:
-                    if self._do_refresh():
-                        # Retry once with new token
-                        response = requests.request(
-                            method,
-                            f"{self.base_url}{endpoint}",
-                            headers=self._headers(),
-                            timeout=10,
-                            **kwargs
-                        )
-                    else:
-                        return None
-
-                if response.status_code >= 400:
-                    logging.error(f"API error {response.status_code}: {response.text}")
-                    return None
-
-                if response.status_code == 204:
-                    return {}
-
-                return response.json()
-
-        except requests.exceptions.ConnectionError:
-            logging.error("No se puede conectar con el backend")
-            return None
-        except Exception as e:
-            logging.error(f"Error en request: {e}")
-            return None
-
-    def _do_refresh(self) -> bool:
-        try:
-            headers = {"Authorization": f"Bearer {self.refresh_token}"}
-            response = requests.post(
-                f"{self.base_url}/api/v1/auth/refresh",
-                headers=headers,
+            response = self.session.post(
+                f"{self._base_url}/auth/refresh",
+                headers={"Authorization": f"Bearer {self.tokens.refresh_token}"},
                 timeout=10
             )
-            if response.ok:
+            if response.status_code == 200:
                 data = response.json()
-                self.access_token = data.get("access_token")
+                self.tokens.access_token = data.get("access_token")
+                self.session.headers["Authorization"] = f"Bearer {self.tokens.access_token}"
                 return True
-            return False
-        except Exception:
-            return False
-
-    # Auth methods
-    def login(self, username: str, password: str) -> dict | None:
-        response = self._request(
-            "POST",
-            "/api/v1/auth/login",
-            json={"username": username, "password": password}
+        except Exception as e:
+            logger.error(f"Error refrescando token: {e}")
+        
+        return False
+    
+    def _make_request(self, method: str, endpoint: str, 
+                     data: Dict = None, 
+                     params: Dict = None,
+                     stream: bool = False) -> APIResponse:
+        """Ejecuta request síncrono."""
+        url = f"{self._base_url}/{endpoint.lstrip('/')}"
+        
+        try:
+            if method == "GET":
+                response = self.session.get(url, params=params, stream=stream, timeout=config.TIMEOUT)
+            elif method == "POST":
+                response = self.session.post(url, json=data, timeout=config.TIMEOUT)
+            elif method == "PUT":
+                response = self.session.put(url, json=data, timeout=config.TIMEOUT)
+            elif method == "PATCH":
+                response = self.session.patch(url, json=data, timeout=config.TIMEOUT)
+            elif method == "DELETE":
+                response = self.session.delete(url, json=data, timeout=config.TIMEOUT)
+            else:
+                return APIResponse(success=False, error=f"Método no soportado: {method}")
+            
+            # Manejar 401 Unauthorized
+            if response.status_code == 401:
+                if self._refresh_token_if_needed():
+                    return self._make_request(method, endpoint, data, params, stream)
+                else:
+                    self.auth_error.emit()
+                    return APIResponse(success=False, error="Sesión expirada", status_code=401)
+            
+            if stream:
+                return APIResponse(success=True, data=response, status_code=response.status_code)
+            
+            try:
+                json_data = response.json()
+                return APIResponse(
+                    success=json_data.get("success", response.status_code < 400),
+                    data=json_data.get("data"),
+                    error=json_data.get("error"),
+                    status_code=response.status_code
+                )
+            except:
+                return APIResponse(
+                    success=response.status_code < 400,
+                    data=response.text,
+                    status_code=response.status_code
+                )
+                
+        except requests.RequestException as e:
+            logger.error(f"Request error: {e}")
+            return APIResponse(success=False, error=str(e), status_code=0)
+    
+    def request_async(self, method: str, endpoint: str,
+                     callback: Callable[[APIResponse], None],
+                     data: Dict = None,
+                     params: Dict = None,
+                     stream: bool = False):
+        """Ejecuta request asíncrono."""
+        worker = APIWorker(
+            lambda: self._make_request(method, endpoint, data, params, stream),
+            callback
         )
-        if response:
-            self.access_token = response.get("access_token")
-            self.refresh_token = response.get("refresh_token")
-        return response
-
-    def logout(self) -> None:
-        self.access_token = None
-        self.refresh_token = None
-
-    def is_authenticated(self) -> bool:
-        return self.access_token is not None
-
-    # Camera methods
-    def get_cameras(self) -> list[dict]:
-        result = self._request("GET", "/api/v1/cameras/")
-        return result if result else []
-
-    def get_camera(self, camera_id: int) -> dict | None:
-        return self._request("GET", f"/api/v1/cameras/{camera_id}")
-
-    def add_camera(self, data: dict) -> dict | None:
-        return self._request("POST", "/api/v1/cameras/", json=data)
-
-    def update_camera(self, camera_id: int, data: dict) -> dict | None:
-        return self._request("PUT", f"/api/v1/cameras/{camera_id}", json=data)
-
-    def delete_camera(self, camera_id: int) -> bool:
-        return self._request("DELETE", f"/api/v1/cameras/{camera_id}") is not None
-
-    def toggle_camera(self, camera_id: int, active: bool) -> dict | None:
-        return self._request("PATCH", f"/api/v1/cameras/{camera_id}/toggle", json={"active": active})
-
-    def discover_cameras(self) -> list[dict]:
-        result = self._request("POST", "/api/v1/cameras/discover")
-        return result if result else []
-
-    def get_stream_url(self, camera_id: int) -> str:
-        token = self.access_token or ""
-        return f"{self.base_url}/api/v1/cameras/{camera_id}/stream?token={token}"
-
-    def get_capabilities(self, camera_id: int) -> dict | None:
-        return self._request("GET", f"/api/v1/cameras/{camera_id}/capabilities")
-
-    # PTZ methods
-    def ptz_move(self, camera_id: int, direction: str, speed: float = 0.5) -> bool:
-        result = self._request(
-            "POST",
-            f"/api/v1/cameras/{camera_id}/ptz/move",
-            json={"direction": direction, "speed": speed}
-        )
-        return result is not None
-
-    def ptz_stop(self, camera_id: int) -> bool:
-        result = self._request("POST", f"/api/v1/cameras/{camera_id}/ptz/stop")
-        return result is not None
-
-    def get_ptz_presets(self, camera_id: int) -> list[dict]:
-        result = self._request("GET", f"/api/v1/cameras/{camera_id}/ptz/presets")
-        return result if result else []
-
-    def go_to_preset(self, camera_id: int, token: str) -> bool:
-        result = self._request(
-            "POST",
-            f"/api/v1/cameras/{camera_id}/ptz/presets/{token}/goto"
-        )
-        return result is not None
-
-    # LED and Audio methods
-    def set_leds(self, camera_id: int, mode: str) -> bool:
-        result = self._request(
-            "POST",
-            f"/api/v1/cameras/{camera_id}/leds",
-            json={"mode": mode}
-        )
-        return result is not None
-
-    def start_audio(self, camera_id: int) -> bool:
-        result = self._request("POST", f"/api/v1/cameras/{camera_id}/audio/start")
-        return result is not None
-
-    def stop_audio(self, camera_id: int) -> bool:
-        result = self._request("POST", f"/api/v1/cameras/{camera_id}/audio/stop")
-        return result is not None
-
-    # Event methods
-    def get_events(
-        self,
-        camera_id: int | None = None,
-        event_type: str | None = None,
-        hours: int = 24,
-        limit: int = 50
-    ) -> list[dict]:
-        params = {"hours": hours, "limit": limit}
-        if camera_id is not None:
-            params["camera_id"] = camera_id
-        if event_type:
-            params["event_type"] = event_type
-
-        result = self._request("GET", "/api/v1/events/", params=params)
-        return result if result else []
-
-    def acknowledge_event(self, event_id: int) -> bool:
-        result = self._request("PATCH", f"/api/v1/events/{event_id}/acknowledge")
-        return result is not None
-
-    def get_event_stats(self) -> dict | None:
-        return self._request("GET", "/api/v1/events/stats")
-
-    # Recording methods
-    def get_recordings(self, camera_id: int | None = None, limit: int = 100) -> list[dict]:
-        params = {"limit": limit}
-        if camera_id is not None:
-            params["camera_id"] = camera_id
-        result = self._request("GET", "/api/v1/recordings/", params=params)
-        return result if result else []
-
-    def get_download_url(self, recording_id: int) -> str:
-        token = self.access_token or ""
-        return f"{self.base_url}/api/v1/recordings/{recording_id}/download?token={token}"
-
-    def delete_recording(self, recording_id: int) -> bool:
-        return self._request("DELETE", f"/api/v1/recordings/{recording_id}") is not None
-
-    # Config methods
-    def get_system_stats(self) -> dict | None:
-        return self._request("GET", "/api/v1/system/stats")
-
-    def get_config(self) -> dict | None:
-        return self._request("GET", "/api/v1/system/config")
-
-    def update_config(self, config: dict) -> dict | None:
-        return self._request("PUT", "/api/v1/system/config", json=config)
+        self._thread_pool.start(worker)
+    
+    # ============ MÉTODOS CONVENIENTES (REST completos) ============
+    
+    def get(self, endpoint: str, callback: Callable, params: Dict = None):
+        """GET asíncrono."""
+        self.request_async("GET", endpoint, callback, params=params)
+    
+    def post(self, endpoint: str, callback: Callable, data: Dict = None):
+        """POST asíncrono."""
+        self.request_async("POST", endpoint, callback, data=data)
+    
+    def put(self, endpoint: str, callback: Callable, data: Dict = None):
+        """PUT asíncrono."""
+        self.request_async("PUT", endpoint, callback, data=data)
+    
+    def patch(self, endpoint: str, callback: Callable, data: Dict = None):
+        """PATCH asíncrono."""
+        self.request_async("PATCH", endpoint, callback, data=data)
+    
+    def delete(self, endpoint: str, callback: Callable, data: Dict = None):
+        """DELETE asíncrono."""
+        self.request_async("DELETE", endpoint, callback, data=data)
+    
+    def login(self, username: str, password: str, callback: Callable[[APIResponse], None]):
+        """Login especial que no requiere token previo."""
+        def do_login():
+            try:
+                response = requests.post(
+                    f"{self._base_url}/auth/login",
+                    json={"username": username, "password": password},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    return APIResponse(success=True, data=data)
+                else:
+                    try:
+                        err = response.json()
+                        return APIResponse(success=False, error=err.get("error", "Login failed"), 
+                                        status_code=response.status_code)
+                    except:
+                        return APIResponse(success=False, error="Login failed", 
+                                        status_code=response.status_code)
+            except Exception as e:
+                return APIResponse(success=False, error=str(e))
+        
+        worker = APIWorker(do_login, callback)
+        self._thread_pool.start(worker)
 
 
-# Global instance
+# Instancia global
 api_client = APIClient()

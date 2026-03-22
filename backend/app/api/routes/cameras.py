@@ -4,6 +4,7 @@ from ...container import get_container
 from ...streaming.mjpeg_streamer import mjpeg_streamer
 import logging
 
+from backend.app.services.permission_service import require_camera_permission
 
 cameras_bp = Blueprint("cameras", __name__, url_prefix="/api/v1/cameras")
 logger = logging.getLogger(__name__)
@@ -21,7 +22,6 @@ def _get_service():
 @cameras_bp.route("/", methods=["GET"])
 @jwt_required()
 def get_cameras():
-    """Obtener lista de todas las cámaras."""
     try:
         service = _get_service()
         cameras = service.get_all_cameras()
@@ -34,7 +34,6 @@ def get_cameras():
 @cameras_bp.route("/<int:camera_id>", methods=["GET"])
 @jwt_required()
 def get_camera(camera_id: int):
-    """Obtener una cámara específica."""
     try:
         service = _get_service()
         camera = service.get_camera(camera_id)
@@ -51,7 +50,6 @@ def get_camera(camera_id: int):
 @cameras_bp.route("/", methods=["POST"])
 @jwt_required()
 def add_camera():
-    """Agregar nueva cámara."""
     try:
         data = request.get_json()
         if not data:
@@ -70,7 +68,6 @@ def add_camera():
 @cameras_bp.route("/<int:camera_id>", methods=["PUT"])
 @jwt_required()
 def update_camera(camera_id: int):
-    """Actualizar cámara existente."""
     try:
         data = request.get_json()
         if not data:
@@ -92,7 +89,6 @@ def update_camera(camera_id: int):
 @cameras_bp.route("/<int:camera_id>", methods=["DELETE"])
 @jwt_required()
 def delete_camera(camera_id: int):
-    """Eliminar cámara."""
     try:
         service = _get_service()
         deleted = service.delete_camera(camera_id)
@@ -110,7 +106,6 @@ def delete_camera(camera_id: int):
 @cameras_bp.route("/<int:camera_id>/toggle", methods=["PATCH"])
 @jwt_required()
 def toggle_camera(camera_id: int):
-    """Activar o desactivar cámara."""
     try:
         data = request.get_json()
         if data is None or "active" not in data:
@@ -132,13 +127,12 @@ def toggle_camera(camera_id: int):
 @cameras_bp.route("/discover", methods=["POST"])
 @jwt_required()
 def discover_cameras():
-    """Descubrir cámaras ONVIF en red local."""
     try:
         service = _get_service()
         cameras = service.discover_cameras()
 
         return jsonify({
-            "success": True, 
+            "success": True,
             "data": cameras,
             "count": len(cameras)
         })
@@ -148,14 +142,53 @@ def discover_cameras():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+# =========================
+# NUEVOS ENDPOINTS CONTROL
+# =========================
+
+@cameras_bp.route("/<int:camera_id>/ptz/<string:direction>", methods=["POST"])
+@jwt_required()
+@require_camera_permission("control_ptz")
+def ptz_control(camera_id, direction):
+    try:
+        service = _get_service()
+        result = service.ptz_control(camera_id, direction)
+        return jsonify({"success": True, "data": result})
+    except Exception as e:
+        logger.error(f"Error en PTZ {camera_id}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@cameras_bp.route("/<int:camera_id>/leds/<string:state>", methods=["POST"])
+@jwt_required()
+@require_camera_permission("control_leds")
+def led_control(camera_id, state):
+    try:
+        service = _get_service()
+        result = service.set_led_state(camera_id, state)
+        return jsonify({"success": True, "data": result})
+    except Exception as e:
+        logger.error(f"Error LEDs {camera_id}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@cameras_bp.route("/<int:camera_id>/audio/talk", methods=["POST"])
+@jwt_required()
+@require_camera_permission("control_audio")
+def audio_talk(camera_id):
+    try:
+        data = request.get_json() or {}
+        service = _get_service()
+        result = service.audio_talk(camera_id, data)
+        return jsonify({"success": True, "data": result})
+    except Exception as e:
+        logger.error(f"Error audio talk {camera_id}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @cameras_bp.route("/<int:camera_id>/stream", methods=["GET"])
 def get_camera_stream(camera_id: int):
-    """
-    Endpoint de streaming MJPEG.
-    NO requiere JWT en cookie/header, sino token en query param.
-    """
     try:
-        # Validar token manualmente desde query param
         token = request.args.get("token")
 
         if not token:
@@ -166,7 +199,6 @@ def get_camera_stream(camera_id: int):
         except Exception:
             return jsonify({"success": False, "error": "Token inválido"}), 401
 
-        # Retornar stream MJPEG
         return Response(
             mjpeg_streamer.generate_stream(camera_id),
             mimetype="multipart/x-mixed-replace; boundary=frame",

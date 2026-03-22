@@ -46,22 +46,33 @@ class EventService:
                 logging.error(f"Error guardando snapshot: {e}")
                 snapshot_path = None
 
-        # Crear evento en BD
+        # Crear evento en BD + NOTIFICACIONES
         try:
             event = Event(
                 camera_id=event_data.camera_id,
                 event_type=event_data.event_type,
                 confidence=event_data.confidence,
                 snapshot_path=snapshot_path,
-                clip_path=None,  # Se actualizará luego si hay grabación
+                clip_path=None,
                 acknowledged=False
             )
 
             saved_event = self._event_repo.create(event)
+
             logging.info(
                 f"Evento guardado: {event_data.event_type} "
                 f"cámara {event_data.camera_id} id={saved_event.id}"
             )
+
+            # ============================
+            # NUEVO: RUTEO DE NOTIFICACIONES
+            # ============================
+            try:
+                from backend.app.services.notification_router import notification_router
+                notification_router.route_event(saved_event, event_data)
+            except Exception as e:
+                logging.error(f"Error enviando notificación: {e}")
+
         except Exception as e:
             logging.error(f"Error guardando evento en BD: {e}")
 

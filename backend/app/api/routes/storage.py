@@ -1,0 +1,111 @@
+"""
+API Endpoints para gestión de almacenamiento.
+"""
+import os
+import shutil
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required
+
+from backend.app.config import settings
+from backend.app.services.user_service import UserService
+
+storage_bp = Blueprint("storage", __name__, url_prefix="/api/v1/storage")
+
+
+@storage_bp.route("/info", methods=["GET"])
+@jwt_required()
+def get_storage_info():
+    """Obtiene información de almacenamiento."""
+    try:
+        path = settings.RECORDINGS_PATH
+        
+        # Espacio total y libre del disco
+        total, used, free = shutil.disk_usage(path)
+        
+        # Espacio usado específicamente por grabaciones
+        recordings_size = 0
+        if os.path.exists(path):
+            for dirpath, dirnames, filenames in os.walk(path):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if os.path.exists(fp) and not os.path.islink(fp):
+                        recordings_size += os.path.getsize(fp)
+        
+        return jsonify({
+            "success": True,
+            "data": {
+                "path": path,
+                "disk_total_gb": round(total / (1024**3), 2),
+                "disk_free_gb": round(free / (1024**3), 2),
+                "disk_used_gb": round(used / (1024**3), 2),
+                "recordings_used_gb": round(recordings_size / (1024**3), 2),
+                "percent_used": round((used / total) * 100, 1) if total > 0 else 0
+            }
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@storage_bp.route("/config", methods=["POST"])
+@jwt_required()
+def update_storage_config():
+    """Actualiza ruta de almacenamiento (solo admin)."""
+    try:
+        from flask_jwt_extended import get_jwt_identity
+        user_id = int(get_jwt_identity())
+        
+        if not UserService().is_admin(user_id):
+            return jsonify({"success": False, "error": "Admin requerido"}), 403
+        
+        data = request.get_json()
+        new_path = data.get("path")
+        
+        if not new_path:
+            return jsonify({"success": False, "error": "Path requerido"}), 400
+        
+        if not os.path.exists(new_path):
+            try:
+                os.makedirs(new_path, exist_ok=True)
+            except Exception as e:
+                return jsonify({"success": False, "error": f"No se puede crear directorio: {e}"}), 400
+        
+        # Actualizar configuración (requiere reinicio para tomar efecto completo)
+        # En producción, guardar en BD y recargar
+        settings.RECORDINGS_PATH = new_path
+        
+        return jsonify({
+            "success": True,
+            "message": "Configuración actualizada. Reinicie el servidor para aplicar cambios completos."
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@storage_bp.route("/cleanup", methods=["POST"])
+@jwt_required()
+def cleanup_storage():
+    """Limpia archivos temporales o viejos (solo admin)."""
+    try:
+        from flask_jwt_extended import get_jwt_identity
+        user_id = int(get_jwt_identity())
+        
+        if not UserService().is_admin(user_id):
+            return jsonify({"success": False, "error": "Admin requerido"}), 403
+        
+        from backend.app.recording.storage_manager import StorageManager
+        from backend.app.database.repositories.recording_repository import RecordingRepository
+        
+        repo = RecordingRepository()
+        manager = StorageManager(repo)
+        
+        deleted_count = manager.run_cleanup()
+        
+        return jsonify({
+            "success": True,
+            "deleted_files": deleted_count
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500

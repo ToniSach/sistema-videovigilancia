@@ -1,54 +1,71 @@
+"""
+Punto de entrada de la aplicación desktop - FIX Qt6.
+"""
 import sys
-import os
 import logging
+import os
 
-# Agregar la carpeta src al path si es necesario (para imports absolutos dentro de src)
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
-
-from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QDialog
-
-# Imports relativos (funcionan desde desktop_app/src/)
-from ui.login_window import LoginWindow
-from ui.cameras_view import CamerasView
-
+# Configurar logging antes de cualquier import
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
 
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Sistema NVR - Videovigilancia")
-        self.setMinimumSize(1400, 900)
-        
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.cameras_view = CamerasView()
-        layout.addWidget(self.cameras_view)
+# Subir solo 2 niveles desde desktop_app/src/ 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.join(current_dir, '..', '..')
+sys.path.insert(0, project_root)
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont, QFontDatabase
+
+from desktop_app.src.ui.main_window import MainWindow
 
 def main():
+    """Función principal."""
+    # FIX Qt6: No usar atributos deprecados en Qt6
+    # Estos solo existen en Qt5, en Qt6 son comportamiento por defecto
+    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling)
+    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
+    
+    # Crear aplicación
     app = QApplication(sys.argv)
-    app.setApplicationName("NVR System")
-    app.setStyle("Fusion")
+    app.setApplicationName("NVR VMS")
+    app.setOrganizationName("NVRSystems")
+    app.setStyle('Fusion')
     
-    login = LoginWindow()
-    result = login.exec()
+    # Cargar fuentes si están disponibles
+    font_paths = [
+        ":/fonts/Inter-Regular.ttf",
+        "/usr/share/fonts/truetype/inter/Inter-Regular.ttf",
+        "C:\\Windows\\Fonts\\Inter.ttf"
+    ]
     
-    if result == QDialog.DialogCode.Accepted:
-        logger.info("Login exitoso, iniciando ventana principal")
-        window = MainWindow()
-        window.show()
-        sys.exit(app.exec())
-    else:
-        logger.info("Login cancelado o fallido")
-        sys.exit(0)
+    for fp in font_paths:
+        if os.path.exists(fp):
+            QFontDatabase.addApplicationFont(fp)
+            break
+    
+    # Fuente por defecto
+    font = QFont("Inter", 10)
+    if not QFontDatabase.hasFamily("Inter"):
+        font = QFont("Segoe UI", 10)
+        if sys.platform == "darwin":
+            font = QFont(".AppleSystemUIFont", 10)
+        elif sys.platform == "linux":
+            font = QFont("Ubuntu", 10)
+    
+    app.setFont(font)
+    
+    # Crear y mostrar ventana principal
+    window = MainWindow()
+    window.show()
+    
+    # Ejecutar loop
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()

@@ -3,7 +3,6 @@ AI Service - Servicio de alto nivel para gestión de IA.
 Coordina schedulers para todas las cámaras activas.
 """
 
-
 from typing import Callable
 import logging
 import threading
@@ -19,7 +18,6 @@ class AIService:
     Servicio singleton que gestiona el procesamiento de IA
     para todas las cámaras del sistema.
     """
-
 
     def __init__(self, camera_manager: CameraManager):
         """
@@ -51,8 +49,8 @@ class AIService:
         with self._lock:
             for scheduler in self._schedulers.values():
                 scheduler.set_detection_callback(
-                    lambda cam_id, class_name, conf, frame: 
-                    self._handle_detection(cam_id, class_name, conf, frame)
+                    lambda cam_id, class_name, conf, frame, metadata: 
+                    self._handle_detection(cam_id, class_name, conf, frame, metadata)
                 )
 
         logger.debug("Callback de eventos asignado a AIService")
@@ -80,10 +78,9 @@ class AIService:
             )
 
     def activate_ai(self, camera_id: int, mode: str = "low_cpu") -> bool:
-        # Esto significa: si detecta una persona, espera 30s antes de alertar "persona" otra vez
-        scheduler = AIScheduler(camera_id, mode, cooldown_seconds=30)
         """
         Activa el procesamiento de IA para una cámara.
+        Esto significa: si detecta una persona, espera 30s antes de alertar "persona" otra vez
         
         Args:
             camera_id: ID de la cámara
@@ -92,7 +89,7 @@ class AIService:
         Returns:
             True si se activó correctamente
         """
-
+        # CORRECCIÓN: La instanciación ahora está DENTRO del método
         # Obtener distributor
         distributor = self._camera_manager.get_distributor(camera_id)
         if distributor is None:
@@ -107,14 +104,14 @@ class AIService:
                 old_scheduler.stop(distributor)
                 del self._schedulers[camera_id]
 
-            # Crear nuevo scheduler
+            # CORRECCIÓN: Crear scheduler DENTRO del método, no en la firma
             scheduler = AIScheduler(camera_id, mode, cooldown_seconds=30)
 
             # Asignar callback si existe
             if self._event_callback:
                 scheduler.set_detection_callback(
-                    lambda cam_id, class_name, conf, frame: 
-                    self._handle_detection(cam_id, class_name, conf, frame)
+                    lambda cam_id, class_name, conf, frame, metadata: 
+                    self._handle_detection(cam_id, class_name, conf, frame, metadata)
                 )
 
             # Iniciar

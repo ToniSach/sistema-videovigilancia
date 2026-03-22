@@ -38,34 +38,31 @@ class FFmpegWorker:
         self.WATCHDOG_TIMEOUT = 30
         self._last_frame_time = time.time()
         self._logger = logging.getLogger(f"{__name__}.Cam{camera.id}")
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_running = False
         
         # Calcular tamaño de frame
         self._frame_size = camera.resolution_width * camera.resolution_height * 3
         
-        # ✅ Verificar FFmpeg al inicio
+        # Verificar FFmpeg al inicio
         self._ffmpeg_path = self._find_ffmpeg_executable()
         if not self._ffmpeg_path:
             self.status = WorkerStatus.FFMPEG_NOT_FOUND
             self._logger.error("FFmpeg no encontrado. Instale FFmpeg y añádalo al PATH del sistema.")
 
     def _find_ffmpeg_executable(self) -> str | None:
-        """
-        Busca el ejecutable de FFmpeg en el sistema.
-        Retorna la ruta completa o None si no se encuentra.
-        """
-        # 1. Buscar en PATH
+        """Busca el ejecutable de FFmpeg."""
         ffmpeg_path = shutil.which("ffmpeg")
         if ffmpeg_path:
             return ffmpeg_path
             
-        # 2. Buscar en ubicaciones comunes de Windows
         common_windows_paths = [
             r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
             r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
             r"C:\ffmpeg\bin\ffmpeg.exe",
             r"C:\Users\%USERNAME%\ffmpeg\bin\ffmpeg.exe",
-            r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",  # Chocolatey
-            r"C:\ProgramData\scoop\shims\ffmpeg.exe",      # Scoop
+            r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+            r"C:\ProgramData\scoop\shims\ffmpeg.exe",
         ]
         
         for path in common_windows_paths:
@@ -97,11 +94,8 @@ class FFmpegWorker:
         if self._running:
             return
             
-        # ✅ Verificar FFmpeg antes de iniciar
         if not self._ffmpeg_path:
             self._logger.error("No se puede iniciar cámara: FFmpeg no está instalado")
-            self._logger.error("Descargue FFmpeg desde: https://www.gyan.dev/ffmpeg/builds/")
-            self._logger.error("O instale con: choco install ffmpeg   (si tiene Chocolatey)")
             self.status = WorkerStatus.FFMPEG_NOT_FOUND
             return
 
@@ -113,7 +107,50 @@ class FFmpegWorker:
             name=f"FFmpeg-Cam{self.camera.id}"
         )
         self._thread.start()
+        
+        # CORRECCIÓN: Iniciar watchdog en thread separado
+        self._watchdog_running = True
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            daemon=True,
+            name=f"Watchdog-Cam{self.camera.id}"
+        )
+        self._watchdog_thread.start()
+        
         self._logger.info(f"Worker iniciado para cámara {self.camera.id}")
+
+    def _watchdog_loop(self) -> None:
+        """
+        CORRECCIÓN: Watchdog en thread separado que monitorea la actividad.
+        Detecta bloqueos donde FFmpeg no cierra pero deja de producir frames.
+        """
+        while self._watchdog_running:
+            try:
+                time.sleep(5)  # Verificar cada 5 segundos
+                
+                if not self._running:
+                    break
+                
+                # Si han pasado más de WATCHDOG_TIMEOUT segundos sin frames
+                time_since_last = time.time() - self._last_frame_time
+                if time_since_last > self.WATCHDOG_TIMEOUT:
+                    self._logger.error(f"Watchdog timeout: {time_since_last:.1f}s sin frames. Matando FFmpeg...")
+                    
+                    # Forzar terminación del proceso FFmpeg bloqueado
+                    if self._process and self._process.poll() is None:
+                        try:
+                            self._process.kill()
+                            self._process.wait(timeout=2)
+                        except:
+                            pass
+                    
+                    # Actualizar estado para forzar reconnect
+                    self.status = WorkerStatus.RECONNECTING
+                    break
+                    
+            except Exception as e:
+                self._logger.error(f"Error en watchdog: {e}")
+                time.sleep(1)
 
     def _worker_loop(self) -> None:
         """Loop principal del worker."""
@@ -132,7 +169,7 @@ class FFmpegWorker:
             except FileNotFoundError as e:
                 self._logger.error(f"FFmpeg no encontrado: {e}")
                 self.status = WorkerStatus.FFMPEG_NOT_FOUND
-                break  # No reintentar si falta FFmpeg
+                break
             except Exception as e:
                 self._logger.error(f"Error en worker loop: {e}")
                 self._reconnect_attempts += 1
@@ -178,10 +215,6 @@ class FFmpegWorker:
                 self.frame_buffer.put(frame)
                 self._last_frame_time = time.time()
 
-                if time.time() - self._last_frame_time > self.WATCHDOG_TIMEOUT:
-                    self._logger.error("Watchdog timeout - no hay frames")
-                    break
-
         except FileNotFoundError:
             self._logger.error("FFmpeg executable no encontrado")
             raise
@@ -198,8 +231,9 @@ class FFmpegWorker:
                 self._process = None
 
     def stop(self) -> None:
-        """Detiene el worker."""
+        """Detiene el worker y el watchdog."""
         self._running = False
+        self._watchdog_running = False
         self.status = WorkerStatus.STOPPED
 
         if self._process:
@@ -213,6 +247,10 @@ class FFmpegWorker:
 
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
+            
+        # CORRECCIÓN: Esperar al watchdog también
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=2)
 
         self._logger.info(f"Worker detenido para cámara {self.camera.id}")
 

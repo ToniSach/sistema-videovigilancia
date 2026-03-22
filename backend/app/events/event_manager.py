@@ -2,6 +2,7 @@ import threading
 import logging
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Any, Optional
+from concurrent.futures import ThreadPoolExecutor
 import time
 import numpy as np
 
@@ -38,6 +39,8 @@ class EventManager:
         self._subscribers: Dict[str, List[Callable]] = {}  # event_type → list of callables
         self._global_subscribers: List[Callable] = []       # se llaman para todos los eventos
         self._lock = threading.Lock()
+        # CORRECCIÓN: Pool de threads compartido para todos los eventos (evita explosión de threads)
+        self._executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="EventManager")
 
     def subscribe(self, event_type: str, callback: Callable[[EventData], None]) -> None:
         with self._lock:
@@ -64,27 +67,26 @@ class EventManager:
             specific_callbacks = self._subscribers.get(event_data.event_type, []).copy()
             global_callbacks = self._global_subscribers.copy()
 
+        # CORRECCIÓN: Usar executor en lugar de crear threads nuevos por cada callback
         # Llamar callbacks específicos
         for callback in specific_callbacks:
-            threading.Thread(
-                target=self._safe_call,
-                args=(callback, event_data),
-                daemon=True
-            ).start()
+            self._executor.submit(self._safe_call, callback, event_data)
 
         # Llamar callbacks globales
         for callback in global_callbacks:
-            threading.Thread(
-                target=self._safe_call,
-                args=(callback, event_data),
-                daemon=True
-            ).start()
+            self._executor.submit(self._safe_call, callback, event_data)
 
     def _safe_call(self, callback: Callable[[EventData], None], event_data: EventData) -> None:
+        """Wrapper seguro para ejecutar callbacks sin propagar excepciones."""
         try:
             callback(event_data)
         except Exception as e:
             logging.error(f"Error en subscriber: {e}", exc_info=True)
+
+    def shutdown(self) -> None:
+        """Limpia recursos del executor (llamar al cerrar la aplicación)."""
+        self._executor.shutdown(wait=False)
+        logging.info("EventManager executor detenido")
 
 
 # Instancia global
