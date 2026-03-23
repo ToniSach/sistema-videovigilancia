@@ -97,6 +97,7 @@ class ONVIFDiscovery:
                         "onvif_url": f"http://{ip}:{port}/onvif/device_service",
                         "username": user,
                         "password": pwd,
+                        "profile_token": profile.token,  # ✅ AGREGAR ESTA LÍNEA
                         "manufacturer": info.Manufacturer,
                         "model": info.Model,
                         "has_ptz": self._has_ptz(cam),
@@ -167,8 +168,16 @@ class ONVIFDiscovery:
             return False
 
     def _has_ptz(self, cam: ONVIFCamera) -> bool:
+        """Verifica PTZ de forma más robusta"""
         try:
             ptz = cam.create_ptz_service()
-            return ptz is not None
-        except Exception:
+            # Hacer una llamada real para verificar que funciona
+            media = cam.create_media_service()
+            profiles = media.GetProfiles()
+            if profiles:
+                # Intentar obtener status (fallará si no hay PTZ real)
+                ptz.GetStatus({"ProfileToken": profiles[0].token})
+            return True
+        except Exception as e:
+            logging.debug(f"PTZ check failed: {e}")
             return False

@@ -5,25 +5,75 @@ from ...cameras.camera_manager import CameraManager
 from ...database.repositories.camera_repository import CameraRepository
 import logging
 import time
+import psutil
+import weakref
 
 
 system_bp = Blueprint("system", __name__, url_prefix="/api/v1/system")
 logger = logging.getLogger(__name__)
 
 
+# ==============================
+# HEALTH MONITOR
+# ==============================
+class HealthMonitor:
+    def __init__(self):
+        self._checks = {}
+        self._running = False
+
+    def register_camera_check(self, camera_id, worker):
+        self._checks[camera_id] = {
+            'last_frame': time.time(),
+            'worker': weakref.ref(worker)
+        }
+
+    def update_frame(self, camera_id):
+        """Actualizar timestamp cuando llega un frame."""
+        if camera_id in self._checks:
+            self._checks[camera_id]['last_frame'] = time.time()
+
+    def _calculate_fps(self, camera_id):
+        # Placeholder básico (puedes mejorarlo luego)
+        return 0
+
+    def get_system_health(self):
+        return {
+            'cameras': [
+                {
+                    'id': cid,
+                    'status': 'healthy' if time.time() - info['last_frame'] < 5 else 'stalled',
+                    'fps': self._calculate_fps(cid)
+                }
+                for cid, info in self._checks.items()
+            ],
+            'memory': psutil.virtual_memory().percent,
+            'disk': psutil.disk_usage('/').percent
+        }
+
+
+# Instancia global (simple singleton)
+health_monitor = HealthMonitor()
+
+
+# ==============================
+# ROUTES
+# ==============================
+
 @system_bp.route("/health", methods=["GET"])
 @jwt_required()
 def health_check():
     """Health check del sistema."""
     try:
-        # Obtener instancia del singleton CameraManager
         camera_manager = CameraManager()
+
+        health_data = health_monitor.get_system_health()
 
         return jsonify({
             "status": "ok",
-    "timestamp": time.time(),
+            "timestamp": time.time(),
             "cameras_active": len(camera_manager._workers),
-    "cameras_total": len(camera_manager._camera_repo.get_all()) if hasattr(camera_manager, '_camera_repo') else 0,
+            "cameras_total": len(camera_manager._camera_repo.get_all()) if hasattr(camera_manager, '_camera_repo') else 0,
+            "system_health": health_data,
             "version": "1.0.0"
         })
 
@@ -70,7 +120,6 @@ def get_stats():
 def get_config():
     """Obtener configuración del sistema."""
     try:
-        # Obtener todas las entradas de SystemConfig
         from ...database.connection import db_manager
         from ...database.models import SystemConfig
 
@@ -110,14 +159,13 @@ def update_config():
             if config:
                 config.value = str(value)
             else:
-                # Crear nueva entrada
                 new_config = SystemConfig(key=key, value=str(value), description="")
                 session.add(new_config)
 
         session.commit()
 
         return jsonify({
-    "success": True,
+            "success": True,
             "message": "Configuración actualizada"
         })
 

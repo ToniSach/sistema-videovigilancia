@@ -3,6 +3,7 @@
 Panel de control para PTZ, LEDs y Audio de cámara.
 """
 import logging
+from PySide6.QtWidgets import QMessageBox
 from typing import Optional
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 

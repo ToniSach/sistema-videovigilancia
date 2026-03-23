@@ -1,5 +1,5 @@
 """
-Vista de login con diseño glassmorphism.
+Vista de login con diseño glassmorphism - FIX Stylesheet.
 """
 import logging
 from typing import Callable
@@ -101,6 +101,8 @@ class LoginView(QWidget):
     
     def _setup_styles(self):
         """Aplica estilos glassmorphism."""
+        # FIX: Usar las propiedades de color precalculadas en config
+        # en lugar de llamar .lighter()/.darker() en el string QSS (inválido)
         self.setStyleSheet(f"""
             #loginView {{
                 background-color: {config.THEME_PRIMARY};
@@ -130,10 +132,10 @@ class LoginView(QWidget):
                 font-size: 14px;
             }}
             QPushButton:hover {{
-                background-color: {config.THEME_ACCENT}.lighter(120);
+                background-color: {config.THEME_ACCENT_LIGHT};
             }}
             QPushButton:pressed {{
-                background-color: {config.THEME_ACCENT}.darker(110);
+                background-color: {config.THEME_ACCENT_DARK};
             }}
             QCheckBox {{
                 color: {config.THEME_TEXT_MUTED};

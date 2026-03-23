@@ -20,12 +20,15 @@ from desktop_app.src.services.video_streamer import video_streamer
 from desktop_app.src.ui.views.login_view import LoginView
 from desktop_app.src.ui.views.live_view import LiveView
 from desktop_app.src.ui.views.playback_view import PlaybackView
-
-# ✅ NUEVOS IMPORTS
 from desktop_app.src.ui.views.camera_management_view import CameraManagementView
-from desktop_app.src.ui.views.settings_view import SettingsView
-from desktop_app.src.ui.components.camera_control_panel import CameraControlPanel
 
+try:
+    from desktop_app.src.ui.views.settings_view import SettingsView
+    SETTINGS_AVAILABLE = True
+except ImportError:
+    SETTINGS_AVAILABLE = False
+
+from desktop_app.src.ui.components.camera_control_panel import CameraControlPanel
 from desktop_app.src.ui.components.glass_card import GlassCard
 
 logger = logging.getLogger(__name__)
@@ -83,7 +86,7 @@ class MainWindow(QMainWindow):
             f"background-color: {config.THEME_PRIMARY};"
         )
 
-        # ===== VISTAS =====
+        # Vistas
         self.live_view = LiveView()
         self.live_view.ptz_requested.connect(self._on_ptz_request)
         self.content_stack.addWidget(self.live_view)
@@ -91,12 +94,10 @@ class MainWindow(QMainWindow):
         self.playback_view = PlaybackView()
         self.content_stack.addWidget(self.playback_view)
 
-        # ✅ NUEVA: Gestión de cámaras
         self.camera_management_view = CameraManagementView()
         self.camera_management_view.camera_updated.connect(self._reload_cameras)
         self.content_stack.addWidget(self.camera_management_view)
 
-        # ✅ NUEVA: Configuración real
         self.settings_view = SettingsView()
         self.content_stack.addWidget(self.settings_view)
 
@@ -122,7 +123,7 @@ class MainWindow(QMainWindow):
 
         layout.addSpacing(20)
 
-        # ===== BOTONES =====
+        # Botones
         self.btn_live = self._nav_button("📹 En Vivo", True)
         self.btn_live.clicked.connect(lambda: self._switch_view(0))
         layout.addWidget(self.btn_live)
@@ -131,12 +132,10 @@ class MainWindow(QMainWindow):
         self.btn_playback.clicked.connect(lambda: self._switch_view(1))
         layout.addWidget(self.btn_playback)
 
-        # ✅ NUEVO
         self.btn_cameras = self._nav_button("📷 Cámaras", False)
         self.btn_cameras.clicked.connect(lambda: self._switch_view(2))
         layout.addWidget(self.btn_cameras)
 
-        # ✅ NUEVO
         self.btn_settings = self._nav_button("⚙ Configuración", False)
         self.btn_settings.clicked.connect(lambda: self._switch_view(3))
         layout.addWidget(self.btn_settings)
@@ -219,11 +218,19 @@ class MainWindow(QMainWindow):
 
         api_client.get("cameras/", on_cameras)
 
-    # ✅ NUEVO helper
     def _reload_cameras(self):
         self._load_cameras()
 
     def _switch_view(self, index: int):
+        # Detener streams al salir de la vista en vivo
+        if index != 0:  # No es la vista en vivo
+            video_streamer.stop_all()
+        elif index == 0:
+            # Reiniciar streams con token actual
+            token = api_client.tokens.access_token if api_client.tokens else ""
+            self.live_view.restart_streams(token)
+
+        # Actualizar botones
         for btn in [
             self.btn_live,
             self.btn_playback,
@@ -236,22 +243,17 @@ class MainWindow(QMainWindow):
             self.btn_live.setChecked(True)
             self.live_view.show()
             video_streamer.set_base_url(config.API_BASE_URL)
-
         elif index == 1:
             self.btn_playback.setChecked(True)
             self.live_view.hide()
-            video_streamer.stop_all()
-
         elif index == 2:
             self.btn_cameras.setChecked(True)
             self.camera_management_view._load_cameras()
-
         elif index == 3:
             self.btn_settings.setChecked(True)
 
         self.content_stack.setCurrentIndex(index)
 
-    # ✅ IMPLEMENTACIÓN REAL PTZ
     def _on_ptz_request(self, camera):
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Control: {camera.name}")

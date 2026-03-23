@@ -24,12 +24,9 @@ from desktop_app.src.ui.main_window import MainWindow
 
 def main():
     """Función principal."""
-    # FIX Qt6: No usar atributos deprecados en Qt6
-    # Estos solo existen en Qt5, en Qt6 son comportamiento por defecto
-    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
-        QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling)
-    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
-        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
+    # FIX Qt6: High DPI es manejado automáticamente en Qt6/PySide6
+    # No usar AA_EnableHighDpiScaling ni AA_UseHighDpiPixmaps (deprecados en Qt6)
+    # En Qt6, el scaling de alta DPI es el comportamiento por defecto
     
     # Crear aplicación
     app = QApplication(sys.argv)

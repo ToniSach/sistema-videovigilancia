@@ -29,12 +29,36 @@ class PTZController:
                 self._camera.username, 
                 self._camera.password
             )
-            self._ptz = self._onvif_cam.create_ptz_service()
             self._media = self._onvif_cam.create_media_service()
-            self._connected = True
-            logging.info(f"PTZ conectado para cámara {self._camera.id}")
+            
+            # ✅ AGREGAR: Verificar si el profile tiene PTZ antes de crear el servicio
+            profiles = self._media.GetProfiles()
+            if not profiles:
+                self._connected = False
+                return
+                
+            profile = profiles[0]
+            
+            # Verificar si el profile tiene configuración PTZ
+            if not hasattr(profile, 'PTZConfiguration') or profile.PTZConfiguration is None:
+                logging.warning(f"Cámara {self._camera.id} no tiene configuración PTZ en el profile")
+                self._connected = False
+                return
+            
+            # Intentar crear servicio PTZ con manejo de error específico
+            try:
+                self._ptz = self._onvif_cam.create_ptz_service()
+                # Verificar que realmente funciona haciendo una llamada de prueba
+                status = self._ptz.GetStatus({"ProfileToken": profile.token})
+                self._profile_token = profile.token
+                self._connected = True
+                logging.info(f"PTZ conectado para cámara {self._camera.id}")
+            except Exception as ptz_error:
+                logging.warning(f"PTZ no disponible para cámara {self._camera.id}: {ptz_error}")
+                self._connected = False
+                
         except Exception as e:
-            logging.warning(f"PTZ no disponible para cámara {self._camera.id}: {e}")
+            logging.warning(f"ONVIF no disponible para cámara {self._camera.id}: {e}")
             self._connected = False
 
     def move(self, direction: str, speed: float = 0.5) -> bool:

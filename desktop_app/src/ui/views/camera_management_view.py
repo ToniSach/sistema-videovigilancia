@@ -336,7 +336,8 @@ class CameraDiscoveryThread(QThread):
             resp = requests.post(
                 "http://localhost:5000/api/v1/cameras/discover",
                 headers=headers,
-                timeout=15
+                #estaba en 15
+                timeout=50
             )
             
             if resp.status_code == 200:

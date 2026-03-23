@@ -61,10 +61,12 @@ class Camera(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     ip_address: Mapped[str] = mapped_column(String(45), nullable=False)
     rtsp_url: Mapped[str] = mapped_column(String(500), nullable=False)
-    onvif_url: Mapped[str] = mapped_column(String(500))
-    username: Mapped[str] = mapped_column(String(100))
-    password: Mapped[str] = mapped_column(String(100))
-    profile_token: Mapped[str] = mapped_column(String(100))
+    
+    onvif_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    username: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    password: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    profile_token: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     has_ai: Mapped[bool] = mapped_column(Boolean, default=False)
     has_ptz: Mapped[bool] = mapped_column(Boolean, default=False)

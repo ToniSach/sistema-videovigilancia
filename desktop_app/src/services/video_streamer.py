@@ -3,12 +3,11 @@ Servicio de streaming MJPEG para cámaras en vivo.
 """
 import logging
 import time
-from typing import Optional, Callable
+from typing import Optional
 from dataclasses import dataclass
 
 import requests
-from PySide6.QtCore import QObject, Signal, QThread, QMutex, QMutexLocker
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QObject, Signal, QThread, QMutex, QMutexLocker, QWaitCondition, Qt
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +15,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Frame:
     """Frame de video con metadata."""
-    pixmap: QPixmap
+    pixmap: 'QPixmap'
     timestamp: float
     camera_id: int
 
@@ -33,123 +32,209 @@ class MJPEGThread(QThread):
         self.camera_id = camera_id
         self.stream_url = stream_url
         self._running = False
+        # Crear mutexes en el constructor del thread (todavía en thread del padre)
         self._mutex = QMutex()
-        self.session = requests.Session()
-        self.session.timeout = 10
+        self._wait_condition = QWaitCondition()
+        self._session: Optional[requests.Session] = None
+        self._response: Optional[requests.Response] = None
     
     def run(self):
         """Loop principal de captura."""
         self._running = True
-        logger.info(f"Stream iniciado para cámara {self.camera_id}")
+        logger.info(f"[Cam {self.camera_id}] Stream thread iniciado")
         
-        while self._running:
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            max_retries=0,
+            pool_connections=1,
+            pool_maxsize=1
+        )
+        self._session.mount('http://', adapter)
+        self._session.mount('https://', adapter)
+        
+        retry_count = 0
+        max_retries = 3
+        
+        while self._running and retry_count < max_retries:
             try:
-                response = self.session.get(self.stream_url, stream=True, timeout=5)
-                if response.status_code != 200:
-                    self.error_occurred.emit(f"HTTP {response.status_code}")
+                self._response = self._session.get(
+                    self.stream_url, 
+                    stream=True, 
+                    timeout=(5, 30),  # Aumentado timeout de lectura
+                    headers={'Connection': 'close'}
+                )
+                
+                if self._response.status_code != 200:
+                    self.error_occurred.emit(f"HTTP {self._response.status_code}")
+                    retry_count += 1
                     time.sleep(2)
                     continue
                 
+                retry_count = 0
                 buffer = b''
-                for chunk in response.iter_content(chunk_size=1024):
+                consecutive_empty = 0
+                
+                for chunk in self._response.iter_content(chunk_size=8192):
                     if not self._running:
                         break
                     
+                    if not chunk:
+                        consecutive_empty += 1
+                        if consecutive_empty > 10:  # Demasiados chunks vacíos
+                            break
+                        continue
+                    else:
+                        consecutive_empty = 0
+                        
                     buffer += chunk
                     
-                    # Buscar JPEG en buffer (formato MJPEG)
-                    start = buffer.find(b'\xff\xd8')  # JPEG SOI
-                    end = buffer.find(b'\xff\xd9')    # JPEG EOI
-                    
-                    if start != -1 and end != -1 and end > start:
-                        jpg = buffer[start:end+2]
-                        buffer = buffer[end+2:]
+                    # Procesar frames JPEG
+                    while True:
+                        start = buffer.find(b'\xff\xd8')
+                        end = buffer.find(b'\xff\xd9')
                         
-                        # Convertir a QPixmap
-                        image = QImage.fromData(jpg)
-                        if not image.isNull():
-                            pixmap = QPixmap.fromImage(image)
-                            frame = Frame(
-                                pixmap=pixmap,
-                                timestamp=time.time(),
-                                camera_id=self.camera_id
-                            )
-                            self.frame_ready.emit(frame)
-                
-            except requests.RequestException as e:
+                        if start != -1 and end != -1 and end > start:
+                            jpg = buffer[start:end+2]
+                            buffer = buffer[end+2:]
+                            
+                            try:
+                                from PySide6.QtGui import QImage, QPixmap
+                                image = QImage.fromData(jpg)
+                                
+                                if not image.isNull():
+                                    pixmap = QPixmap.fromImage(image)
+                                    if not pixmap.isNull():
+                                        frame = Frame(
+                                            pixmap=pixmap,
+                                            timestamp=time.time(),
+                                            camera_id=self.camera_id
+                                        )
+                                        self.frame_ready.emit(frame)
+                            except Exception as e:
+                                logger.debug(f"Error decodificando JPEG: {e}")
+                        else:
+                            break
+                            
+                    # Limitar buffer
+                    if len(buffer) > 2 * 1024 * 1024:  # 2MB max
+                        buffer = buffer[-65536:]
+                        
+            except requests.exceptions.Timeout:
+                logger.warning(f"[Cam {self.camera_id}] Timeout")
+                retry_count += 1
+                self.error_occurred.emit("Timeout de conexión")
+            except requests.exceptions.RequestException as e:
                 if self._running:
-                    logger.warning(f"Error de conexión cámara {self.camera_id}: {e}")
+                    logger.warning(f"[Cam {self.camera_id}] Error conexión: {e}")
                     self.connection_lost.emit()
-                    time.sleep(3)
+                    retry_count += 1
             except Exception as e:
                 if self._running:
-                    logger.error(f"Error en stream cámara {self.camera_id}: {e}")
-                    time.sleep(1)
+                    logger.error(f"[Cam {self.camera_id}] Error: {e}")
+                    retry_count += 1
+            
+            if self._running and retry_count < max_retries:
+                time.sleep(3)
         
-        logger.info(f"Stream detenido para cámara {self.camera_id}")
+        logger.info(f"[Cam {self.camera_id}] Stream thread finalizado")
     
     def stop(self):
         """Detiene el thread de forma segura."""
         with QMutexLocker(self._mutex):
             self._running = False
-        self.wait(1000)  # Esperar max 1 segundo
-        self.session.close()
+        
+        # Cerrar response para desbloquear iter_content
+        if self._response:
+            try:
+                self._response.close()
+            except:
+                pass
+        
+        if self._session:
+            try:
+                self._session.close()
+            except:
+                pass
+        
+        self._wait_condition.wakeAll()
+        # Esperar a que termine (máximo 3 segundos)
+        if not self.wait(3000):
+            logger.warning(f"[Cam {self.camera_id}] Forzando terminación del thread")
+            self.terminate()
+            self.wait(1000)
 
 
 class VideoStreamerService(QObject):
     """Servicio que gestiona múltiples streams de video."""
     
     frame_updated = Signal(Frame)
-    camera_error = Signal(int, str)  # camera_id, error
+    camera_error = Signal(int, str)
     
     def __init__(self):
         super().__init__()
         self._streams: dict[int, MJPEGThread] = {}
-        self._base_url = None  # Se establece después del login
+        self._base_url = None
+        self._mutex = QMutex()  # Mutex para proteger el diccionario
     
     def set_base_url(self, base_url: str):
-        """Establece URL base del backend (incluyendo token)."""
+        """Establece URL base del backend."""
         self._base_url = base_url
     
     def start_stream(self, camera_id: int, token: str):
         """Inicia streaming de una cámara."""
-        if camera_id in self._streams:
-            return  # Ya está corriendo
-        
-        if not self._base_url:
-            self.camera_error.emit(camera_id, "API no configurada")
-            return
-        
-        stream_url = f"{self._base_url}/cameras/{camera_id}/stream?token={token}"
-        
-        thread = MJPEGThread(camera_id, stream_url)
-        thread.frame_ready.connect(self._on_frame)
-        thread.error_occurred.connect(lambda e: self.camera_error.emit(camera_id, e))
-        thread.connection_lost.connect(lambda: self.camera_error.emit(camera_id, "Conexión perdida"))
-        
-        self._streams[camera_id] = thread
-        thread.start()
-        logger.info(f"Stream iniciado para cámara {camera_id}")
+        with QMutexLocker(self._mutex):
+            # Si ya existe, verificar si está corriendo
+            if camera_id in self._streams:
+                old_thread = self._streams[camera_id]
+                if old_thread.isRunning():
+                    logger.info(f"[Cam {self.camera_id}] Stream ya activo, ignorando solicitud")
+                    return
+                else:
+                    # Limpiar thread muerto
+                    old_thread.deleteLater()
+                    del self._streams[camera_id]
+            
+            if not self._base_url:
+                self.camera_error.emit(camera_id, "API no configurada")
+                return
+            
+            stream_url = f"{self._base_url}/cameras/{camera_id}/stream?token={token}"
+            
+            thread = MJPEGThread(camera_id, stream_url, self)  # Parent es self
+            thread.frame_ready.connect(self._on_frame, type=Qt.QueuedConnection)
+            thread.error_occurred.connect(lambda e: self.camera_error.emit(camera_id, e))
+            thread.connection_lost.connect(lambda: self.camera_error.emit(camera_id, "Conexión perdida"))
+            
+            self._streams[camera_id] = thread
+            thread.start()
+            logger.info(f"[Cam {camera_id}] Stream iniciado")
     
     def stop_stream(self, camera_id: int):
-        """Detiene streaming de una cámara."""
-        if camera_id in self._streams:
-            self._streams[camera_id].stop()
-            del self._streams[camera_id]
-            logger.info(f"Stream detenido para cámara {camera_id}")
+        """Detiene streaming específico."""
+        with QMutexLocker(self._mutex):
+            if camera_id in self._streams:
+                thread = self._streams.pop(camera_id)
+                thread.stop()
+                thread.deleteLater()  # Importante para Qt
+                logger.info(f"[Cam {camera_id}] Stream detenido")
     
     def stop_all(self):
         """Detiene todos los streams."""
-        for camera_id in list(self._streams.keys()):
-            self.stop_stream(camera_id)
+        with QMutexLocker(self._mutex):
+            camera_ids = list(self._streams.keys())
+        
+        for cam_id in camera_ids:
+            self.stop_stream(cam_id)
     
     def _on_frame(self, frame: Frame):
-        """Reenvía frame a quienes escuchan."""
+        """Reenvía frame."""
         self.frame_updated.emit(frame)
     
     def is_streaming(self, camera_id: int) -> bool:
-        """Verifica si una cámara está stremeando."""
-        return camera_id in self._streams and self._streams[camera_id].isRunning()
+        """Verifica si está stremeando."""
+        with QMutexLocker(self._mutex):
+            return (camera_id in self._streams and 
+                    self._streams[camera_id].isRunning())
 
 
 # Instancia global

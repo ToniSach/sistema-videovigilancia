@@ -142,36 +142,27 @@ class TelegramNotifier:
         return f"{count} {plural}"
 
     def _validate_snapshot_path(self, snapshot_path: Optional[str]) -> Optional[str]:
-        """
-        Valida que la ruta del snapshot esté dentro del directorio permitido.
-        
-        Args:
-            snapshot_path: Ruta proporcionada en metadata
-            
-        Returns:
-            Ruta absoluta válida o None si no pasa validación
-        """
         if not snapshot_path:
             return None
-            
+        
         try:
-            # Normalizar a ruta absoluta
-            abs_path = os.path.abspath(snapshot_path)
+            # 1. Normalizar y resolver symlinks (seguridad)
+            real_base = os.path.realpath(self._allowed_base_path)
+            real_path = os.path.realpath(os.path.join(real_base, snapshot_path))
             
-            # Verificar que esté dentro del directorio permitido (evita path traversal)
-            if not abs_path.startswith(self._allowed_base_path):
-                logging.error(f"Intento de acceso fuera de directorio: {snapshot_path}")
+            # 2. Verificar que está dentro del directorio permitido
+            if not real_path.startswith(real_base + os.sep):
+                logger.error(f"Path traversal detectado: {snapshot_path}")
                 return None
             
-            # Verificar que existe y es archivo
-            if not os.path.isfile(abs_path):
-                logging.warning(f"Snapshot no encontrado: {abs_path}")
+            # 3. Verificar que es archivo (no symlink a otro lado)
+            if not os.path.isfile(real_path):
                 return None
                 
-            return abs_path
+            return real_path
             
         except Exception as e:
-            logging.error(f"Error validando ruta: {e}")
+            logger.error(f"Error validando ruta: {e}")
             return None
 
     def send_notification(self, event_data: EventData) -> bool:
