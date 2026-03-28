@@ -6,6 +6,7 @@ from ..database.repositories.camera_repository import CameraRepository
 from ..streaming.frame_buffer import CircularFrameBuffer
 from ..streaming.frame_distributor import FrameDistributor
 from ..workers.ffmpeg_worker import FFmpegWorker, WorkerStatus
+from ..streaming.mjpeg_streamer import mjpeg_streamer
 
 
 class CameraManager:
@@ -38,12 +39,13 @@ class CameraManager:
         self._logger = logging.getLogger(__name__)
         self._initialized = True
 
-    def start_camera(self, camera: Camera) -> bool:
+    def start_camera(self, camera: Camera, register_mjpeg: bool = True) -> bool:
         """
         Inicia el pipeline completo para una cámara: buffer -> distributor -> worker.
 
         Args:
             camera: Instancia de Camera a iniciar
+            register_mjpeg: Si es True, registra automáticamente el streamer MJPEG como consumidor
 
         Returns:
             True si se inició correctamente, False si ya estaba corriendo
@@ -55,7 +57,7 @@ class CameraManager:
 
             try:
                 # Crear buffer circular
-                buffer = CircularFrameBuffer(camera_id=camera.id, maxsize=30)
+                buffer = CircularFrameBuffer(camera_id=camera.id, maxsize=5)
 
                 # Crear distribuidor de frames
                 distributor = FrameDistributor(camera_id=camera.id)
@@ -71,6 +73,14 @@ class CameraManager:
                 self._workers[camera.id] = worker
                 self._buffers[camera.id] = buffer
                 self._distributors[camera.id] = distributor
+
+                # CRÍTICO: Registrar MJPEG automáticamente si se solicita
+                if register_mjpeg:
+                    distributor.register_consumer(
+                        "mjpeg", 
+                        lambda fd: mjpeg_streamer.update_frame(camera.id, fd)
+                    )
+                    self._logger.info(f"MJPEG registrado automáticamente para cámara {camera.id}")
 
                 self._logger.info(f"Cámara {camera.id} ({camera.name}) iniciada correctamente")
                 return True
@@ -104,6 +114,9 @@ class CameraManager:
                 buffer = self._buffers.pop(camera_id)
                 buffer.clear()
 
+                # Limpiar también del streamer MJPEG
+                mjpeg_streamer.unregister_camera(camera_id)
+
                 self._logger.info(f"Cámara {camera_id} detenida")
                 return True
 
@@ -127,7 +140,8 @@ class CameraManager:
             return False
 
         self.stop_camera(camera_id)
-        return self.start_camera(camera)
+        # Al reiniciar, también registramos MJPEG automáticamente
+        return self.start_camera(camera, register_mjpeg=True)
 
     def get_distributor(self, camera_id: int) -> FrameDistributor | None:
         """
@@ -175,7 +189,8 @@ class CameraManager:
             if not camera.rtsp_url:
                 self._logger.warning(f"Cámara {camera.id} no tiene URL RTSP, omitiendo")
                 continue
-            self.start_camera(camera)
+            # CRÍTICO: Pasar register_mjpeg=True para iniciar streaming automáticamente
+            self.start_camera(camera, register_mjpeg=True)
 
     def stop_all(self) -> None:
         """Detiene todas las cámaras gestionadas."""

@@ -185,6 +185,47 @@ def audio_talk(camera_id):
         logger.error(f"Error audio talk {camera_id}: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@cameras_bp.route("/<int:camera_id>/diagnose", methods=["GET"])
+@jwt_required()
+def diagnose_camera(camera_id: int):
+    """
+    Endpoint de diagnóstico para verificar el estado del stream.
+    Retorna información detallada para debugging.
+    """
+    try:
+        from ...container import get_container
+        
+        container = get_container()
+        camera_service = container.get("camera_service")
+        
+        if not camera_service:
+            return jsonify({"success": False, "error": "Servicio no disponible"}), 500
+        
+        # Obtener información de la cámara
+        camera = camera_service.get_camera(camera_id)
+        if not camera:
+            return jsonify({"success": False, "error": "Cámara no encontrada"}), 404
+        
+        # Obtener worker y buffer
+        camera_manager = camera_service._camera_manager
+        worker = camera_manager.get_worker(camera_id)
+        buffer = camera_manager.get_buffer(camera_id)
+        distributor = camera_manager.get_distributor(camera_id)
+        
+        diag_info = {
+            "camera_id": camera_id,
+            "camera_info": camera,
+            "worker": worker.get_status() if worker else None,
+            "buffer_stats": buffer.get_stats() if buffer else None,
+            "distributor_stats": distributor.get_stats() if distributor else None,
+            "mjpeg_active": camera_id in mjpeg_streamer._frames if hasattr(mjpeg_streamer, '_frames') else None
+        }
+        
+        return jsonify({"success": True, "data": diag_info})
+        
+    except Exception as e:
+        logger.error(f"Error en diagnóstico: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @cameras_bp.route("/<int:camera_id>/stream", methods=["GET"])
 def get_camera_stream(camera_id: int):

@@ -107,11 +107,10 @@ class CameraService:
         created_camera = self._camera_repo.create(camera)
 
         # Iniciar si está activa
+        # CRÍTICO: El registro MJPEG ahora es automático en CameraManager, 
+        # ya no necesitamos llamarlo manualmente aquí
         if created_camera.is_active:
-            self._camera_manager.start_camera(created_camera)
-
-            # Registrar MJPEG como consumer
-            self.start_mjpeg_for_camera(created_camera.id)
+            self._camera_manager.start_camera(created_camera)  # register_mjpeg=True por defecto
 
         result = created_camera.to_dict() if hasattr(created_camera, 'to_dict') else self._camera_to_dict(created_camera)
         result["worker_status"] = None
@@ -154,8 +153,8 @@ class CameraService:
 
         if restart_needed:
             self._camera_manager.restart_camera(camera_id)
-            if updated.is_active:
-                self.start_mjpeg_for_camera(camera_id)
+            # CRÍTICO: No necesitamos llamar start_mjpeg_for_camera aquí
+            # porque restart_camera ya llama a start_camera con register_mjpeg=True
 
         return self.get_camera(camera_id)
 
@@ -177,9 +176,9 @@ class CameraService:
 
     def toggle_camera(self, camera_id: int, active: bool) -> dict | None:
         """
-    Activa o desactiva una cámara.
+        Activa o desactiva una cámara.
 
-    Args:
+        Args:
             camera_id: ID de la cámara
             active: True para activar, False para desactivar
 
@@ -194,8 +193,8 @@ class CameraService:
         updated = self._camera_repo.update(camera)
 
         if active:
+            # CRÍTICO: El registro MJPEG es automático en CameraManager
             self._camera_manager.start_camera(updated)
-            self.start_mjpeg_for_camera(camera_id)
         else:
             self._camera_manager.stop_camera(camera_id)
 
@@ -203,8 +202,8 @@ class CameraService:
 
     def set_ai_camera(self, camera_id: int) -> bool:
         """
-    Establece una cámara como la única cámara con AI activada.
-    Desactiva has_ai en todas las demás.
+        Establece una cámara como la única cámara con AI activada.
+        Desactiva has_ai en todas las demás.
 
         Args:
             camera_id: ID de la cámara para AI
@@ -267,9 +266,13 @@ class CameraService:
 
     def start_mjpeg_for_camera(self, camera_id: int) -> None:
         """
-    Registra el streamer MJPEG como consumer del distributor de la cámara.
-
-    Args:
+        Registra el streamer MJPEG como consumer del distributor de la cámara.
+        
+        NOTA: Este método se mantiene por compatibilidad pero YA NO SE USA
+        automáticamente. El registro MJPEG ahora se hace automáticamente
+        en CameraManager.start_camera().
+        
+        Args:
             camera_id: ID de la cámara
         """
         distributor = self._camera_manager.get_distributor(camera_id)
@@ -278,7 +281,7 @@ class CameraService:
                 "mjpeg", 
                 lambda fd: self._mjpeg.update_frame(camera_id, fd)
             )
-            self._logger.info(f"MJPEG registrado para cámara {camera_id}")
+            self._logger.info(f"MJPEG registrado manualmente para cámara {camera_id} (método legacy)")
 
     def _camera_to_dict(self, camera: Camera) -> dict:
         """Helper para convertir Camera a dict si el modelo no tiene to_dict."""

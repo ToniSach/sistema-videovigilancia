@@ -227,12 +227,41 @@ def create_app(config_name='default'):
         logger.error(f"Error inicializando base de datos: {e}")
         raise
     
+    # OPTIMIZACIÓN: Inicialización del contenedor con manejo de errores mejorado
+    # y carga lazy de servicios pesados
     @app.before_request
     def init_container():
         if not hasattr(app, '_container_initialized'):
             try:
-                get_container()
+                container = get_container()
+                
+                # OPTIMIZACIÓN: Iniciar cámaras activas solo después de que 
+                # el contenedor esté completamente listo y en un thread separado
+                # para no bloquear el arranque del servidor
+                import threading
+                
+                def delayed_camera_startup():
+                    """Inicia cámaras con delay para no bloquear el arranque de Flask."""
+                    import time
+                    time.sleep(0.5)  # Esperar 500ms a que Flask esté listo
+                    
+                    try:
+                        from backend.app.cameras.camera_manager import CameraManager
+                        cm = CameraManager()
+                        
+                        # OPTIMIZACIÓN: start_all_active ahora usa register_mjpeg=True por defecto
+                        cm.start_all_active()
+                        logger.info("Cámaras activas iniciadas automáticamente")
+                    except Exception as e:
+                        logger.error(f"Error iniciando cámaras: {e}")
+                
+                # Iniciar cámaras en thread separado para no bloquear el arranque
+                startup_thread = threading.Thread(target=delayed_camera_startup, daemon=True)
+                startup_thread.start()
+                
                 app._container_initialized = True
+                logger.info("Contenedor inicializado y cámaras en proceso de arranque")
+                
             except Exception as e:
                 logger.error(f"Error inicializando contenedor: {e}")
     
