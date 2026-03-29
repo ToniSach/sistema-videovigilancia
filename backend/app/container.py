@@ -51,35 +51,37 @@ class DependencyContainer:
             self.auth_service: AuthService = AuthService()
             logger.debug("AuthService registrado")
             
-            # Registrar servicios de cámaras (ahora _services ya existe)
+            # ===============================
+            # 🔧 SERVICIOS DE CÁMARA (MODIFICADO)
+            # ===============================
             try:
                 from backend.app.cameras.onvif_discovery import ONVIFDiscovery
                 from backend.app.cameras.camera_manager import CameraManager
                 from backend.app.services.camera_service import CameraService
                 
-                self.onvif_discovery = ONVIFDiscovery()
-                self._services["onvif_discovery"] = self.onvif_discovery
+                # ✅ CAMBIO: usar atributo privado consistente
+                self._onvif_discovery = ONVIFDiscovery()
+                self._services["onvif_discovery"] = self._onvif_discovery
                 logger.debug("ONVIFDiscovery registrado")
                 
                 # Crear CameraManager singleton
                 camera_manager = CameraManager()
                 
-                # Crear CameraService con todas las dependencias
+                # Crear CameraService con dependencias
                 camera_service = CameraService(
                     camera_repo=self.camera_repository,
                     camera_manager=camera_manager,
-                    onvif_discovery=self.onvif_discovery
+                    onvif_discovery=self._onvif_discovery  # ✅ usar el privado
                 )
+                
                 self._services["camera_service"] = camera_service
                 logger.info("CameraService registrado correctamente")
                 
             except ImportError as e:
                 logger.error(f"Error importando dependencias de cámara: {e}")
                 logger.error("Instale: pip install ifaddr wsdiscovery onvif-zeep")
-                # No propagar el error para que al menos el auth funcione
             except Exception as e:
                 logger.error(f"Error inicializando servicios de cámara: {e}", exc_info=True)
-                # No propagar para que el contenedor siga funcionando parcialmente
             
             DependencyContainer._initialized = True
             logger.info("DependencyContainer inicializado correctamente")
@@ -139,5 +141,5 @@ def get_container() -> DependencyContainer:
     return _container_instance
 
 
-# Alias para compatibilidad (cámaras_control.py busca 'Container')
+# Alias para compatibilidad
 Container = DependencyContainer

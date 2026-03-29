@@ -6,8 +6,9 @@ import time
 import os
 import shutil
 import queue
+import re
 from enum import Enum
-from typing import Optional
+from typing import Optional, Tuple
 
 from ..database.models import Camera
 from ..streaming.frame_buffer import CircularFrameBuffer
@@ -27,6 +28,20 @@ class FFmpegWorker:
     Worker que ejecuta FFmpeg para capturar stream RTSP.
     VERSIÓN CORREGIDA - Parámetros de salida simplificados.
     """
+
+    # Patrones de error FFmpeg y su clasificación
+    ERROR_PATTERNS = {
+        r"authentication failed": ("AUTH_FAILED", True),
+        r"connection refused": ("CONN_REFUSED", True),
+        r"invalid data found": ("INVALID_DATA", True),
+        r"timeout": ("TIMEOUT", True),
+        r"404 not found": ("NOT_FOUND", False),
+        r"401 unauthorized": ("UNAUTHORIZED", False),
+        r"could not find codec": ("CODEC_ERROR", False),
+        r"protocol not found": ("PROTOCOL_ERROR", False),
+        r"invalid argument": ("INVALID_ARG", False),
+        r"memory allocation error": ("MEMORY_ERROR", False),
+    }
 
     def __init__(self, camera: Camera, frame_buffer: CircularFrameBuffer, 
                  rtsp_transport: str = "tcp"):
@@ -59,6 +74,7 @@ class FFmpegWorker:
         self._frame_size = self.resolution_width * self.resolution_height * 3
         self._frames_processed = 0
         self._frames_sent = 0
+        self._last_error_code: Optional[str] = None  # Nuevo: último código de error
 
         self._ffmpeg_path = self._find_ffmpeg_executable()
         if not self._ffmpeg_path:
@@ -108,6 +124,15 @@ class FFmpegWorker:
 
         return cmd
 
+    def _parse_error(self, line: str) -> Tuple[Optional[str], bool]:
+        """
+        Analiza una línea de stderr de FFmpeg y devuelve (código_error, retryable).
+        """
+        for pattern, (code, retryable) in self.ERROR_PATTERNS.items():
+            if re.search(pattern, line, re.IGNORECASE):
+                return code, retryable
+        return None, True
+
     def start(self) -> None:
         if self._running:
             return
@@ -122,6 +147,7 @@ class FFmpegWorker:
             self.status = WorkerStatus.STARTING
             self._last_frame_time = time.time()
             self._reconnect_attempts = 0
+            self._last_error_code = None
 
         self._thread = threading.Thread(
             target=self._worker_loop,
@@ -212,13 +238,25 @@ class FFmpegWorker:
 
                 line_str = line.decode('utf-8', errors='ignore').strip()
                 if line_str:
-                    # Filtrar errores comunes de HEVC (no críticos)
-                    if "Error constructing the frame RPS" in line_str:
-                        self._logger.debug(f"HEVC warning: {line_str}")
-                    elif "Invalid data found" in line_str:
-                        self._logger.debug(f"FFmpeg: {line_str}")
+                    # Analizar error
+                    error_code, retryable = self._parse_error(line_str)
+                    if error_code:
+                        self._last_error_code = error_code
+                        level = logging.ERROR if not retryable else logging.WARNING
+                        self._logger.log(level, f"FFmpeg error [{error_code}]: {line_str}")
+                        # Si es no-reintentable, detener el worker
+                        if not retryable:
+                            self._logger.critical(f"Error fatal, deteniendo worker: {error_code}")
+                            self.stop()
+                            break
                     else:
-                        self._logger.debug(f"FFmpeg: {line_str}")
+                        # Filtro de errores comunes no críticos
+                        if "Error constructing the frame RPS" in line_str:
+                            self._logger.debug(f"HEVC warning: {line_str}")
+                        elif "Invalid data found" in line_str:
+                            self._logger.debug(f"FFmpeg: {line_str}")
+                        else:
+                            self._logger.debug(f"FFmpeg: {line_str}")
 
         except Exception as e:
             self._logger.debug(f"Stderr reader terminado: {e}")
@@ -402,7 +440,8 @@ class FFmpegWorker:
                 "ffmpeg_found": self._ffmpeg_path is not None,
                 "expected_resolution": f"{self.resolution_width}x{self.resolution_height}",
                 "queue_size": self._stdout_queue.qsize(),
-                "rtsp_transport": self.rtsp_transport
+                "rtsp_transport": self.rtsp_transport,
+                "last_error_code": self._last_error_code  # Incluir último error detectado
             }
 
     def switch_transport(self, transport: str) -> bool:

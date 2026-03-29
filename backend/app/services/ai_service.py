@@ -3,12 +3,14 @@ AI Service - Servicio de alto nivel para gestión de IA.
 Coordina schedulers para todas las cámaras activas.
 """
 
-from typing import Callable
+import time
 import logging
 import threading
+from typing import Callable
 
 from ..cameras.camera_manager import CameraManager
 from ..processing.ai.ai_scheduler import AIScheduler
+from ..events.event_manager import event_manager, EventData
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,6 @@ class AIService:
         Args:
             camera_manager: Instancia de CameraManager para acceder a distributors
         """
-
         self._camera_manager = camera_manager
         self._schedulers: dict[int, AIScheduler] = {}
         self._lock = threading.Lock()
@@ -42,7 +43,6 @@ class AIService:
         Args:
             callback: Función(camera_id, event_type, class_name, confidence, metadata)
         """
-
         self._event_callback = callback
 
         # Actualizar callbacks en schedulers existentes
@@ -58,29 +58,47 @@ class AIService:
     def _handle_detection(self, camera_id: int, class_name: str, confidence: float, frame, metadata: dict = None) -> None:
         """
         Handler interno para detecciones de schedulers.
-        Recibe metadata con count (cantidad de objetos detectados).
+        Publica evento en EventManager para notificaciones y llama al callback de logging.
         """
+        # Llamar al callback de logging si existe
         if self._event_callback:
-            event_metadata = metadata or {}
-            event_metadata["detected_class"] = class_name
-            
-            # Si hay múltiples objetos, incluir el conteo en el mensaje
-            if metadata and metadata.get("count", 1) > 1:
-                event_metadata["object_count"] = metadata["count"]
-                logger.info(f"Detección múltiple: {metadata['count']} {class_name}s")
-            
-            self._event_callback(
-                camera_id,
-                "ai_detection",
-                class_name,
-                confidence,
-                event_metadata
-            )
+            self._event_callback(camera_id, class_name, class_name, confidence, metadata)
+
+        # Preparar metadata para el evento
+        event_metadata = {
+            "class": class_name,
+            "count": metadata.get("count", 1) if metadata else 1,
+            "bbox": metadata.get("bbox") if metadata else None,
+            "object_count": metadata.get("count", 1) if metadata else 1
+        }
+
+        # Obtener nombre de la cámara (si está disponible)
+        camera_name = f"Camara_{camera_id}"
+        try:
+            # Intentar obtener el nombre real de la cámara si CameraManager tiene el método
+            camera = self._camera_manager.get_camera_by_id(camera_id)
+            if camera:
+                camera_name = camera.name
+        except Exception:
+            pass  # Mantener nombre genérico
+
+        # Crear evento con el tipo real (class_name)
+        event_data = EventData(
+            camera_id=camera_id,
+            camera_name=camera_name,          # <-- CAMPO OBLIGATORIO AGREGADO
+            event_type=class_name,
+            confidence=confidence,
+            timestamp=time.time(),
+            metadata=event_metadata
+        )
+
+        # Publicar evento
+        event_manager.publish(event_data)
+        logger.debug(f"Evento publicado para {class_name} en cámara {camera_id}")
 
     def activate_ai(self, camera_id: int, mode: str = "low_cpu") -> bool:
         """
         Activa el procesamiento de IA para una cámara.
-        Esto significa: si detecta una persona, espera 30s antes de alertar "persona" otra vez
         
         Args:
             camera_id: ID de la cámara
@@ -89,7 +107,6 @@ class AIService:
         Returns:
             True si se activó correctamente
         """
-        # CORRECCIÓN: La instanciación ahora está DENTRO del método
         # Obtener distributor
         distributor = self._camera_manager.get_distributor(camera_id)
         if distributor is None:
@@ -104,7 +121,7 @@ class AIService:
                 old_scheduler.stop(distributor)
                 del self._schedulers[camera_id]
 
-            # CORRECCIÓN: Crear scheduler DENTRO del método, no en la firma
+            # Crear scheduler
             scheduler = AIScheduler(camera_id, mode, cooldown_seconds=30)
 
             # Asignar callback si existe
@@ -131,7 +148,6 @@ class AIService:
         Returns:
             True si se desactivó correctamente
         """
-
         distributor = self._camera_manager.get_distributor(camera_id)
 
         with self._lock:
@@ -159,7 +175,6 @@ class AIService:
         Returns:
             True si se cambió correctamente
         """
-
         with self._lock:
             if camera_id not in self._schedulers:
                 logger.error(f"No hay IA activa en cámara {camera_id} para cambiar modo")
@@ -177,7 +192,6 @@ class AIService:
         Returns:
             Dict con IDs activas y estadísticas
         """
-
         with self._lock:
             active_ids = list(self._schedulers.keys())
             schedulers_stats = {
@@ -193,8 +207,8 @@ class AIService:
 
     def stop_all(self) -> None:
         """
-        Detiene todos los schedulers de IA (util para shutdown)."""
-
+        Detiene todos los schedulers de IA (util para shutdown).
+        """
         with self._lock:
             schedulers_copy = dict(self._schedulers)
             self._schedulers.clear()

@@ -34,12 +34,12 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     
-    # Relaciones (ya estaban correctas)
+    # Relaciones
     cameras_owned: Mapped[List["Camera"]] = relationship(back_populates="owner")
     permissions: Mapped[List["UserCameraPermission"]] = relationship(back_populates="user")
     devices: Mapped[List["MobileDevice"]] = relationship(back_populates="user")
     notification_preferences: Mapped[List["NotificationPreference"]] = relationship(back_populates="user")
-    telegram_chats: Mapped[List["UserTelegramChat"]] = relationship(back_populates="user")  # Referencia a "user"
+    telegram_chats: Mapped[List["UserTelegramChat"]] = relationship(back_populates="user")
     
     def to_dict(self) -> dict:
         return {
@@ -78,6 +78,18 @@ class Camera(Base):
     fps: Mapped[int] = mapped_column(Integer, default=15)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     
+    # Nuevos campos para robustez y diagnóstico
+    connection_type: Mapped[str] = mapped_column(String(20), default="unknown")
+    # Valores: "onvif", "rtsp_fallback", "manual"
+    
+    last_error_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # Valores: "AUTH_FAILED", "CONN_REFUSED", "FROZEN", etc.
+    
+    last_connected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    
+    fallback_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    # Si ONVIF falló pero RTSP funcionó, guardar aquí la URL alternativa
+    
     # NUEVO: Owner de la cámara
     owner_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     owner: Mapped[Optional["User"]] = relationship(back_populates="cameras_owned")
@@ -107,7 +119,11 @@ class Camera(Base):
             "resolution_height": self.resolution_height,
             "fps": self.fps,
             "owner_id": self.owner_id,
-            "created_at": self.created_at.isoformat() if self.created_at else None
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "connection_type": self.connection_type,
+            "last_error_code": self.last_error_code,
+            "last_connected_at": self.last_connected_at.isoformat() if self.last_connected_at else None,
+            "fallback_url": self.fallback_url
         }
 
 
@@ -326,7 +342,7 @@ class UserTelegramChat(Base):
     linked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     
-    # ✅ CORRECCIÓN: Agregar esta relación para completar back_populates
+    # Relación con usuario
     user: Mapped["User"] = relationship(back_populates="telegram_chats")
 
 

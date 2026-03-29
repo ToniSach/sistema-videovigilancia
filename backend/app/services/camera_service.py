@@ -83,6 +83,29 @@ class CameraService:
         Returns:
             Diccionario con la cámara creada
         """
+        # Validar si hay IP para probar
+        ip = data.get('ip_address')
+        if ip:
+            try:
+                discovery = ONVIFDiscovery()
+                device_info = discovery.probe_single_ip(ip)
+                if device_info:
+                    # Auto-completar desde el descubrimiento
+                    data['rtsp_url'] = device_info['rtsp_url']
+                    data['username'] = device_info['username']
+                    data['password'] = device_info['password']
+                    data['manufacturer'] = device_info.get('manufacturer', 'Unknown')
+                    data['connection_type'] = device_info.get('connection_type', 'manual')
+                    # Opcionalmente actualizar resolución/fps
+                    data['resolution_width'] = device_info.get('resolution_width', data.get('resolution_width', 1920))
+                    data['resolution_height'] = device_info.get('resolution_height', data.get('resolution_height', 1080))
+                    data['fps'] = device_info.get('fps', data.get('fps', 15))
+                else:
+                    # Si falla el probe, no guardar (o guardar con advertencia)
+                    raise ValueError("No se pudo conectar a la cámara. Verifique IP y credenciales.")
+            except Exception as e:
+                raise ValueError(f"Error validando cámara: {e}")
+
         # Crear objeto Camera
         camera = Camera(
             name=data.get('name', 'Nueva Cámara'),
@@ -100,15 +123,14 @@ class CameraService:
             is_dual_lens=data.get('is_dual_lens', False),
             resolution_width=data.get('resolution_width', 1920),
             resolution_height=data.get('resolution_height', 1080),
-            fps=data.get('fps', 25)
+            fps=data.get('fps', 25),
+            connection_type=data.get('connection_type', 'manual')  # Nuevo campo
         )
 
         # Guardar en BD
         created_camera = self._camera_repo.create(camera)
 
         # Iniciar si está activa
-        # CRÍTICO: El registro MJPEG ahora es automático en CameraManager, 
-        # ya no necesitamos llamarlo manualmente aquí
         if created_camera.is_active:
             self._camera_manager.start_camera(created_camera)  # register_mjpeg=True por defecto
 
@@ -300,5 +322,6 @@ class CameraService:
             "is_dual_lens": camera.is_dual_lens,
             "resolution_width": camera.resolution_width,
             "resolution_height": camera.resolution_height,
-            "fps": camera.fps
+            "fps": camera.fps,
+            "connection_type": camera.connection_type if hasattr(camera, 'connection_type') else "unknown"
         }

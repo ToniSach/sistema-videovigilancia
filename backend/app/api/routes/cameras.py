@@ -5,6 +5,8 @@ from ...streaming.mjpeg_streamer import mjpeg_streamer
 import logging
 
 from backend.app.services.permission_service import require_camera_permission
+from ...cameras.camera_manager import CameraManager
+from ...workers.ffmpeg_worker import WorkerStatus
 
 cameras_bp = Blueprint("cameras", __name__, url_prefix="/api/v1/cameras")
 logger = logging.getLogger(__name__)
@@ -185,6 +187,7 @@ def audio_talk(camera_id):
         logger.error(f"Error audio talk {camera_id}: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+
 @cameras_bp.route("/<int:camera_id>/diagnose", methods=["GET"])
 @jwt_required()
 def diagnose_camera(camera_id: int):
@@ -193,39 +196,43 @@ def diagnose_camera(camera_id: int):
     Retorna información detallada para debugging.
     """
     try:
-        from ...container import get_container
-        
-        container = get_container()
-        camera_service = container.get("camera_service")
-        
-        if not camera_service:
-            return jsonify({"success": False, "error": "Servicio no disponible"}), 500
-        
-        # Obtener información de la cámara
-        camera = camera_service.get_camera(camera_id)
+        cm = CameraManager()
+        worker = cm.get_worker(camera_id)
+        camera = cm._camera_repo.get_by_id(camera_id)
+
         if not camera:
             return jsonify({"success": False, "error": "Cámara no encontrada"}), 404
-        
-        # Obtener worker y buffer
-        camera_manager = camera_service._camera_manager
-        worker = camera_manager.get_worker(camera_id)
-        buffer = camera_manager.get_buffer(camera_id)
-        distributor = camera_manager.get_distributor(camera_id)
-        
-        diag_info = {
+
+        status = {
             "camera_id": camera_id,
-            "camera_info": camera,
-            "worker": worker.get_status() if worker else None,
-            "buffer_stats": buffer.get_stats() if buffer else None,
-            "distributor_stats": distributor.get_stats() if distributor else None,
-            "mjpeg_active": camera_id in mjpeg_streamer._frames if hasattr(mjpeg_streamer, '_frames') else None
+            "name": camera.name,
+            "connection_type": camera.connection_type,
+            "last_error_code": camera.last_error_code,
+            "last_connected_at": camera.last_connected_at.isoformat() if camera.last_connected_at else None,
+            "is_active": camera.is_active
         }
-        
-        return jsonify({"success": True, "data": diag_info})
-        
+
+        if worker:
+            worker_status = worker.get_status()
+            status.update({
+                "worker_status": worker_status,
+                "health": "ok" if worker_status["status"] == WorkerStatus.RUNNING.value else "degraded"
+            })
+        else:
+            # Verificar si está en error permanente
+            all_status = cm.get_all_status()
+            perm = all_status.get(camera_id, {}).get('permanent_error', False) if all_status else False
+            status.update({
+                "worker_status": None,
+                "health": "permanent_error" if perm else "stopped"
+            })
+
+        return jsonify({"success": True, "data": status})
+
     except Exception as e:
         logger.error(f"Error en diagnóstico: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
+
 
 @cameras_bp.route("/<int:camera_id>/stream", methods=["GET"])
 def get_camera_stream(camera_id: int):
