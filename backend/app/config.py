@@ -84,6 +84,11 @@ class Settings:
             self.FFMPEG_RESOLUTION_WIDTH: int = int(os.getenv("FFMPEG_RESOLUTION_WIDTH", "1280"))
             self.FFMPEG_RESOLUTION_HEIGHT: int = int(os.getenv("FFMPEG_RESOLUTION_HEIGHT", "720"))
             self.FFMPEG_FPS: int = int(os.getenv("FFMPEG_FPS", "15"))
+
+            # DUAL LENS: resolución del stream completo antes del split
+            # Si tu cámara transmite 1280x1440 (dos lentes de 720 cada uno)
+            self.FFMPEG_DUAL_LENS_WIDTH: int = int(os.getenv("FFMPEG_DUAL_LENS_WIDTH", "1280"))
+            self.FFMPEG_DUAL_LENS_HEIGHT: int = int(os.getenv("FFMPEG_DUAL_LENS_HEIGHT", "1440"))
             
             # ==============================
             # TELEGRAM

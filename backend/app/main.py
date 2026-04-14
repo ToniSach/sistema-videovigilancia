@@ -144,25 +144,6 @@ def create_app(config_name='default'):
     try:
         db_manager.init_db()
         logger.info("Base de datos inicializada correctamente")
-        
-        # ================== NUEVO: Crear usuario admin si no existe ==================
-        try:
-            from backend.app.services.user_service import UserService
-            from backend.app.database.connection import db_manager as local_db
-            from backend.app.database.models import User
-            
-            with local_db.get_session() as session:
-                admin = session.query(User).filter_by(username="admin").first()
-                if not admin:
-                    user_service = UserService()
-                    user_service.create_user("admin", "admin123", role="admin")
-                    logger.info("✅ Usuario admin creado: admin / admin123")
-                else:
-                    logger.info("Usuario admin ya existe")
-        except Exception as e:
-            logger.warning(f"No se pudo crear usuario admin automáticamente: {e}")
-        # ============================================================================
-        
     except Exception as e:
         logger.critical(f"Error inicializando DB: {e}")
         raise

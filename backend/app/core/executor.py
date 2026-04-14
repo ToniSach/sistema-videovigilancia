@@ -17,7 +17,7 @@ class GlobalExecutor:
     """
     _instance = None
     _lock = threading.Lock()
-    MAX_WORKERS = 20  # FIX F1.3: Límite global estricto
+    MAX_WORKERS = 50  # FIX F1.3: Límite global estricto
 
     def __new__(cls):
         if cls._instance is None:

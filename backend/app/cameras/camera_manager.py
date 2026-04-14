@@ -38,6 +38,7 @@ class CameraManager:
         self._buffers: dict = {}
         self._distributors: dict = {}
         self._lifecycle_lock = threading.Lock()
+        self._lock = threading.Lock()
         self._camera_repo = CameraRepository()
         self._logger = logging.getLogger(__name__)
         self._initialized = True
@@ -79,7 +80,8 @@ class CameraManager:
                 return False
 
     def start_dual_lens_camera(self, parent_camera: Camera) -> bool:
-        from ..processing.dual_lens_splitter import DualLensSplitter
+        from ..cameras.dual_lens_splitter import DualLensSplitter
+        from backend.app.config import settings
 
         with self._lifecycle_lock:
             if parent_camera.id in self._workers:
@@ -89,9 +91,19 @@ class CameraManager:
             try:
                 self._logger.info(f"Iniciando cámara DUAL LENS {parent_camera.id}")
 
+                # FIX: Buffer raw con resolución COMPLETA (no la default 720p)
                 raw_buffer = CircularFrameBuffer(camera_id=parent_camera.id, maxsize=5)
                 raw_distributor = FrameDistributor(camera_id=parent_camera.id)
-                worker = FFmpegWorker(camera=parent_camera, frame_buffer=raw_buffer)
+                
+                # FIX: Pasar target_resolution forzando las dimensiones duales
+                dual_width = settings.FFMPEG_DUAL_LENS_WIDTH   # 1280
+                dual_height = settings.FFMPEG_DUAL_LENS_HEIGHT # 1440
+                
+                worker = FFmpegWorker(
+                    camera=parent_camera, 
+                    frame_buffer=raw_buffer,
+                    target_resolution=(dual_width, dual_height)  # ← ESTO ES CLAVE
+                )
 
                 raw_distributor.start(raw_buffer)
                 worker.start()
@@ -100,7 +112,8 @@ class CameraManager:
                 self._buffers[parent_camera.id] = raw_buffer
                 self._distributors[parent_camera.id] = raw_distributor
 
-                splitter = DualLensSplitter(parent_camera.id, split_mode="vertical")
+                # Configurar el splitter
+                splitter = DualLensSplitter(parent_camera.id, split_mode="vertical")  # o "horizontal"
 
                 def split_and_distribute(frame_data: FrameData):
                     frame = frame_data.frame
@@ -134,15 +147,14 @@ class CameraManager:
                     needs_copy=True
                 )
 
-                self._logger.info(f"Cámara dual {parent_camera.id} iniciada correctamente")
-                self._logger.info(f"  → Lente izquierdo disponible con stream_id='l1'")
-                self._logger.info(f"  → Lente derecho disponible con stream_id='l2'")
+                self._logger.info(f"✅ Cámara dual {parent_camera.id} iniciada: "
+                                f"{dual_width}x{dual_height} → l1/l2")
                 return True
 
             except Exception as e:
                 self._logger.error(f"Error iniciando cámara dual {parent_camera.id}: {e}", exc_info=True)
                 return False
-
+        
     def stop_camera(self, camera_id: int) -> bool:
         with self._lifecycle_lock:
             if camera_id in self._workers:

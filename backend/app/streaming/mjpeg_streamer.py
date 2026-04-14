@@ -121,23 +121,41 @@ class MJPEGStreamer:
                         del self._clients[key]
 
     def update_frame(self, camera_id: int, stream_id: str, frame_data: FrameData) -> None:
+        """
+        Versión corregida: El encoding sucede en el worker thread, no en el distributor.
+        FIX C3: Evita bloquear el pipeline principal.
+        """
         key = (camera_id, stream_id)
+        
+        # Verificar si hay clientes (lectura rápida con lock)
         with self._lock:
-            if key not in self._clients:
+            if key not in self._clients or not self._clients[key]:
+                return  # No hay clientes, descartar inmediatamente
+            
+            # Si hay clientes, enviar a procesamiento async
+            # FIX: Usar executor para encoding, no el hilo del distributor
+            global_executor.submit(self._encode_and_distribute, key, frame_data)
+
+    def _encode_and_distribute(self, key, frame_data: FrameData) -> None:
+        """
+        Ejecutado en worker thread del GlobalExecutor.
+        """
+        try:
+            jpeg_bytes = self._encode_frame(frame_data)
+            if jpeg_bytes is None:
                 return
-            clients = dict(self._clients[key])
-
-        # ✅ Encoding fuera del lock, síncrono (no en executor)
-        jpeg_bytes = self._encode_frame(frame_data)
-        if jpeg_bytes is None:
-            return
-
-        boundary_frame = self._build_mjpeg_frame(jpeg_bytes)
-
-        # ✅ Distribución directa con drop-oldest, sin executor
-        with self._lock:
-            for client_id, client_info in list(self._clients.get(key, {}).items()):
+            
+            boundary_frame = self._build_mjpeg_frame(jpeg_bytes)
+            
+            # Distribución a clientes (ahora es rápida, solo encolar bytes)
+            with self._lock:
+                clients = list(self._clients.get(key, {}).items())
+            
+            for client_id, client_info in clients:
                 self._send_to_client(client_info, boundary_frame, client_id)
+                
+        except Exception as e:
+            self._logger.error(f"Error en encoding MJPEG: {e}")
 
     def _send_to_client(self, client_info: ClientInfo, frame: bytes, client_id: str):
         """

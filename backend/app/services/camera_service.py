@@ -292,23 +292,6 @@ class CameraService:
             "camera_info": camera.to_dict() if camera and hasattr(camera, 'to_dict') else self._camera_to_dict(camera) if camera else None
         }
 
-    def start_mjpeg_for_camera(self, camera_id: int) -> None:
-        """
-        ✅ DEPRECATED: Este método ya no debe usarse.
-        
-        El registro MJPEG ahora es automático en CameraManager.start_camera().
-        Mantenido por compatibilidad con código legacy pero no realiza ninguna acción.
-        
-        Args:
-            camera_id: ID de la cámara (ignorado)
-        """
-        self._logger.warning(
-            f"start_mjpeg_for_camera({camera_id}) llamado pero está DEPRECATED. "
-            f"El registro MJPEG es automático en CameraManager."
-        )
-        # NO-OP: No registramos nada aquí para evitar duplicados
-        return
-
     def _camera_to_dict(self, camera: Camera) -> dict:
         """Helper para convertir Camera a dict si el modelo no tiene to_dict."""
         return {
