@@ -1,11 +1,14 @@
 """
-Main entry point para el backend del Sistema NVR.
-Inicializa Flask, base de datos y todos los servicios.
+Main entry point - Fase 0, 1, 2 y 3 integradas.
 """
 import sys
 import os
 import logging
 from pathlib import Path
+
+# ============================================================================
+# LOGGING
+# ============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,21 +26,14 @@ def setup_paths():
     backend_dir = current_dir.parent
     root_dir = backend_dir.parent
     
-    paths_to_add = [
-        str(root_dir),
-        str(backend_dir),
-        str(current_dir),
-    ]
-    
-    for path in paths_to_add:
+    for path in [str(root_dir), str(backend_dir), str(current_dir)]:
         if path not in sys.path:
             sys.path.insert(0, path)
-            logger.debug(f"Path añadido: {path}")
 
 setup_paths()
 
 # ============================================================================
-# IMPORTS DE FLASK Y EXTENSIONES
+# IMPORTS
 # ============================================================================
 
 from flask import Flask, jsonify
@@ -45,248 +41,242 @@ from flask_jwt_extended import JWTManager
 from flask_cors import CORS
 from datetime import timedelta
 
-# ============================================================================
-# IMPORTS DEL PROYECTO
-# ============================================================================
-
 try:
     from backend.app.config import settings
     from backend.app.database.connection import db_manager
     from backend.app.container import get_container
 except ImportError as e:
-    logger.error(f"Error crítico importando módulos del backend: {e}")
+    logger.critical(f"Error crítico importando módulos: {e}")
     sys.exit(1)
 
-# ============================
-# NUEVOS IMPORTS (BLUEPRINTS)
-# ============================
-
-from backend.app.api.routes.users import users_bp
-from backend.app.api.routes.permissions import permissions_bp
-from backend.app.api.routes.notifications import notifications_bp
-from backend.app.api.routes.devices import devices_bp
-from backend.app.api.routes.telegram import telegram_bp
-from backend.app.api.routes.qr import qr_bp
-from backend.app.api.routes.storage import storage_bp  # ✅ NUEVO
+# Rate limiter
+from backend.app.api.middleware.rate_limiter import create_limiter
 
 # ============================================================================
 # BLUEPRINTS
 # ============================================================================
 
 def register_blueprints(app):
-    """Registra todos los blueprints de la API."""
+    """Registra todos los blueprints disponibles."""
     
     blueprints = []
+
+    def safe_register(import_path, name):
+        try:
+            module = __import__(import_path, fromlist=[name])
+            bp = getattr(module, name)
+            app.register_blueprint(bp)
+            blueprints.append(name.replace("_bp", ""))
+        except Exception as e:
+            logger.error(f"Error registrando '{name}': {e}")
+
+    # Core
+    safe_register("backend.app.api.routes.auth", "auth_bp")
+    safe_register("backend.app.api.routes.cameras", "cameras_bp")
+    safe_register("backend.app.api.routes.events", "events_bp")
+    safe_register("backend.app.api.routes.recordings", "recordings_bp")
+    safe_register("backend.app.api.routes.system", "system_bp")
+
+    # Multiusuario
+    safe_register("backend.app.api.routes.users", "users_bp")
+    safe_register("backend.app.api.routes.permissions", "permissions_bp")
+    safe_register("backend.app.api.routes.notifications", "notifications_bp")
+    safe_register("backend.app.api.routes.devices", "devices_bp")
+
+    # Telegram
+    #safe_register("backend.app.api.routes.telegram", "telegram_bp")
+    safe_register("backend.app.api.routes.telegram_link", "telegram_link_bp")
+
+    # Otros
+    safe_register("backend.app.api.routes.qr", "qr_bp")
+    safe_register("backend.app.api.routes.storage", "storage_bp")
     
-    try:
-        from backend.app.api.routes.auth import auth_bp
-        app.register_blueprint(auth_bp)
-        blueprints.append('auth')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'auth': {e}")
-
-    try:
-        from backend.app.api.routes.cameras import cameras_bp
-        app.register_blueprint(cameras_bp)
-        blueprints.append('cameras')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'cameras': {e}")
-
-    try:
-        from backend.app.api.routes.events import events_bp
-        app.register_blueprint(events_bp)
-        blueprints.append('events')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'events': {e}")
-
-    try:
-        from backend.app.api.routes.recordings import recordings_bp
-        app.register_blueprint(recordings_bp)
-        blueprints.append('recordings')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'recordings': {e}")
-
-    try:
-        from backend.app.api.routes.system import system_bp
-        app.register_blueprint(system_bp)
-        blueprints.append('system')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'system': {e}")
-
-    # ============================
-    # NUEVOS BLUEPRINTS MULTIUSUARIO
-    # ============================
-
-    try:
-        app.register_blueprint(users_bp)
-        blueprints.append('users')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'users': {e}")
-
-    try:
-        app.register_blueprint(permissions_bp)
-        blueprints.append('permissions')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'permissions': {e}")
-
-    try:
-        app.register_blueprint(notifications_bp)
-        blueprints.append('notifications')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'notifications': {e}")
-
-    try:
-        app.register_blueprint(devices_bp)
-        blueprints.append('devices')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'devices': {e}")
-
-    try:
-        app.register_blueprint(telegram_bp)
-        blueprints.append('telegram')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'telegram': {e}")
-
-    try:
-        app.register_blueprint(qr_bp)
-        blueprints.append('qr')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'qr': {e}")
-
-    # ============================
-    # NUEVO: STORAGE
-    # ============================
-
-    try:
-        app.register_blueprint(storage_bp)
-        blueprints.append('storage')
-    except Exception as e:
-        logger.error(f"Error registrando blueprint 'storage': {e}")
-
-    # ============================
-    # INTEGRACIÓN EVENTOS → NOTIFICACIONES
-    # ============================
-
-    try:
-        from backend.app.services.notification_router import notification_router
-        from backend.app.events.event_manager import event_manager
-
-        def on_event(event_data):
-            try:
-                notification_router.handle_event(event_data)
-            except Exception as e:
-                logger.error(f"Error procesando evento: {e}")
-
-        event_manager.subscribe_all(on_event)
-        logger.info("EventManager conectado a NotificationRouter")
-
-    except Exception as e:
-        logger.error(f"Error integrando eventos/notificaciones: {e}")
+    # FASE 2: Móvil
+    safe_register("backend.app.api.routes.mobile", "mobile_bp")
 
     return blueprints
 
-
 # ============================================================================
-# FACTORY APP
+# FACTORY
 # ============================================================================
 
 def create_app(config_name='default'):
     app = Flask(__name__)
-    
+
+    # Configuración básica
     app.config['SECRET_KEY'] = settings.SECRET_KEY
     app.config['JWT_SECRET_KEY'] = settings.JWT_SECRET_KEY
     app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(minutes=settings.JWT_ACCESS_TOKEN_MINUTES)
     app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days=settings.JWT_REFRESH_TOKEN_DAYS)
-    
+
+    # JWT
     jwt = JWTManager(app)
-    
+
+    @jwt.expired_token_loader
+    def expired_token_callback(jwt_header, jwt_payload):
+        return jsonify({"success": False, "error": "Token expirado"}), 401
+
+    @jwt.invalid_token_loader
+    def invalid_token_callback(error):
+        return jsonify({"success": False, "error": "Token inválido"}), 401
+
+    @jwt.unauthorized_loader
+    def missing_token_callback(error):
+        return jsonify({"success": False, "error": "Autorización requerida"}), 401
+
+    # Rate Limiter
+    limiter = create_limiter(app)
+    app.limiter = limiter
+
+    # CORS
     CORS(app, resources={
         r"/api/*": {
-            "origins": ["http://localhost", "http://127.0.0.1"],
+            "origins": ["http://localhost", "http://127.0.0.1", "*"],
             "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
             "allow_headers": ["Authorization", "Content-Type"]
         }
     })
-    
-    @jwt.expired_token_loader
-    def expired_token_callback(jwt_header, jwt_payload):
-        return jsonify({"success": False, "error": "Token expirado"}), 401
-    
-    @jwt.invalid_token_loader
-    def invalid_token_callback(error):
-        return jsonify({"success": False, "error": "Token inválido"}), 401
-    
-    @jwt.unauthorized_loader
-    def missing_token_callback(error):
-        return jsonify({"success": False, "error": "Autorización requerida"}), 401
-    
+
+    # ============================================================================
+    # BASE DE DATOS
+    # ============================================================================
+
     try:
         db_manager.init_db()
         logger.info("Base de datos inicializada correctamente")
+        
+        # ================== NUEVO: Crear usuario admin si no existe ==================
+        try:
+            from backend.app.services.user_service import UserService
+            from backend.app.database.connection import db_manager as local_db
+            from backend.app.database.models import User
+            
+            with local_db.get_session() as session:
+                admin = session.query(User).filter_by(username="admin").first()
+                if not admin:
+                    user_service = UserService()
+                    user_service.create_user("admin", "admin123", role="admin")
+                    logger.info("✅ Usuario admin creado: admin / admin123")
+                else:
+                    logger.info("Usuario admin ya existe")
+        except Exception as e:
+            logger.warning(f"No se pudo crear usuario admin automáticamente: {e}")
+        # ============================================================================
+        
     except Exception as e:
-        logger.error(f"Error inicializando base de datos: {e}")
+        logger.critical(f"Error inicializando DB: {e}")
         raise
-    
-    # OPTIMIZACIÓN: Inicialización del contenedor con manejo de errores mejorado
-    # y carga lazy de servicios pesados
-    @app.before_request
-    def init_container():
-        if not hasattr(app, '_container_initialized'):
+
+    # ============================================================================
+    # CONTENEDOR + CÁMARAS + STORAGE MANAGER + METRICS + HLS + CONSISTENCY + STALLED MONITOR
+    # ============================================================================
+
+    try:
+        container = get_container()
+
+        import threading
+        import time
+
+        def delayed_camera_startup():
+            time.sleep(0.5)
             try:
-                container = get_container()
-                
-                # OPTIMIZACIÓN: Iniciar cámaras activas solo después de que 
-                # el contenedor esté completamente listo y en un thread separado
-                # para no bloquear el arranque del servidor
-                import threading
-                
-                def delayed_camera_startup():
-                    """Inicia cámaras con delay para no bloquear el arranque de Flask."""
-                    import time
-                    time.sleep(0.5)  # Esperar 500ms a que Flask esté listo
-                    
-                    try:
-                        from backend.app.cameras.camera_manager import CameraManager
-                        cm = CameraManager()
-                        
-                        # OPTIMIZACIÓN: start_all_active ahora usa register_mjpeg=True por defecto
-                        cm.start_all_active()
-                        logger.info("Cámaras activas iniciadas automáticamente")
-                    except Exception as e:
-                        logger.error(f"Error iniciando cámaras: {e}")
-                
-                # Iniciar cámaras en thread separado para no bloquear el arranque
-                startup_thread = threading.Thread(target=delayed_camera_startup, daemon=True)
-                startup_thread.start()
-                
-                app._container_initialized = True
-                logger.info("Contenedor inicializado y cámaras en proceso de arranque")
-                
+                from backend.app.cameras.camera_manager import CameraManager
+                CameraManager().start_all_active()
+                logger.info("Cámaras iniciadas correctamente")
             except Exception as e:
-                logger.error(f"Error inicializando contenedor: {e}")
-    
+                logger.error(f"Error iniciando cámaras: {e}")
+
+        threading.Thread(target=delayed_camera_startup, daemon=True).start()
+
+        # StorageManager
+        try:
+            from backend.app.recording.storage_manager import StorageManager
+            from backend.app.database.repositories.recording_repository import RecordingRepository
+            
+            recording_repo = RecordingRepository()
+            storage_manager = StorageManager(recording_repo=recording_repo)
+            storage_manager.start()
+            app.storage_manager = storage_manager
+            logger.info("StorageManager iniciado")
+        except Exception as e:
+            logger.error(f"Error iniciando StorageManager: {e}")
+
+        # MetricsCollector (singleton, ya se autoinicia)
+        from backend.app.infrastructure.metrics.collector import metrics_collector
+        logger.info("MetricsCollector activo")
+
+        # LiveHLSService (singleton, ya se autoinicia)
+        from backend.app.streaming.live_hls_service import live_hls_service
+        logger.info("LiveHLSService activo")
+
+        # ================== NUEVO: Consistency Checker ==================
+        try:
+            from backend.app.storage.consistency_checker import consistency_checker
+            consistency_checker.start()
+            app.consistency_checker = consistency_checker
+            logger.info("ConsistencyChecker iniciado")
+        except Exception as e:
+            logger.error(f"Error iniciando ConsistencyChecker: {e}")
+
+        # ================== NUEVO: Stalled camera monitor ==================
+        try:
+            from backend.app.cameras.camera_manager import CameraManager
+            metrics_collector.start_stalled_monitor(CameraManager())
+            logger.info("Stalled camera monitor iniciado")
+        except Exception as e:
+            logger.error(f"Error iniciando monitor de cámaras congeladas: {e}")
+
+        app._container_initialized = True
+        logger.info("Contenedor inicializado")
+
+    except Exception as e:
+        logger.error(f"Error inicializando contenedor: {e}")
+
+    # ============================================================================
+    # BLUEPRINTS
+    # ============================================================================
+
     registered = register_blueprints(app)
-    
+
+    # ============================================================================
+    # HEALTH CHECK
+    # ============================================================================
+
     @app.route('/api/v1/health', methods=['GET'])
     def health_check():
+        from backend.app.infrastructure.metrics.collector import metrics_collector
+        health_data = metrics_collector.get_health_status()
+        
         return jsonify({
             "status": "ok",
             "service": "NVR Backend",
-            "version": "1.0.0",
-            "blueprints": registered
-        })
-    
+            "version": "1.3.0",
+            "blueprints": registered,
+            "system_health": health_data
+        }), 200
+
+    # ============================================================================
+    # ERROR HANDLERS
+    # ============================================================================
+
     @app.errorhandler(404)
     def not_found(error):
         return jsonify({"success": False, "error": "Endpoint no encontrado"}), 404
-    
+
     @app.errorhandler(500)
     def internal_error(error):
         logger.error(f"Error 500: {error}")
         return jsonify({"success": False, "error": "Error interno del servidor"}), 500
-    
-    return app
 
+    @app.errorhandler(429)
+    def ratelimit_handler(e):
+        return jsonify({
+            "success": False, 
+            "error": "Demasiadas solicitudes. Intente más tarde.",
+            "retry_after": e.description
+        }), 429
+
+    return app
 
 # ============================================================================
 # MAIN
@@ -295,30 +285,72 @@ def create_app(config_name='default'):
 if __name__ == "__main__":
     try:
         app = create_app()
-        
+
+        # Verificar FFmpeg
         try:
             import shutil
             ffmpeg_path = shutil.which("ffmpeg")
-            if not ffmpeg_path:
-                logger.warning("FFmpeg no encontrado en PATH.")
-            else:
+            if ffmpeg_path:
                 logger.info(f"FFmpeg encontrado: {ffmpeg_path}")
+            else:
+                logger.warning("FFmpeg no encontrado en PATH")
         except Exception:
             pass
-        
-        host = settings.SERVER_HOST
-        port = settings.SERVER_PORT
-        
-        logger.info(f"Iniciando servidor en {host}:{port}")
-        
+
+        # Estadísticas del executor
+        from backend.app.core.executor import global_executor
+        logger.info(f"GlobalExecutor stats: {global_executor.get_stats()}")
+
+        logger.info(f"Iniciando servidor en {settings.SERVER_HOST}:{settings.SERVER_PORT}")
+
         app.run(
-            host=host,
-            port=port,
+            host=settings.SERVER_HOST,
+            port=settings.SERVER_PORT,
             debug=False,
             threaded=True,
             use_reloader=False
         )
-        
+
     except Exception as e:
         logger.critical(f"Error fatal iniciando aplicación: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        # Graceful shutdown
+        if hasattr(app, 'storage_manager'):
+            try:
+                app.storage_manager.stop()
+                logger.info("StorageManager detenido")
+            except Exception as e:
+                logger.error(f"Error deteniendo StorageManager: {e}")
+        
+        # Detener MetricsCollector (incluye el monitor de cámaras congeladas)
+        try:
+            from backend.app.infrastructure.metrics.collector import metrics_collector
+            metrics_collector.shutdown()
+            logger.info("MetricsCollector detenido")
+        except Exception as e:
+            logger.error(f"Error deteniendo MetricsCollector: {e}")
+            
+        # Detener Executor
+        try:
+            from backend.app.core.executor import global_executor
+            global_executor.shutdown()
+            logger.info("GlobalExecutor detenido")
+        except Exception as e:
+            logger.error(f"Error deteniendo GlobalExecutor: {e}")
+        
+        # Detener LiveHLSService
+        try:
+            from backend.app.streaming.live_hls_service import live_hls_service
+            live_hls_service.shutdown()
+            logger.info("LiveHLSService detenido")
+        except Exception as e:
+            logger.error(f"Error deteniendo LiveHLSService: {e}")
+
+        # ================== NUEVO: Detener ConsistencyChecker ==================
+        if hasattr(app, 'consistency_checker'):
+            try:
+                app.consistency_checker.stop()
+                logger.info("ConsistencyChecker detenido")
+            except Exception as e:
+                logger.error(f"Error deteniendo ConsistencyChecker: {e}")

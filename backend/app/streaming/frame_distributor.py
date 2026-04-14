@@ -1,37 +1,43 @@
+"""
+Frame Distributor v2.0 - Distribución eficiente con opción de copia.
+Usa GlobalExecutor y permite consumidores sin copia (zero-copy) para MJPEG.
+"""
 import threading
-import logging
 import time
-from typing import Callable, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor
+import logging
+from typing import Callable, Dict, Optional, Tuple
 
 from .frame_buffer import CircularFrameBuffer, FrameData
+from ..core.executor import global_executor
+
+# FIX F1.1: Eliminar import circular de system.py
+# from backend.app.api.routes.system import health_monitor  # ELIMINADO
+
+# FIX F1.1: Importar MetricsCollector independiente
+from ..infrastructure.metrics.collector import metrics_collector
+logger = logging.getLogger(__name__)
 
 
 class FrameDistributor:
-    """
-    Distribuye frames desde el buffer a múltiples consumidores.
-    """
-
     def __init__(self, camera_id: int, max_workers: int = 4):
         self.camera_id = camera_id
-        self._consumers: Dict[str, Callable[[FrameData], None]] = {}
+        self._consumers: Dict[str, Tuple[Callable[[FrameData], None], bool]] = {}
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._logger = logging.getLogger(__name__)
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers, 
-            thread_name_prefix=f"Distributor-{camera_id}"
-        )
         
-        self._last_frame_id: int = -1
+        self._last_frame_id = -1
         self._frames_distributed = 0
         self._duplicates_skipped = 0
+        
+        # FIX F1.1: Registrar cámara en métricas al crear distributor
+        metrics_collector.register_camera(camera_id)
 
-    def register_consumer(self, name: str, callback: Callable[[FrameData], None]) -> None:
+    def register_consumer(self, name: str, callback: Callable[[FrameData], None], needs_copy: bool = True) -> None:
         with self._lock:
-            self._consumers[name] = callback
-            self._logger.info(f"Consumidor '{name}' registrado para cámara {self.camera_id}")
+            self._consumers[name] = (callback, needs_copy)
+            self._logger.info(f"Consumidor '{name}' registrado (copy={needs_copy})")
 
     def unregister_consumer(self, name: str) -> None:
         with self._lock:
@@ -42,7 +48,7 @@ class FrameDistributor:
     def start(self, frame_buffer: CircularFrameBuffer) -> None:
         if self._running:
             return
-
+        
         self._running = True
         self._thread = threading.Thread(
             target=self._distribution_loop,
@@ -54,9 +60,6 @@ class FrameDistributor:
         self._logger.info(f"FrameDistributor iniciado para cámara {self.camera_id}")
 
     def _distribution_loop(self, frame_buffer: CircularFrameBuffer) -> None:
-        """
-        Loop principal de distribución.
-        """
         last_frame_id = -1
         
         while self._running:
@@ -64,49 +67,56 @@ class FrameDistributor:
                 frame_data = frame_buffer.get_latest()
                 
                 if frame_data is None:
-                    time.sleep(0.01)
+                    time.sleep(0.005)
                     continue
                 
-                # Si es el mismo frame, saltar
+                # --- NUEVO: Asegurar que stream_id esté presente ---
+                if not hasattr(frame_data, 'stream_id') or frame_data.stream_id is None:
+                    frame_data.stream_id = "main"  # valor por defecto para cámaras normales
+                
                 if frame_data.frame_id == last_frame_id:
                     self._duplicates_skipped += 1
-                    time.sleep(0.01)
+                    time.sleep(0.005)
                     continue
                 
                 last_frame_id = frame_data.frame_id
                 self._frames_distributed += 1
                 
-                # Copiar consumidores
+                # FIX F1.1: Usar MetricsCollector en lugar de health_monitor directo
+                metrics_collector.update_camera_frame(
+                    self.camera_id, 
+                    timestamp=frame_data.timestamp,
+                    frame_size=frame_data.frame.size if hasattr(frame_data.frame, 'size') else 0
+                )
+                
                 with self._lock:
                     consumers = dict(self._consumers)
                 
-                if not consumers:
-                    time.sleep(0.01)
-                    continue
-                
-                # Distribuir a todos los consumidores
-                for name, callback in consumers.items():
+                for name, (callback, needs_copy) in consumers.items():
                     try:
-                        # Copia independiente para cada consumidor
-                        frame_copy = FrameData(
-                            frame=frame_data.frame.copy(),
-                            timestamp=frame_data.timestamp,
-                            camera_id=frame_data.camera_id,
-                            frame_id=frame_data.frame_id
-                        )
-                        self._executor.submit(self._safe_callback, name, callback, frame_copy)
+                        if needs_copy:
+                            # --- NUEVO: Copiar también el stream_id ---
+                            frame_copy = FrameData(
+                                frame=frame_data.frame.copy(),
+                                timestamp=frame_data.timestamp,
+                                camera_id=frame_data.camera_id,
+                                frame_id=frame_data.frame_id,
+                                stream_id=frame_data.stream_id  # ← propagar stream_id
+                            )
+                            global_executor.submit(self._safe_callback, name, callback, frame_copy)
+                        else:
+                            # Sin copia: se pasa la misma referencia (stream_id ya está presente)
+                            global_executor.submit(self._safe_callback, name, callback, frame_data)
                     except Exception as e:
                         self._logger.error(f"Error encolando {name}: {e}")
                 
-                # Pequeña pausa
                 time.sleep(0.001)
                 
             except Exception as e:
-                self._logger.error(f"Error en loop: {e}")
+                self._logger.error(f"Error en loop de distribución: {e}")
                 time.sleep(0.01)
 
-    def _safe_callback(self, name: str, callback: Callable[[FrameData], None], frame_data: FrameData) -> None:
-        """Wrapper seguro para callbacks."""
+    def _safe_callback(self, name: str, callback: Callable, frame_data: FrameData) -> None:
         try:
             callback(frame_data)
         except Exception as e:
@@ -125,5 +135,6 @@ class FrameDistributor:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
         
-        self._executor.shutdown(wait=False)
+        # FIX F1.1: Desregistrar de métricas al detener
+        metrics_collector.unregister_camera(self.camera_id)
         self._logger.info(f"Distributor detenido. Total distribuidos: {self._frames_distributed}")

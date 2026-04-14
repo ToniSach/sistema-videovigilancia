@@ -9,7 +9,6 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 
 from backend.app.services.permission_service import PermissionService
 from backend.app.database.repositories.recording_repository import RecordingRepository
-from backend.app.database.connection import db_manager
 from backend.app.config import settings
 
 recordings_bp = Blueprint("recordings", __name__, url_prefix="/api/v1/recordings")
@@ -17,7 +16,8 @@ permission_service = PermissionService()
 
 
 def get_recording_repo():
-    return RecordingRepository(db_manager)
+    """Repositorio sin parámetro de db_manager."""
+    return RecordingRepository()  # ← CORREGIDO: sin parámetros
 
 
 @recordings_bp.route("/", methods=["GET"])
@@ -256,6 +256,75 @@ def delete_recording(recording_id):
         
         repo.delete(recording_id)
         return jsonify({"success": True}), 200
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    
+from backend.app.streaming.hls_service import hls_service
+
+
+@recordings_bp.route("/<int:recording_id>/hls/index.m3u8", methods=["GET"])
+@jwt_required()
+def get_hls_manifest(recording_id):
+    """Manifest HLS para streaming adaptativo."""
+    try:
+        user_id = int(get_jwt_identity())
+        repo = get_recording_repo()
+        recording = repo.get_by_id(recording_id)
+        
+        if not recording:
+            return jsonify({"success": False, "error": "Grabación no encontrada"}), 404
+        
+        if not permission_service.check_permission(user_id, recording.camera_id, 'view'):
+            return jsonify({"success": False, "error": "Permiso denegado"}), 403
+        
+        if not recording.file_path or not os.path.exists(recording.file_path):
+            return jsonify({"success": False, "error": "Archivo no encontrado"}), 404
+        
+        manifest_path = hls_service.get_hls_manifest(recording_id, recording.file_path)
+        
+        if not manifest_path:
+            # 202 = Accepted, procesando en background
+            return jsonify({
+                "success": False, 
+                "error": "Generando stream HLS, intente en unos segundos"
+            }), 202
+        
+        return send_file(
+            manifest_path,
+            mimetype="application/vnd.apple.mpegurl",
+            as_attachment=False
+        )
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@recordings_bp.route("/<int:recording_id>/hls/<path:filename>", methods=["GET"])
+@jwt_required()
+def get_hls_segment(recording_id, filename):
+    """Segmentos TS del stream HLS."""
+    try:
+        user_id = int(get_jwt_identity())
+        repo = get_recording_repo()
+        recording = repo.get_by_id(recording_id)
+        
+        if not recording:
+            return jsonify({"success": False, "error": "Grabación no encontrada"}), 404
+        
+        if not permission_service.check_permission(user_id, recording.camera_id, 'view'):
+            return jsonify({"success": False, "error": "Permiso denegado"}), 403
+        
+        segment_path = hls_service.get_segment(recording_id, filename)
+        
+        if not segment_path:
+            return jsonify({"success": False, "error": "Segmento no encontrado"}), 404
+        
+        return send_file(
+            segment_path,
+            mimetype="video/MP2T",
+            as_attachment=False
+        )
         
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500

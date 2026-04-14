@@ -83,6 +83,19 @@ class DependencyContainer:
             except Exception as e:
                 logger.error(f"Error inicializando servicios de cámara: {e}", exc_info=True)
             
+            # ===============================
+            # 🔧 EVENT SERVICE SINGLETON (NUEVO)
+            # ===============================
+            try:
+                from backend.app.services.event_service import EventService
+                
+                # Crear EventService singleton (ya registra su callback en EventManager)
+                event_service = EventService(self.event_repository)
+                self._services["event_service"] = event_service
+                logger.info("EventService registrado correctamente")
+            except Exception as e:
+                logger.error(f"Error registrando EventService: {e}", exc_info=True)
+            
             DependencyContainer._initialized = True
             logger.info("DependencyContainer inicializado correctamente")
             

@@ -100,12 +100,13 @@ class EventRepository(BaseRepository[Event]):
             self.logger.error(f"Error al obtener eventos tipo {event_type}: {error}")
             raise
     
-    def get_recent(self, hours: int = 24) -> List[Event]:
+    def get_recent(self, hours: int = 24, limit: int = 1000) -> List[Event]:
         """
         Obtiene eventos ocurridos en las últimas N horas.
         
         Args:
             hours: Ventana de tiempo hacia atrás (default 24)
+            limit: Máximo número de resultados (default 1000)
             
         Returns:
             Lista de eventos recientes
@@ -119,7 +120,7 @@ class EventRepository(BaseRepository[Event]):
                     Event.created_at >= cutoff_time
                 ).order_by(
                     Event.created_at.desc()
-                ).all()
+                ).limit(limit).all()  # ← AGREGADO: .limit(limit)
                 
                 for result in results:
                     session.expunge(result)

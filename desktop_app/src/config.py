@@ -38,15 +38,26 @@ def darken_color(hex_color: str, percent: int = 20) -> str:
 class Config:
     """Configuración de la aplicación."""
     
-    # Backend
+    # ==============================
+    # BACKEND
+    # ==============================
     API_BASE_URL: str = "http://localhost:5000/api/v1"
     TIMEOUT: int = 30
     
-    # Video
+    # ==============================
+    # VIDEO
+    # ==============================
     VLC_OPTIONS: list = None
     STREAM_BUFFER_SIZE: int = 1024 * 1024
+
+    # (Opcional) Sync con backend para debug/preview
+    FFMPEG_WIDTH: int = int(os.getenv("FFMPEG_WIDTH", "1280"))
+    FFMPEG_HEIGHT: int = int(os.getenv("FFMPEG_HEIGHT", "720"))
+    FFMPEG_FPS: int = int(os.getenv("FFMPEG_FPS", "15"))
     
-    # UI - Colores base
+    # ==============================
+    # UI - COLORES BASE
+    # ==============================
     THEME_PRIMARY: str = "#0f172a"
     THEME_SECONDARY: str = "#1e293b"
     THEME_ACCENT: str = "#38bdf8"
@@ -55,7 +66,9 @@ class Config:
     THEME_TEXT_MUTED: str = "#94a3b8"
     THEME_DANGER: str = "#ef4444"
     
-    # Colores calculados (para QSS)
+    # ==============================
+    # COLORES DINÁMICOS
+    # ==============================
     @property
     def THEME_ACCENT_LIGHT(self):
         return lighten_color(self.THEME_ACCENT, 20)
@@ -64,7 +77,9 @@ class Config:
     def THEME_ACCENT_DARK(self):
         return darken_color(self.THEME_ACCENT, 20)
     
-    # Glassmorphism
+    # ==============================
+    # GLASSMORPHISM
+    # ==============================
     GLASS_BG: str = "rgba(30, 41, 59, 0.7)"
     GLASS_BORDER: str = "rgba(255, 255, 255, 0.1)"
     BORDER_RADIUS: int = 12

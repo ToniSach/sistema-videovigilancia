@@ -30,9 +30,18 @@ class Settings:
             self.JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "default-jwt-secret-change-immediately")
             
             # ==============================
-            # BASE DE DATOS
+            # BASE DE DATOS (PostgreSQL)
             # ==============================
-            self.DATABASE_PATH: str = os.getenv("DATABASE_PATH", "data/surveillance.db")
+            self.POSTGRES_HOST: str = os.getenv("POSTGRES_HOST", "localhost")
+            self.POSTGRES_PORT: int = int(os.getenv("POSTGRES_PORT", "5432"))
+            self.POSTGRES_DB: str = os.getenv("POSTGRES_DB", "nvr_db")
+            self.POSTGRES_USER: str = os.getenv("POSTGRES_USER", "nvr_user")
+            self.POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "nvr_pass")
+            
+            # Pooling
+            self.DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "20"))
+            self.DB_MAX_OVERFLOW: int = int(os.getenv("DB_MAX_OVERFLOW", "30"))
+            self.DB_POOL_TIMEOUT: int = int(os.getenv("DB_POOL_TIMEOUT", "30"))
             
             # ==============================
             # ALMACENAMIENTO
@@ -40,7 +49,7 @@ class Settings:
             self.RECORDINGS_PATH: str = os.getenv("RECORDINGS_PATH", "recordings")
             self.MAX_STORAGE_GB: float = float(os.getenv("MAX_STORAGE_GB", "50.0"))
             
-            # 🔥 NUEVO: límite de tamaño de archivos de grabación (split automático)
+            # NUEVO: límite de tamaño de archivos de grabación (split automático)
             self.RECORDING_MAX_FILE_SIZE: int = int(
                 os.getenv("RECORDING_MAX_FILE_SIZE", str(2 * 1024**3))  # 2GB
             )
@@ -56,10 +65,25 @@ class Settings:
             self.MAX_CAMERAS: int = int(os.getenv("MAX_CAMERAS", "4"))
             self.AI_CAMERA_ID: str | None = os.getenv("AI_CAMERA_ID") or None
             
-            # 🔥 NUEVOS LÍMITES CRÍTICOS (NVR)
+            # NUEVOS LÍMITES CRÍTICOS (NVR)
             self.MAX_CONCURRENT_FFMPEG: int = int(os.getenv("MAX_CONCURRENT_FFMPEG", "4"))
             self.MAX_AI_INFERENCE_QUEUE: int = int(os.getenv("MAX_AI_INFERENCE_QUEUE", "10"))
             self.MAX_MJPEG_CLIENTS_PER_CAMERA: int = int(os.getenv("MAX_MJPEG_CLIENTS_PER_CAMERA", "5"))
+            
+            # ==============================
+            # CONFIGURACIÓN AI/HARDWARE
+            # ==============================
+            # use_gpu_ai: "auto", "true", "false"
+            self.USE_GPU_AI: str = os.getenv("USE_GPU_AI", "auto")
+            # ai_backend: "auto", "cuda", "cpu"
+            self.AI_BACKEND: str = os.getenv("AI_BACKEND", "auto")
+            
+            # ==============================
+            # FFMPEG OPTIMIZACIÓN (720p15 por defecto)
+            # ==============================
+            self.FFMPEG_RESOLUTION_WIDTH: int = int(os.getenv("FFMPEG_RESOLUTION_WIDTH", "1280"))
+            self.FFMPEG_RESOLUTION_HEIGHT: int = int(os.getenv("FFMPEG_RESOLUTION_HEIGHT", "720"))
+            self.FFMPEG_FPS: int = int(os.getenv("FFMPEG_FPS", "15"))
             
             # ==============================
             # TELEGRAM
@@ -95,22 +119,24 @@ class Settings:
     
     def _ensure_directories(self) -> None:
         """Crea los directorios necesarios si no existen."""
-        # Directorio de base de datos
-        db_dir = os.path.dirname(self.DATABASE_PATH)
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-        
         # Directorio de grabaciones
         os.makedirs(self.RECORDINGS_PATH, exist_ok=True)
+        
+        # Directorio de snapshots
+        snapshots_dir = os.path.join(self.RECORDINGS_PATH, "snapshots")
+        os.makedirs(snapshots_dir, exist_ok=True)
     
     def get_database_url(self) -> str:
         """
-        Genera la URL de conexión a la base de datos SQLite.
+        Genera la URL de conexión a la base de datos PostgreSQL.
         
         Returns:
-            str: URL de conexión SQLAlchemy (sqlite:///path/to/db)
+            str: URL de conexión SQLAlchemy (postgresql+psycopg2://...)
         """
-        return f"sqlite:///{self.DATABASE_PATH}"
+        return (
+            f"postgresql+psycopg2://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
+            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        )
 
 
 # Instancia global de configuración

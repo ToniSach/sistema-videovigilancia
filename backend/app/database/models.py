@@ -107,7 +107,7 @@ class Camera(Base):
             "rtsp_url": self.rtsp_url,
             "onvif_url": self.onvif_url,
             "username": self.username,
-            "password": self.password,
+            "has_password": bool(self.password),
             "profile_token": self.profile_token,
             "is_active": self.is_active,
             "has_ai": self.has_ai,
@@ -151,6 +151,7 @@ class UserCameraPermission(Base):
     
     __table_args__ = (
         UniqueConstraint('user_id', 'camera_id', name='uq_user_camera'),
+        Index('idx_user_camera_perms', 'user_id', 'camera_id'),
     )
 
 
@@ -182,6 +183,12 @@ class Event(Base):
     camera: Mapped["Camera"] = relationship(back_populates="events")
     notification_logs: Mapped[List["NotificationLog"]] = relationship(back_populates="event")
     
+    __table_args__ = (
+        Index('idx_event_camera_created', 'camera_id', 'created_at'),
+        Index('idx_event_type', 'event_type'),
+        Index('idx_event_acknowledged', 'acknowledged', 'created_at'),
+    )
+    
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -210,6 +217,10 @@ class Recording(Base):
     duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     
     camera: Mapped["Camera"] = relationship(back_populates="recordings")
+    
+    __table_args__ = (
+        Index('idx_recording_camera_time', 'camera_id', 'start_time'),
+    )
     
     def to_dict(self) -> dict:
         return {
@@ -245,6 +256,11 @@ class MobileDevice(Base):
     refresh_token_hash: Mapped[str] = mapped_column(String(255))
     
     user: Mapped["User"] = relationship(back_populates="devices")
+    
+    __table_args__ = (
+        Index('idx_mobile_device_user', 'user_id'),
+        Index('idx_mobile_device_uuid', 'device_uuid'),
+    )
     
     def to_dict(self) -> dict:
         return {
@@ -326,6 +342,11 @@ class TelegramVerificationCode(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     used: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_telegram_code', 'code'),
+        Index('idx_telegram_user', 'user_id'),
+    )
 
 
 class UserTelegramChat(Base):
@@ -344,6 +365,11 @@ class UserTelegramChat(Base):
     
     # Relación con usuario
     user: Mapped["User"] = relationship(back_populates="telegram_chats")
+    
+    __table_args__ = (
+        Index('idx_telegram_chat_user', 'user_id'),
+        Index('idx_telegram_chat_id', 'telegram_chat_id'),
+    )
 
 
 class NotificationLog(Base):
@@ -365,6 +391,12 @@ class NotificationLog(Base):
     cooldown_key: Mapped[Optional[str]] = mapped_column(String(200), nullable=True, index=True)
     
     event: Mapped["Event"] = relationship(back_populates="notification_logs")
+    
+    __table_args__ = (
+        Index('idx_notification_event', 'event_id'),
+        Index('idx_notification_user', 'user_id'),
+        Index('idx_notification_cooldown', 'cooldown_key'),
+    )
 
 
 class LinkToken(Base):
@@ -379,6 +411,11 @@ class LinkToken(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     used: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_link_token', 'token'),
+        Index('idx_link_token_user', 'user_id'),
+    )
 
 
 class SystemConfig(Base):
@@ -402,4 +439,37 @@ class SystemConfig(Base):
             "key": self.key,
             "value": self.value,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
+    
+class AuditLog(Base):
+    """
+    Registro de auditoría para acciones sensibles del sistema.
+    """
+    __tablename__ = "audit_logs"
+    
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(100), nullable=False)  # ej: "login", "delete_recording", "change_permission"
+    resource_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # ej: "camera", "user", "recording"
+    resource_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    
+    __table_args__ = (
+        Index('idx_audit_user_time', 'user_id', 'created_at'),
+        Index('idx_audit_action', 'action'),
+    )
+    
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "action": self.action,
+            "resource_type": self.resource_type,
+            "resource_id": self.resource_id,
+            "details": self.details,
+            "ip_address": self.ip_address,
+            "created_at": self.created_at.isoformat() if self.created_at else None
         }

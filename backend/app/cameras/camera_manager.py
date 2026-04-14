@@ -3,7 +3,7 @@ import logging
 
 from ..database.models import Camera
 from ..database.repositories.camera_repository import CameraRepository
-from ..streaming.frame_buffer import CircularFrameBuffer
+from ..streaming.frame_buffer import CircularFrameBuffer, FrameData
 from ..streaming.frame_distributor import FrameDistributor
 from ..workers.ffmpeg_worker import FFmpegWorker, WorkerStatus
 from ..streaming.mjpeg_streamer import mjpeg_streamer
@@ -15,6 +15,9 @@ class CameraManager:
     - Inicia/detiene workers FFmpeg
     - Crea buffers y distribuidores por cámara
     - Proporciona acceso centralizado a componentes de streaming
+    - SOPORTE DUAL LENS: Divide cámaras side-by-side en dos streams independientes
+      SIN crear buffers/distribuidores separados; los frames divididos se inyectan
+      directamente en el MJPEG streamer con un stream_id ('l1' / 'l2').
     """
 
     _instance = None
@@ -32,55 +35,41 @@ class CameraManager:
             return
 
         self._workers: dict[int, FFmpegWorker] = {}
-        self._buffers: dict[int, CircularFrameBuffer] = {}
-        self._distributors: dict[int, FrameDistributor] = {}
-        self._lock = threading.Lock()
+        self._buffers: dict = {}
+        self._distributors: dict = {}
+        self._lifecycle_lock = threading.Lock()
         self._camera_repo = CameraRepository()
         self._logger = logging.getLogger(__name__)
         self._initialized = True
 
     def start_camera(self, camera: Camera, register_mjpeg: bool = True) -> bool:
-        """
-        Inicia el pipeline completo para una cámara: buffer -> distributor -> worker.
+        if camera.is_dual_lens:
+            return self.start_dual_lens_camera(camera)
 
-        Args:
-            camera: Instancia de Camera a iniciar
-            register_mjpeg: Si es True, registra automáticamente el streamer MJPEG como consumidor
-
-        Returns:
-            True si se inició correctamente, False si ya estaba corriendo
-        """
-        with self._lock:
+        with self._lifecycle_lock:
             if camera.id in self._workers:
                 self._logger.warning(f"Cámara {camera.id} ya está activa")
                 return False
 
             try:
-                # Crear buffer circular
-                buffer = CircularFrameBuffer(camera_id=camera.id, maxsize=5)
-
-                # Crear distribuidor de frames
+                buffer = CircularFrameBuffer(camera_id=camera.id, maxsize=3)
                 distributor = FrameDistributor(camera_id=camera.id)
-
-                # Crear y configurar worker FFmpeg
                 worker = FFmpegWorker(camera=camera, frame_buffer=buffer)
 
-                # Iniciar: primero distributor (escucha), luego worker (produce)
                 distributor.start(buffer)
                 worker.start()
 
-                # Guardar referencias
                 self._workers[camera.id] = worker
                 self._buffers[camera.id] = buffer
                 self._distributors[camera.id] = distributor
 
-                # CRÍTICO: Registrar MJPEG automáticamente si se solicita
                 if register_mjpeg:
                     distributor.register_consumer(
-                        "mjpeg", 
-                        lambda fd: mjpeg_streamer.update_frame(camera.id, fd)
+                        "mjpeg",
+                        lambda fd: mjpeg_streamer.update_frame(camera.id, "main", fd),
+                        needs_copy=False
                     )
-                    self._logger.info(f"MJPEG registrado automáticamente para cámara {camera.id}")
+                    self._logger.info(f"MJPEG registrado automáticamente para cámara {camera.id} (stream main)")
 
                 self._logger.info(f"Cámara {camera.id} ({camera.name}) iniciada correctamente")
                 return True
@@ -89,134 +78,174 @@ class CameraManager:
                 self._logger.error(f"Error al iniciar cámara {camera.id}: {e}")
                 return False
 
-    def stop_camera(self, camera_id: int) -> bool:
-        """
-        Detiene completamente una cámara y libera recursos.
+    def start_dual_lens_camera(self, parent_camera: Camera) -> bool:
+        from ..processing.dual_lens_splitter import DualLensSplitter
 
-        Args:
-            camera_id: ID de la cámara a detener
-
-        Returns:
-            True si se detuvo, False si no existía
-        """
-        with self._lock:
-            if camera_id not in self._workers:
+        with self._lifecycle_lock:
+            if parent_camera.id in self._workers:
+                self._logger.warning(f"Cámara dual {parent_camera.id} ya está activa")
                 return False
 
             try:
-                # Detener en orden inverso: worker -> distributor
-                worker = self._workers.pop(camera_id)
-                worker.stop()
+                self._logger.info(f"Iniciando cámara DUAL LENS {parent_camera.id}")
 
-                distributor = self._distributors.pop(camera_id)
-                distributor.stop()
+                raw_buffer = CircularFrameBuffer(camera_id=parent_camera.id, maxsize=5)
+                raw_distributor = FrameDistributor(camera_id=parent_camera.id)
+                worker = FFmpegWorker(camera=parent_camera, frame_buffer=raw_buffer)
 
-                buffer = self._buffers.pop(camera_id)
-                buffer.clear()
+                raw_distributor.start(raw_buffer)
+                worker.start()
 
-                # Limpiar también del streamer MJPEG
-                mjpeg_streamer.unregister_camera(camera_id)
+                self._workers[parent_camera.id] = worker
+                self._buffers[parent_camera.id] = raw_buffer
+                self._distributors[parent_camera.id] = raw_distributor
 
-                self._logger.info(f"Cámara {camera_id} detenida")
+                splitter = DualLensSplitter(parent_camera.id, split_mode="vertical")
+
+                def split_and_distribute(frame_data: FrameData):
+                    frame = frame_data.frame
+                    timestamp = frame_data.timestamp
+
+                    left, right = splitter.split(frame)
+
+                    if left is not None:
+                        fd_l1 = FrameData(
+                            frame=left,
+                            timestamp=timestamp,
+                            camera_id=parent_camera.id,
+                            frame_id=frame_data.frame_id,
+                            stream_id="l1"
+                        )
+                        mjpeg_streamer.update_frame(parent_camera.id, "l1", fd_l1)
+
+                    if right is not None:
+                        fd_l2 = FrameData(
+                            frame=right,
+                            timestamp=timestamp,
+                            camera_id=parent_camera.id,
+                            frame_id=frame_data.frame_id,
+                            stream_id="l2"
+                        )
+                        mjpeg_streamer.update_frame(parent_camera.id, "l2", fd_l2)
+
+                raw_distributor.register_consumer(
+                    "dual_lens_splitter",
+                    split_and_distribute,
+                    needs_copy=True
+                )
+
+                self._logger.info(f"Cámara dual {parent_camera.id} iniciada correctamente")
+                self._logger.info(f"  → Lente izquierdo disponible con stream_id='l1'")
+                self._logger.info(f"  → Lente derecho disponible con stream_id='l2'")
                 return True
 
             except Exception as e:
-                self._logger.error(f"Error al detener cámara {camera_id}: {e}")
+                self._logger.error(f"Error iniciando cámara dual {parent_camera.id}: {e}", exc_info=True)
                 return False
 
+    def stop_camera(self, camera_id: int) -> bool:
+        with self._lifecycle_lock:
+            if camera_id in self._workers:
+                try:
+                    worker = self._workers.pop(camera_id)
+                    worker.stop()
+                except Exception as e:
+                    self._logger.error(f"Error deteniendo worker {camera_id}: {e}")
+
+                # Eliminar buffer y distributor del stream raw
+                if camera_id in self._buffers:
+                    try:
+                        self._buffers[camera_id].clear()
+                        del self._buffers[camera_id]
+                    except Exception as e:
+                        self._logger.error(f"Error limpiando buffer raw {camera_id}: {e}")
+
+                if camera_id in self._distributors:
+                    try:
+                        self._distributors[camera_id].stop()
+                        del self._distributors[camera_id]
+                    except Exception as e:
+                        self._logger.error(f"Error deteniendo distributor raw {camera_id}: {e}")
+
+                # Limpiar streams MJPEG (main y posibles lentes duales)
+                try:
+                    # Para cámara normal o dual, limpiar main
+                    mjpeg_streamer.cleanup_stream(camera_id, "main")
+                except Exception:
+                    pass
+                try:
+                    # Si es dual, limpiar lentes
+                    mjpeg_streamer.cleanup_stream(camera_id, "l1")
+                    mjpeg_streamer.cleanup_stream(camera_id, "l2")
+                except Exception as e:
+                    self._logger.debug(f"Limpieza de streams virtuales: {e}")
+
+            else:
+                self._logger.warning(f"No se encontró cámara activa con ID {camera_id}")
+
+            self._logger.info(f"Cámara {camera_id} detenida")
+            return True
+
     def restart_camera(self, camera_id: int) -> bool:
-        """
-        Reinicia una cámara: detener y volver a iniciar.
-
-        Args:
-            camera_id: ID de la cámara a reiniciar
-
-        Returns:
-            True si se reinició correctamente
-        """
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
             self._logger.error(f"No se encontró cámara {camera_id} para reiniciar")
             return False
 
-        self.stop_camera(camera_id)
-        # Al reiniciar, también registramos MJPEG automáticamente
-        return self.start_camera(camera, register_mjpeg=True)
+        with self._lifecycle_lock:
+            self.stop_camera(camera_id)
+            import time
+            time.sleep(0.5)
+            return self.start_camera(camera, register_mjpeg=True)
 
-    def get_distributor(self, camera_id: int) -> FrameDistributor | None:
-        """
-        Obtiene el distribuidor de frames de una cámara.
-
-        Args:
-            camera_id: ID de la cámara
-
-        Returns:
-            FrameDistributor o None si no está activa
-        """
+    def get_distributor(self, camera_id):
+        if isinstance(camera_id, str) and "_l" in camera_id:
+            self._logger.debug(f"get_distributor llamado con ID de lente virtual '{camera_id}' -> retorna None")
+            return None
         return self._distributors.get(camera_id)
 
-    def get_buffer(self, camera_id: int) -> CircularFrameBuffer | None:
-        """
-        Obtiene el buffer de frames de una cámara.
-
-        Args:
-            camera_id: ID de la cámara
-
-        Returns:
-            CircularFrameBuffer o None si no está activa
-        """
+    def get_buffer(self, camera_id):
+        if isinstance(camera_id, str) and "_l" in camera_id:
+            return None
         return self._buffers.get(camera_id)
 
     def get_worker(self, camera_id: int) -> FFmpegWorker | None:
-        """
-        Obtiene el worker FFmpeg de una cámara.
-
-        Args:
-            camera_id: ID de la cámara
-
-        Returns:
-            FFmpegWorker o None si no está activa
-        """
         return self._workers.get(camera_id)
 
+    def get_dual_lens_ids(self, parent_id: int) -> list:
+        return [f"{parent_id}_l1", f"{parent_id}_l2"]
+
     def start_all_active(self) -> None:
-        """Inicia todas las cámaras marcadas como activas en la base de datos."""
         active_cameras = self._camera_repo.get_active_cameras()
-
         self._logger.info(f"Iniciando {len(active_cameras)} cámaras activas...")
-
         for camera in active_cameras:
             if not camera.rtsp_url:
                 self._logger.warning(f"Cámara {camera.id} no tiene URL RTSP, omitiendo")
                 continue
-            # CRÍTICO: Pasar register_mjpeg=True para iniciar streaming automáticamente
             self.start_camera(camera, register_mjpeg=True)
 
     def stop_all(self) -> None:
-        """Detiene todas las cámaras gestionadas."""
         camera_ids = list(self._workers.keys())
-
         self._logger.info(f"Deteniendo {len(camera_ids)} cámaras...")
-
         for camera_id in camera_ids:
             self.stop_camera(camera_id)
 
-    def get_all_status(self) -> dict[int, dict]:
-        """
-        Obtiene el estado de todos los workers activos.
-
-        Returns:
-            Diccionario camera_id -> estado
-        """
+    def get_all_status(self) -> dict:
         with self._lock:
-            return {
-                camera_id: worker.get_status()
-                for camera_id, worker in self._workers.items()
-            }
+            status = {}
+            for camera_id, worker in self._workers.items():
+                worker_status = worker.get_status()
+                camera = self._camera_repo.get_by_id(camera_id)
+                if camera and camera.is_dual_lens:
+                    worker_status["is_dual_lens"] = True
+                    worker_status["virtual_lenses"] = self.get_dual_lens_ids(camera_id)
+                else:
+                    worker_status["is_dual_lens"] = False
+                status[camera_id] = worker_status
+            return status
 
 
 if __name__ == "__main__":
-    # Test básico del singleton
     cm1 = CameraManager()
     cm2 = CameraManager()
     assert cm1 is cm2, "Singleton no está funcionando correctamente"

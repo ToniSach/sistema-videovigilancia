@@ -1,5 +1,5 @@
-import threading
 import subprocess
+import threading
 import os
 import time
 import logging
@@ -35,6 +35,9 @@ class RecordingManager:
         self._continuous_threads: Dict[int, threading.Thread] = {}
         self._continuous_running: Dict[int, bool] = {}
         self._continuous_lock = threading.Lock()
+        
+        # ✅ NUEVO: Cache de dimensiones por cámara
+        self._frame_dimensions: Dict[int, Tuple[int, int]] = {}
 
         event_manager.subscribe("motion", self._on_event)
         event_manager.subscribe("person", self._on_event)
@@ -49,7 +52,8 @@ class RecordingManager:
         consumer_name = f"recording_prebuffer_{camera_id}"
         frame_distributor.register_consumer(
             consumer_name,
-            lambda fd: self._update_pre_buffer(camera_id, fd)
+            lambda fd: self._update_pre_buffer(camera_id, fd),
+            needs_copy=True
         )
         logging.info(f"Buffer pre-evento registrado para cámara {camera_id}")
 
@@ -59,6 +63,8 @@ class RecordingManager:
                 self._pre_buffers[camera_id].append(
                     (frame_data.frame.copy(), frame_data.timestamp)
                 )
+                h, w = frame_data.frame.shape[:2]
+                self._frame_dimensions[camera_id] = (h, w)
 
     def _on_event(self, event_data: EventData) -> None:
         camera_id = event_data.camera_id
@@ -82,76 +88,101 @@ class RecordingManager:
                 "event_type": event_data.event_type
             }
 
+    def _get_frame_dimensions(self, camera_id: int) -> Tuple[int, int]:
+        if camera_id in self._frame_dimensions:
+            return self._frame_dimensions[camera_id]
+        return (720, 1280)  # fallback
+
+    # ✅ MÉTODO REESCRITO: streaming directo a FFmpeg
     def _record_event_clip(self, camera_id: int, event_data: EventData) -> None:
+        process = None
         try:
-            # ✅ CORREGIDO: Usar camera_id en lugar de camera_name inexistente
             logging.info(f"Iniciando grabación de evento {event_data.event_type} para cámara {camera_id}")
-
+            
+            cam_dir = os.path.join(self._recordings_dir, str(camera_id), "events")
+            os.makedirs(cam_dir, exist_ok=True)
+            
+            timestamp_str = datetime.fromtimestamp(event_data.timestamp).strftime("%Y%m%d_%H%M%S")
+            filename = f"event_{event_data.event_type}_{timestamp_str}.mp4"
+            output_path = os.path.join(cam_dir, filename)
+            
+            height, width = self._get_frame_dimensions(camera_id)
+            if height == 0 or width == 0:
+                logging.error(f"No se pudo determinar dimensiones para cámara {camera_id}")
+                return
+            
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo",
+                "-vcodec", "rawvideo",
+                "-s", f"{width}x{height}",
+                "-pix_fmt", "bgr24",
+                "-r", "15",
+                "-i", "pipe:0",
+                "-vcodec", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "ultrafast",
+                output_path
+            ]
+            
+            process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            # Pre-buffer
+            pre_frames = []
             with self._pre_buffer_lock:
-                if camera_id not in self._pre_buffers:
-                    pre_frames = []
-                else:
+                if camera_id in self._pre_buffers:
                     pre_frames = list(self._pre_buffers[camera_id])
-
-            all_frames = [f[0] for f in pre_frames]
+            
+            for frame, _ in pre_frames:
+                process.stdin.write(frame.tobytes())
+            
+            # Frames en tiempo real
             start_time = time.time()
-            end_time = start_time + self.EVENT_RECORDING_DURATION
-
-            post_frames = []
             last_buffer_size = len(pre_frames)
-
-            while time.time() < end_time:
+            
+            while time.time() - start_time < self.EVENT_RECORDING_DURATION:
                 with self._pre_buffer_lock:
                     if camera_id in self._pre_buffers:
                         current_buffer = list(self._pre_buffers[camera_id])
                         if len(current_buffer) > last_buffer_size:
                             new_frames = current_buffer[last_buffer_size:]
-                            post_frames.extend([f[0] for f in new_frames])
+                            for frame, _ in new_frames:
+                                process.stdin.write(frame.tobytes())
                             last_buffer_size = len(current_buffer)
-
                 time.sleep(0.033)
-
-            all_frames.extend(post_frames)
-
-            if not all_frames:
-                logging.warning(f"No hay frames para grabar en cámara {camera_id}")
-                return
-
-            cam_dir = os.path.join(self._recordings_dir, str(camera_id), "events")
-            os.makedirs(cam_dir, exist_ok=True)
-
-            timestamp_str = datetime.fromtimestamp(event_data.timestamp).strftime("%Y%m%d_%H%M%S")
-            filename = f"event_{event_data.event_type}_{timestamp_str}.mp4"
-            output_path = os.path.join(cam_dir, filename)
-
-            success = self._frames_to_mp4(all_frames, output_path, fps=15)
-
-            if success and os.path.exists(output_path):
+            
+            process.stdin.close()
+            process.wait(timeout=10)
+            
+            if os.path.exists(output_path) and process.returncode == 0:
                 file_size = os.path.getsize(output_path)
-                duration = len(all_frames) / 15.0
-
+                duration = self.EVENT_RECORDING_DURATION + 5
                 recording = Recording(
                     camera_id=camera_id,
                     start_time=datetime.fromtimestamp(event_data.timestamp - 5),
-                    end_time=datetime.now(),
+                    end_time=datetime.utcnow(),
                     file_path=output_path,
                     file_size_bytes=file_size,
                     duration_seconds=duration
                 )
-                saved = self._recording_repo.create(recording)
-
+                self._recording_repo.create(recording)
                 logging.info(f"Clip de evento guardado: {output_path} ({file_size} bytes)")
-
+                
                 if self._event_repo:
                     recent_events = self._event_repo.get_by_camera(camera_id, limit=1)
                     if recent_events:
                         recent_events[0].clip_path = output_path
             else:
                 logging.error(f"Fallo al crear clip MP4: {output_path}")
-
+        
         except Exception as e:
             logging.error(f"Error en grabación de evento: {e}", exc_info=True)
         finally:
+            if process and process.stdin:
+                try:
+                    process.stdin.close()
+                except:
+                    pass
             with self._event_recordings_lock:
                 if camera_id in self._event_recordings:
                     del self._event_recordings[camera_id]

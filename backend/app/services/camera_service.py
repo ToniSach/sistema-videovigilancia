@@ -83,8 +83,14 @@ class CameraService:
         Returns:
             Diccionario con la cámara creada
         """
-        # Validar si hay IP para probar
+        # ✅ NUEVO: Validar duplicado por IP antes de crear
         ip = data.get('ip_address')
+        if ip:
+            existing = self._camera_repo.get_by_ip(ip)
+            if existing:
+                raise ValueError(f"Ya existe una cámara con IP {ip}: '{existing.name}' (ID: {existing.id})")
+        
+        # Validar si hay IP para probar
         if ip:
             try:
                 discovery = ONVIFDiscovery()
@@ -175,7 +181,7 @@ class CameraService:
 
         if restart_needed:
             self._camera_manager.restart_camera(camera_id)
-            # CRÍTICO: No necesitamos llamar start_mjpeg_for_camera aquí
+            # ✅ CORREGIDO: No llamamos start_mjpeg_for_camera aquí
             # porque restart_camera ya llama a start_camera con register_mjpeg=True
 
         return self.get_camera(camera_id)
@@ -288,22 +294,20 @@ class CameraService:
 
     def start_mjpeg_for_camera(self, camera_id: int) -> None:
         """
-        Registra el streamer MJPEG como consumer del distributor de la cámara.
+        ✅ DEPRECATED: Este método ya no debe usarse.
         
-        NOTA: Este método se mantiene por compatibilidad pero YA NO SE USA
-        automáticamente. El registro MJPEG ahora se hace automáticamente
-        en CameraManager.start_camera().
+        El registro MJPEG ahora es automático en CameraManager.start_camera().
+        Mantenido por compatibilidad con código legacy pero no realiza ninguna acción.
         
         Args:
-            camera_id: ID de la cámara
+            camera_id: ID de la cámara (ignorado)
         """
-        distributor = self._camera_manager.get_distributor(camera_id)
-        if distributor:
-            distributor.register_consumer(
-                "mjpeg", 
-                lambda fd: self._mjpeg.update_frame(camera_id, fd)
-            )
-            self._logger.info(f"MJPEG registrado manualmente para cámara {camera_id} (método legacy)")
+        self._logger.warning(
+            f"start_mjpeg_for_camera({camera_id}) llamado pero está DEPRECATED. "
+            f"El registro MJPEG es automático en CameraManager."
+        )
+        # NO-OP: No registramos nada aquí para evitar duplicados
+        return
 
     def _camera_to_dict(self, camera: Camera) -> dict:
         """Helper para convertir Camera a dict si el modelo no tiene to_dict."""
@@ -325,3 +329,21 @@ class CameraService:
             "fps": camera.fps,
             "connection_type": camera.connection_type if hasattr(camera, 'connection_type') else "unknown"
         }
+    
+    def ptz_control(self, camera_id: int, direction: str) -> dict:
+        camera = self._camera_repo.get_by_id(camera_id)
+        if not camera:
+            raise ValueError("Cámara no encontrada")
+        if not camera.has_ptz:
+            raise ValueError("La cámara no soporta PTZ")
+        from backend.app.cameras.ptz_controller import PTZController
+        controller = PTZController(camera)
+        if not controller.is_supported():
+            raise RuntimeError("PTZ no disponible")
+        if direction == "stop":
+            success = controller.stop()
+        else:
+            success = controller.move(direction)
+        if not success:
+            raise RuntimeError(f"Error moviendo PTZ hacia {direction}")
+        return {"direction": direction, "status": "ok"}

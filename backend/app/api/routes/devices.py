@@ -4,6 +4,10 @@ API Endpoints para gestión de dispositivos móviles.
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
+# IMPORTS FALTANTES AGREGADOS:
+from backend.app.database.connection import db_manager
+from backend.app.database.models import MobileDevice
+
 from backend.app.services.device_service import DeviceService
 
 devices_bp = Blueprint("devices", __name__, url_prefix="/api/v1/devices")

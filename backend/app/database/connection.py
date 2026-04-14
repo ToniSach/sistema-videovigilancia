@@ -1,193 +1,117 @@
 """
-Gestión de conexión a base de datos y sesiones SQLAlchemy.
-Implementa patrón Singleton para el DatabaseManager.
+Gestión de conexión PostgreSQL con SQLAlchemy 2.0.
+Patrón Singleton para el pool de conexiones.
 """
 import logging
-import os
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
-from werkzeug.security import generate_password_hash
+from sqlalchemy.pool import QueuePool
 
 from backend.app.config import settings
-from .models import Base, User, SystemConfig
 
 logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
     """
-    Gestor centralizado de la base de datos.
-    Maneja la conexión, creación de tablas y seeding inicial.
+    Singleton para gestionar conexiones PostgreSQL.
+    Configura pooling y provee sesiones con context manager.
     """
+    _instance = None
+    _engine = None
+    _session_factory = None
 
-    def __init__(self) -> None:
-        """Inicializa el motor de base de datos y el creador de sesiones."""
-        try:
-            # Crear engine
-            self.engine = create_engine(
-                settings.get_database_url(),
-                connect_args={"check_same_thread": False},
-                echo=False,
-                pool_pre_ping=True
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def _initialize(self):
+        """Inicializa el engine y session factory si no existen."""
+        if self._engine is None:
+            database_url = settings.get_database_url()
+            
+            self._engine = create_engine(
+                database_url,
+                poolclass=QueuePool,
+                pool_size=10,
+                max_overflow=20,
+                pool_pre_ping=True,  # Verifica conexiones antes de usar
+                pool_recycle=3600,   # Recicla conexiones cada hora
+                echo=False
             )
-
-            # 🔍 DEBUG: ruta real de la DB
-            print("🧠 DB URL REAL:", settings.get_database_url())
-
-            # Crear fábrica de sesiones
-            self.SessionLocal = sessionmaker(
+            
+            self._session_factory = sessionmaker(
                 autocommit=False,
                 autoflush=False,
-                bind=self.engine
+                bind=self._engine
             )
 
-            logger.info("DatabaseManager inicializado correctamente")
-
-        except Exception as error:
-            logger.error(f"Error al inicializar DatabaseManager: {error}")
-            raise RuntimeError(f"No se pudo conectar a la base de datos: {error}") from error
-
-        # ✅ PRIMERO: verificar migraciones (ANTES de usar la DB)
-        if os.getenv('FLASK_ENV') == 'development':
-            self.check_migrations()
-
-        # ✅ DESPUÉS: crear tablas
-        self.init_db()
-
-    # =========================================================
-    # MIGRACIONES (DEV)
-    # =========================================================
-    def check_migrations(self) -> None:
+    def init_db(self):
         """
-        Verifica discrepancias entre modelos y BD.
-        Si falta una columna crítica (como owner_id), reconstruye la BD.
-        SOLO para desarrollo.
+        Crea todas las tablas definidas en los modelos si no existen.
+        Importación diferida para evitar circular imports.
         """
         try:
-            inspector = inspect(self.engine)
-
-            # Si no existe la tabla, no hay nada que migrar
-            if "cameras" not in inspector.get_table_names():
-                return
-
-            columns = [col["name"] for col in inspector.get_columns("cameras")]
-
-            # Verificar columna nueva
-            if "owner_id" not in columns:
-                logger.warning("⚠ Falta columna owner_id. Recreando base de datos...")
-
-                Base.metadata.drop_all(bind=self.engine)
-                Base.metadata.create_all(bind=self.engine)
-                self._seed_initial_data()
-
-                logger.info("✅ Base de datos recreada correctamente con owner_id")
-
+            from ..database.models import Base
+            engine = self.get_engine()
+            Base.metadata.create_all(bind=engine)
+            logger.info("Tablas de base de datos creadas/verificadas correctamente")
+            return True
         except Exception as e:
-            logger.error(f"Error en check_migrations: {e}")
+            logger.error(f"Error creando tablas: {e}")
             raise
 
-    # =========================================================
-    # INICIALIZACIÓN
-    # =========================================================
-    def init_db(self) -> None:
-        """
-        Inicializa la base de datos creando todas las tablas
-        y cargando datos iniciales si es necesario.
-        """
-        try:
-            Base.metadata.create_all(bind=self.engine)
-            logger.info("Tablas de base de datos creadas/verificadas")
+    def get_engine(self):
+        """Retorna el engine SQLAlchemy."""
+        self._initialize()
+        return self._engine
 
-            self._seed_initial_data()
-            logger.info("Datos iniciales verificados")
+    def get_session_factory(self):
+        """Retorna la fábrica de sesiones."""
+        self._initialize()
+        return self._session_factory
 
-        except Exception as error:
-            logger.error(f"Error al inicializar base de datos: {error}")
-            raise RuntimeError(f"Error en init_db: {error}") from error
-
-    # =========================================================
-    # SEEDING
-    # =========================================================
-    def _seed_initial_data(self) -> None:
-        """
-        Crea datos iniciales si no existen:
-        - Usuario admin
-        - Configuración básica
-        """
-        try:
-            with self.get_session() as session:
-
-                # Admin por defecto
-                existing_admin = session.query(User).filter_by(username="admin").first()
-                if not existing_admin:
-                    admin_user = User(
-                        username="admin",
-                        password_hash=generate_password_hash("admin123"),
-                        role="admin",
-                        is_active=True
-                    )
-                    session.add(admin_user)
-                    logger.info("Usuario admin creado (admin/admin123)")
-
-                # Configuración inicial
-                initial_configs = [
-                    ("telegram_bot_token", ""),
-                    ("telegram_chat_id", ""),
-                    ("telegram_enabled", "false"),
-                    ("notify_motion", "true"),
-                    ("notify_person", "true"),
-                    ("notify_vehicle", "true"),
-                    ("notify_offline", "true"),
-                    ("notify_tampering", "true")
-                ]
-
-                for key, value in initial_configs:
-                    existing = session.query(SystemConfig).filter_by(key=key).first()
-                    if not existing:
-                        config = SystemConfig(key=key, value=value)
-                        session.add(config)
-
-                session.commit()
-
-        except Exception as error:
-            logger.error(f"Error en seeding inicial: {error}")
-            raise RuntimeError(f"Error al crear datos iniciales: {error}") from error
-
-    # =========================================================
-    # SESIONES
-    # =========================================================
     @contextmanager
     def get_session(self) -> Generator[Session, None, None]:
         """
-        Context manager para sesiones seguras.
+        Context manager para sesiones de base de datos.
+        Maneja automáticamente commit/rollback y cierre.
+        
+        Uso:
+            with db_manager.get_session() as session:
+                session.query(Model).all()
         """
-        session = self.SessionLocal()
+        self._initialize()
+        session = self._session_factory()
         try:
             yield session
             session.commit()
-        except Exception as error:
+        except Exception as e:
             session.rollback()
-            logger.error(f"Error en sesión de BD: {error}")
-            raise
+            raise e
         finally:
-            try:
-                session.close()
-            except Exception as e:
-                logger.error(f"Error cerrando sesión: {e}")
-                import gc
-                gc.collect()
+            session.close()
 
-    # =========================================================
-    # UTILIDADES
-    # =========================================================
-    def get_engine(self):
-        return self.engine
+    def health_check(self) -> bool:
+        """Verifica que la conexión a PostgreSQL funciona."""
+        try:
+            with self.get_session() as session:
+                session.execute(text("SELECT 1"))
+                return True
+        except Exception:
+            return False
+
+    def dispose(self):
+        """Cierra todas las conexiones del pool."""
+        if self._engine:
+            self._engine.dispose()
+            self._engine = None
+            self._session_factory = None
 
 
-# =========================================================
-# INSTANCIA GLOBAL
-# =========================================================
+# Singleton instance
 db_manager = DatabaseManager()

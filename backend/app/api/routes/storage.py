@@ -2,7 +2,7 @@
 API Endpoints para gestión de almacenamiento.
 """
 import os
-import shutil
+from pathlib import Path
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required
 
@@ -17,6 +17,7 @@ storage_bp = Blueprint("storage", __name__, url_prefix="/api/v1/storage")
 def get_storage_info():
     """Obtiene información de almacenamiento."""
     try:
+        import shutil
         path = settings.RECORDINGS_PATH
         
         # Espacio total y libre del disco
@@ -64,15 +65,27 @@ def update_storage_config():
         if not new_path:
             return jsonify({"success": False, "error": "Path requerido"}), 400
         
-        if not os.path.exists(new_path):
-            try:
-                os.makedirs(new_path, exist_ok=True)
-            except Exception as e:
-                return jsonify({"success": False, "error": f"No se puede crear directorio: {e}"}), 400
-        
-        # Actualizar configuración (requiere reinicio para tomar efecto completo)
-        # En producción, guardar en BD y recargar
-        settings.RECORDINGS_PATH = new_path
+        # VALIDACIÓN PATH TRAVERSAL MULTIPLATAFORMA
+        try:
+            requested_path = Path(new_path).resolve()
+            
+            # Rutas absolutamente prohibidas independiente del SO
+            forbidden = [
+                Path(os.environ.get("SystemRoot", "C:/Windows")),  # Windows
+                Path("/etc"), Path("/usr"), Path("/bin"),           # Linux/Mac
+                Path("/sys"), Path("/proc"), Path("/boot"),
+                Path("/sbin"), Path("/dev"),
+            ]
+            
+            if any(str(requested_path).startswith(str(f)) for f in forbidden):
+                return jsonify({"success": False, "error": "Path no permitido"}), 400
+            
+            # Verificar que se puede crear el directorio
+            os.makedirs(requested_path, exist_ok=True)
+            settings.RECORDINGS_PATH = str(requested_path)
+            
+        except Exception as e:
+            return jsonify({"success": False, "error": f"Path inválido: {e}"}), 400
         
         return jsonify({
             "success": True,

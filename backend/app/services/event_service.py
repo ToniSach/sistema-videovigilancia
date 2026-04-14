@@ -42,6 +42,16 @@ class EventService:
                     snapshot_path = None
                 else:
                     logging.debug(f"Snapshot guardado: {snapshot_path}")
+                    
+                    # ============================
+                    # AÑADIR: metadata con snapshot_path
+                    # ============================
+                    metadata = {
+                        "count": 1,
+                        "object_count": 1,
+                        "snapshot_path": snapshot_path   # ← AÑADIR ESTA LÍNEA
+                    }
+                    
             except Exception as e:
                 logging.error(f"Error guardando snapshot: {e}")
                 snapshot_path = None

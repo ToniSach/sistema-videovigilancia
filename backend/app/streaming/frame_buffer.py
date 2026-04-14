@@ -8,11 +8,11 @@ from typing import Optional
 
 @dataclass
 class FrameData:
-    """Estructura de datos para un frame capturado."""
     frame: np.ndarray
     timestamp: float
     camera_id: int
     frame_id: int = 0
+    stream_id: str = "main" 
 
 
 class CircularFrameBuffer:
@@ -58,15 +58,21 @@ class CircularFrameBuffer:
         return True
 
     def get_latest(self) -> Optional[FrameData]:
-        """Obtiene el frame más reciente."""
+        """
+        Obtiene el frame más reciente del buffer.
+        ✅ CORREGIDO: No hace copia aquí, deja que el FrameDistributor 
+        maneje la copia según el parámetro needs_copy de cada consumidor.
+        """
         with self._lock:
             if len(self._buffer) > 0:
                 latest = self._buffer[-1]
+                # ✅ Sin .copy() aquí - el distributor decide si copiar o no
                 return FrameData(
-                    frame=latest.frame.copy(),
+                    frame=latest.frame,              # Referencia directa
                     timestamp=latest.timestamp,
                     camera_id=latest.camera_id,
-                    frame_id=latest.frame_id
+                    frame_id=latest.frame_id,
+                    stream_id=latest.stream_id if hasattr(latest, 'stream_id') else "main"
                 )
             return None
 
