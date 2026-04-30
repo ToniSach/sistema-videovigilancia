@@ -159,7 +159,9 @@ class AIService:
                 old_scheduler.stop(distributor)
                 del self._schedulers[camera_id]
 
-            scheduler = AIScheduler(camera_id, mode, cooldown_seconds=30)
+            #scheduler = AIScheduler(camera_id, mode, cooldown_seconds=30)
+            #para pruebas sin cooldown:
+            scheduler = AIScheduler(camera_id, mode, cooldown_seconds=0)
 
             if self._event_callback:
                 scheduler.set_detection_callback(self._detection_callback)
