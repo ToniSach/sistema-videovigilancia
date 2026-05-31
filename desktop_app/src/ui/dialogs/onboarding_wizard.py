@@ -3,7 +3,7 @@ Onboarding Wizard — tutorial inicial paso a paso.
 
 Se muestra automáticamente la primera vez que un usuario hace login en
 este equipo (usa QSettings para recordar que ya se vio). También se puede
-reabrir desde el botón «🎓 Tutorial» del sidebar.
+reabrir desde el botón «Tutorial» del sidebar.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class Step:
 
 STEPS: List[Step] = [
     Step(
-        icon="👋",
+        icon="",
         title="Bienvenido al NVR",
         body=(
             "Este sistema te permite ver, grabar y recibir alertas de tus "
@@ -37,23 +37,23 @@ STEPS: List[Step] = [
             "internet salvo las notificaciones que tú configures.\n\n"
             "Este pequeño tutorial te muestra lo esencial en menos de un "
             "minuto. Puedes saltarlo y volver a abrirlo cuando quieras "
-            "desde el botón «🎓 Tutorial» del menú lateral."
+            "desde el botón «Tutorial» del menú lateral."
         ),
     ),
     Step(
-        icon="📹",
+        icon="",
         title="1. Añadir tus cámaras",
         body=(
-            "Ve a la sección «Cámaras» y pulsa «🔍 Descubrir Cámaras». "
+            "Ve a la sección «Cámaras» y pulsa «Descubrir Cámaras». "
             "El sistema buscará automáticamente cámaras ONVIF en tu red.\n\n"
             "Si tu cámara no aparece, puedes añadirla manualmente con su URL "
             "RTSP. Si tu cámara tiene dos lentes (panorámica), márcala como "
             "«dual-lens» y verás los dos por separado."
         ),
-        hint="💡 Las cámaras se conectan solas en cuanto las añades."
+        hint="Las cámaras se conectan solas en cuanto las añades."
     ),
     Step(
-        icon="📺",
+        icon="",
         title="2. Verlas en vivo",
         body=(
             "Ve a «En vivo» para ver los streams. Cambia la disposición "
@@ -62,15 +62,15 @@ STEPS: List[Step] = [
             "/ Siguiente ▶» o las teclas PageUp/PageDown para navegar entre "
             "páginas."
         ),
-        hint="💡 Doble clic en una cámara para maximizarla. Clic derecho "
+        hint="Doble clic en una cámara para maximizarla. Clic derecho "
              "para PTZ, captura o configuración."
     ),
     Step(
-        icon="💬",
+        icon="",
         title="3. Configurar Telegram",
         body=(
             "Para recibir alertas en tu teléfono, ve a «Notificaciones» y "
-            "pulsa «📲 Vincular nuevo chat».\n\n"
+            "pulsa «Vincular nuevo chat».\n\n"
             "El sistema te dará un código de 6 caracteres. Abre Telegram, "
             "busca el bot del NVR y envíale ese código. ¡Y listo, queda "
             "vinculado automáticamente!"
@@ -79,21 +79,21 @@ STEPS: List[Step] = [
              "mensaje al bot. El sistema lo detecta y te avisa."
     ),
     Step(
-        icon="📱",
+        icon="",
         title="4. Vincular tu celular",
         body=(
-            "Pulsa «📱 Vincular móvil» en el menú lateral. Aparecerá un QR; "
+            "Pulsa «Vincular móvil» en el menú lateral. Aparecerá un QR; "
             "escanéalo desde la app móvil del NVR (en la misma red WiFi) "
             "y tu teléfono quedará autenticado.\n\n"
             "Desde el móvil podrás ver streams, recibir alertas push, ver "
             "grabaciones y controlar las cámaras."
         ),
-        hint="🌐 Solo funciona en la misma red WiFi. Para acceso remoto, "
+        hint="Solo funciona en la misma red WiFi. Para acceso remoto, "
              "monta un túnel privado (Tailscale, WireGuard) — fuera del "
              "alcance de este tutorial."
     ),
     Step(
-        icon="🔔",
+        icon="",
         title="5. Reglas de notificación",
         body=(
             "En «Notificaciones → Mis preferencias» creas reglas tipo:\n\n"
@@ -101,16 +101,16 @@ STEPS: List[Step] = [
             "Cuantas reglas quieras. Sin reglas no recibes nada (las "
             "cámaras siguen grabando, sólo silencias los avisos)."
         ),
-        hint="🎯 Usa el ❔ que hay en cada vista para más detalles."
+        hint="Usa el que hay en cada vista para más detalles."
     ),
     Step(
-        icon="🎉",
+        icon="",
         title="¡Todo listo!",
         body=(
             "Ya tienes lo esencial. Recuerda:\n\n"
-            "• Cualquier vista tiene un botón ❔ con ayuda específica.\n"
+            "• Cualquier vista tiene un botón con ayuda específica.\n"
             "• Este tutorial se puede reabrir en cualquier momento desde "
-            "el botón «🎓 Tutorial» del menú lateral.\n"
+            "el botón «Tutorial» del menú lateral.\n"
             "• En «Sistema» puedes ver el estado real del servidor.\n\n"
             "Si algo no funciona como esperas, revisa el log del servidor "
             "o consulta la ayuda de la sección correspondiente."
@@ -280,7 +280,7 @@ class OnboardingWizard(QDialog):
 
         self.btn_prev.setEnabled(self._current > 0)
         last = self._current == len(STEPS) - 1
-        self.btn_next.setText("Finalizar ✓" if last else "Siguiente →")
+        self.btn_next.setText("Finalizar " if last else "Siguiente →")
 
     def _prev(self):
         if self._current > 0:

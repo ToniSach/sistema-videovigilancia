@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from desktop_app.src.config import config
+from desktop_app.src.ui.icons import icon
 from desktop_app.src.services.api_client import api_client
 from desktop_app.src.ui.components.glass_card import GlassCard
 
@@ -50,12 +51,17 @@ class GrantPermissionDialog(QDialog):
         # Checks de permisos
         perms_box = QVBoxLayout()
         perms_box.addWidget(QLabel("<b>Capacidades:</b>"))
-        self.chk_view = QCheckBox("👁 Ver stream en vivo")
+        self.chk_view = QCheckBox("Ver stream en vivo")
+        self.chk_view.setIcon(icon("view"))
         self.chk_view.setChecked(True)
-        self.chk_ptz = QCheckBox("🎮 Controlar PTZ")
-        self.chk_leds = QCheckBox("💡 Controlar LEDs / IR-Cut")
-        self.chk_audio = QCheckBox("🎤 Audio bidireccional")
-        self.chk_download = QCheckBox("⬇ Descargar grabaciones")
+        self.chk_ptz = QCheckBox("Controlar PTZ")
+        self.chk_ptz.setIcon(icon("ptz_ctrl"))
+        self.chk_leds = QCheckBox("Controlar LEDs / IR-Cut")
+        self.chk_leds.setIcon(icon("led"))
+        self.chk_audio = QCheckBox("Audio bidireccional")
+        self.chk_audio.setIcon(icon("audio"))
+        self.chk_download = QCheckBox("Descargar grabaciones")
+        self.chk_download.setIcon(icon("download"))
         for c in (self.chk_view, self.chk_ptz, self.chk_leds,
                   self.chk_audio, self.chk_download):
             perms_box.addWidget(c)
@@ -122,20 +128,21 @@ class PermissionsView(QWidget):
 
         # Header
         header = QHBoxLayout()
-        title = QLabel("🔐 Permisos por cámara")
+        title = QLabel("Permisos por cámara")
         title.setStyleSheet(
             f"color: {config.THEME_TEXT}; font-size: 22px; font-weight: bold;"
         )
         header.addWidget(title)
         header.addStretch()
 
-        self.btn_refresh = QPushButton("🔄 Refrescar")
+        self.btn_refresh = QPushButton("  Refrescar")
+        self.btn_refresh.setIcon(icon("refresh"))
         self.btn_refresh.clicked.connect(self.refresh)
         header.addWidget(self.btn_refresh)
         layout.addLayout(header)
 
         self.lbl_warn = QLabel(
-            "⚠ Esta sección solo está disponible para administradores."
+            "Esta sección solo está disponible para administradores."
         )
         self.lbl_warn.setStyleSheet(
             f"background:{config.THEME_DANGER}; color:white; padding:8px; "
@@ -182,11 +189,13 @@ class PermissionsView(QWidget):
         )
         r_header.addWidget(self.lbl_cam_title)
         r_header.addStretch()
-        self.btn_grant = QPushButton("➕ Otorgar acceso")
+        self.btn_grant = QPushButton("  Otorgar acceso")
+        self.btn_grant.setIcon(icon("grant"))
         self.btn_grant.clicked.connect(self._grant)
         self.btn_grant.setEnabled(False)
         r_header.addWidget(self.btn_grant)
-        self.btn_revoke = QPushButton("🗑 Revocar")
+        self.btn_revoke = QPushButton("  Revocar")
+        self.btn_revoke.setIcon(icon("delete"))
         self.btn_revoke.clicked.connect(self._revoke)
         self.btn_revoke.setEnabled(False)
         r_header.addWidget(self.btn_revoke)
@@ -194,7 +203,7 @@ class PermissionsView(QWidget):
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
-            "Usuario", "👁 Ver", "🎮 PTZ", "💡 LEDs", "🎤 Audio", "⬇ Download"
+            "Usuario", "Ver", "PTZ", "LEDs", "Audio", "Descargar"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -270,7 +279,7 @@ class PermissionsView(QWidget):
                     start=1
                 ):
                     self.table.setItem(
-                        r, col, QTableWidgetItem("✓" if p.get(key) else "—")
+                        r, col, QTableWidgetItem("Sí" if p.get(key) else "—")
                     )
         api_client.get(f"permissions/camera/{cam_id}", on_perms)
 

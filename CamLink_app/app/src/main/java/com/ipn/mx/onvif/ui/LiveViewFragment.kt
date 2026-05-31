@@ -1,6 +1,7 @@
 package com.ipn.mx.onvif.ui
 
 import android.annotation.SuppressLint
+import android.content.pm.ActivityInfo
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.MotionEvent
@@ -11,11 +12,18 @@ import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.Toast
 import androidx.annotation.OptIn
+import androidx.appcompat.app.AppCompatActivity
+import androidx.constraintlayout.widget.ConstraintLayout
+import androidx.constraintlayout.widget.ConstraintSet
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.rtsp.RtspMediaSource
 import androidx.navigation.fragment.findNavController
 import com.ipn.mx.onvif.R
 import com.ipn.mx.onvif.model.CameraResponse
@@ -25,13 +33,54 @@ import kotlinx.coroutines.launch
 
 class LiveViewFragment : BaseMenuFragment() {
 
-    // ── Estado de la cámara activa ────────────────────────────────────────────
-    private var cameras: List<CameraResponse> = emptyList()
-    private var currentCamIndex = 0
-    private val currentCamera get() = cameras.getOrNull(currentCamIndex)
+    // ── Estado: "feeds" ───────────────────────────────────────────────────────
+    // Una cámara mono = 1 feed; una dual-lens = 2 feeds (L1 y L2). La navegación
+    // prev/next cicla por feeds, así cada lente se ve por separado por WebRTC/RTSP
+    // (go2rtc) sin tocar el layout.
+    private data class Feed(
+        val camera: CameraResponse,
+        val lens: String?,        // null (mono) | "l1" | "l2"
+        val url: String,          // URL preferida (HLS si existe)
+        val fallbackUrl: String?, // RTSP de respaldo si el HLS falla
+        val label: String,
+    )
+    private var feeds: List<Feed> = emptyList()
+    private var currentFeedIndex = 0
+    private val currentFeed get() = feeds.getOrNull(currentFeedIndex)
+    private val currentCamera get() = currentFeed?.camera
+    // Para no entrar en bucle de fallback HLS→RTSP→HLS por feed.
+    private var triedFallback = false
+
+    /** Construye la lista de feeds: dual-lens → 2 (L1/L2); mono → 1.
+     *  Prefiere HLS (fiable en ExoPlayer); RTSP queda como fallback. */
+    private fun buildFeeds(cams: List<CameraResponse>): List<Feed> {
+        val out = mutableListOf<Feed>()
+        for (c in cams) {
+            if (c.isDualLens && !c.streamUrlL1.isNullOrBlank() && !c.streamUrlL2.isNullOrBlank()) {
+                val urlL1 = c.hlsUrlL1?.takeIf { it.isNotBlank() } ?: c.streamUrlL1!!
+                val urlL2 = c.hlsUrlL2?.takeIf { it.isNotBlank() } ?: c.streamUrlL2!!
+                out.add(Feed(c, "l1", urlL1, c.streamUrlL1, "${c.name} · L1"))
+                out.add(Feed(c, "l2", urlL2, c.streamUrlL2, "${c.name} · L2"))
+            } else {
+                val url = c.liveHlsUrl ?: c.liveUrl
+                out.add(Feed(c, null, url, c.liveUrl, c.name))
+            }
+        }
+        return out
+    }
 
     // ── ExoPlayer ─────────────────────────────────────────────────────────────
     private var player: ExoPlayer? = null
+
+    // ── Referencias a vistas (para ocultar controles no soportados + fullscreen)
+    private var rootLayout: ConstraintLayout? = null
+    private var cameraFeedRef: FrameLayout? = null
+    private var controlsCardRef: View? = null
+    private var joystickCardRef: View? = null
+    private var bottomRowRefs: List<View> = emptyList()
+    private var btnMicRef: ImageButton? = null
+    private var btnFullscreenRef: ImageButton? = null
+    private var isFullscreen = false
 
     // ── Estado de controles ───────────────────────────────────────────────────
     private var isRecording = false
@@ -62,6 +111,15 @@ class LiveViewFragment : BaseMenuFragment() {
         val joystickOuter = view.findViewById<FrameLayout>(R.id.joystickOuter)
         val joystickThumb = view.findViewById<View>(R.id.joystickThumb)
 
+        // Guardar refs para ocultar controles no soportados y la pantalla completa.
+        rootLayout       = view as? ConstraintLayout
+        cameraFeedRef    = cameraFeed
+        controlsCardRef  = view.findViewById(R.id.controlsCard)
+        joystickCardRef  = view.findViewById(R.id.joystickCard)
+        bottomRowRefs    = listOf(btnToggleView, btnFullscreen)
+        btnMicRef        = btnMic
+        btnFullscreenRef = btnFullscreen
+
         // Preparar el SurfaceView para ExoPlayer dentro del FrameLayout
         val surfaceView = SurfaceView(requireContext()).apply {
             layoutParams = FrameLayout.LayoutParams(
@@ -76,18 +134,32 @@ class LiveViewFragment : BaseMenuFragment() {
 
         // ── Navegación entre cámaras ─────────────────────────────────────────
         btnPrevFeed.setOnClickListener {
-            if (cameras.isEmpty()) return@setOnClickListener
-            currentCamIndex = (currentCamIndex - 1 + cameras.size) % cameras.size
+            if (feeds.isEmpty()) return@setOnClickListener
+            currentFeedIndex = (currentFeedIndex - 1 + feeds.size) % feeds.size
             playCurrentCamera(surfaceView)
         }
         btnNextFeed.setOnClickListener {
-            if (cameras.isEmpty()) return@setOnClickListener
-            currentCamIndex = (currentCamIndex + 1) % cameras.size
+            if (feeds.isEmpty()) return@setOnClickListener
+            currentFeedIndex = (currentFeedIndex + 1) % feeds.size
             playCurrentCamera(surfaceView)
         }
 
         // ── Joystick PTZ ─────────────────────────────────────────────────────
         joystickOuter.setOnTouchListener { _, event ->
+            // La cámara actual puede no tener PTZ (p.ej. la dual-lens iCSee no
+            // tiene motor de giro). En ese caso el joystick no hace nada: se lo
+            // explicamos al usuario en vez de dejarlo "muerto" sin feedback.
+            if (currentCamera?.hasPtz != true) {
+                if (event.action == MotionEvent.ACTION_DOWN) {
+                    Toast.makeText(
+                        requireContext(),
+                        "Esta cámara no tiene control PTZ (giro/inclinación)",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+                return@setOnTouchListener true
+            }
+
             val cx     = joystickOuter.width / 2f
             val cy     = joystickOuter.height / 2f
             val radius = (joystickOuter.width / 2f) - (joystickThumb.width / 2f)
@@ -230,8 +302,77 @@ class LiveViewFragment : BaseMenuFragment() {
         btnToggleView.setOnClickListener {
             findNavController().navigate(R.id.action_liveView_to_cameraList)
         }
-        btnFullscreen.setOnClickListener {
-            Toast.makeText(requireContext(), "Pantalla completa: pendiente", Toast.LENGTH_SHORT).show()
+        btnFullscreen.setOnClickListener { toggleFullscreen() }
+    }
+
+    // ── Mostrar/ocultar controles según capacidades de la cámara ──────────────
+    /** Oculta el micrófono si la cámara no tiene audio y el joystick si no tiene
+     *  PTZ — así no hay botones "muertos" (diseño más limpio). */
+    private fun updateControlsForCamera(cam: CameraResponse?) {
+        btnMicRef?.visibility = if (cam?.hasAudio == true) View.VISIBLE else View.GONE
+        joystickCardRef?.visibility = if (cam?.hasPtz == true) View.VISIBLE else View.GONE
+    }
+
+    // ── Pantalla completa (landscape + inmersivo + video a pantalla) ──────────
+    private fun toggleFullscreen() {
+        val root = rootLayout ?: return
+        val act = activity ?: return
+        isFullscreen = !isFullscreen
+
+        if (isFullscreen) {
+            act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            (act as? AppCompatActivity)?.supportActionBar?.hide()
+            setSystemBarsHidden(true)
+            controlsCardRef?.visibility = View.GONE
+            joystickCardRef?.visibility = View.GONE
+            bottomRowRefs.forEach { it.visibility = View.GONE }
+            applyFeedFullscreen(root, true)
+            btnFullscreenRef?.setImageResource(R.drawable.ic_fullscreen)
+        } else {
+            act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            (act as? AppCompatActivity)?.supportActionBar?.show()
+            setSystemBarsHidden(false)
+            controlsCardRef?.visibility = View.VISIBLE
+            bottomRowRefs.forEach { it.visibility = View.VISIBLE }
+            applyFeedFullscreen(root, false)
+            // El joystick vuelve solo si la cámara lo soporta.
+            updateControlsForCamera(currentCamera)
+        }
+    }
+
+    /** Expande/contrae el contenedor del video usando ConstraintSet. */
+    private fun applyFeedFullscreen(root: ConstraintLayout, full: Boolean) {
+        val cs = ConstraintSet().apply { clone(root) }
+        val id = R.id.cameraFeedContainer
+        if (full) {
+            cs.setDimensionRatio(id, null)              // quitar el 16:9
+            cs.constrainHeight(id, ConstraintSet.MATCH_CONSTRAINT)
+            cs.connect(id, ConstraintSet.BOTTOM, ConstraintSet.PARENT_ID, ConstraintSet.BOTTOM, 0)
+            cs.setMargin(id, ConstraintSet.START, 0)
+            cs.setMargin(id, ConstraintSet.END, 0)
+            cs.setMargin(id, ConstraintSet.TOP, 0)
+        } else {
+            cs.setDimensionRatio(id, "16:9")
+            cs.constrainHeight(id, ConstraintSet.MATCH_CONSTRAINT)
+            cs.clear(id, ConstraintSet.BOTTOM)
+            val m = (12 * resources.displayMetrics.density).toInt()
+            cs.setMargin(id, ConstraintSet.START, m)
+            cs.setMargin(id, ConstraintSet.END, m)
+            cs.setMargin(id, ConstraintSet.TOP, m)
+        }
+        cs.applyTo(root)
+    }
+
+    private fun setSystemBarsHidden(hidden: Boolean) {
+        val window = activity?.window ?: return
+        WindowCompat.setDecorFitsSystemWindows(window, !hidden)
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        if (hidden) {
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else {
+            controller.show(WindowInsetsCompat.Type.systemBars())
         }
     }
 
@@ -245,9 +386,10 @@ class LiveViewFragment : BaseMenuFragment() {
             try {
                 val response = api.getCameras()
                 if (response.isSuccessful) {
-                    cameras = response.body()?.data ?: emptyList()
-                    if (cameras.isNotEmpty()) {
-                        currentCamIndex = 0
+                    val cams = response.body()?.data ?: emptyList()
+                    feeds = buildFeeds(cams)
+                    if (feeds.isNotEmpty()) {
+                        currentFeedIndex = 0
                         playCurrentCamera(surfaceView)
                     } else {
                         Toast.makeText(requireContext(), "No hay cámaras registradas", Toast.LENGTH_LONG).show()
@@ -269,25 +411,44 @@ class LiveViewFragment : BaseMenuFragment() {
 
     // ── ExoPlayer: reproducir RTSP ────────────────────────────────────────────
 
-    @OptIn(UnstableApi::class)
     private fun playCurrentCamera(surfaceView: SurfaceView) {
-        val camera = currentCamera ?: return
+        val feed = currentFeed ?: return
 
         // Liberar instancia anterior
         player?.release()
+        triedFallback = false
 
         player = ExoPlayer.Builder(requireContext()).build().also { exo ->
             exo.setVideoSurfaceView(surfaceView)
-
-            val mediaSource = RtspMediaSource.Factory()
-                .createMediaSource(MediaItem.fromUri(camera.rtspUrl))
-
-            exo.setMediaSource(mediaSource)
+            // ExoPlayer detecta el tipo por la URL: .m3u8 → HLS, rtsp:// → RTSP
+            // (ambos módulos están en el classpath). No hace falta factory manual.
+            exo.addListener(object : Player.Listener {
+                override fun onPlayerError(error: PlaybackException) {
+                    val fb = feed.fallbackUrl
+                    if (!triedFallback && !fb.isNullOrBlank() && fb != feed.url) {
+                        // HLS falló → reintentar una vez con RTSP directo.
+                        triedFallback = true
+                        android.util.Log.w("LiveView", "HLS falló (${error.errorCodeName}); probando RTSP: $fb")
+                        exo.setMediaItem(MediaItem.fromUri(fb))
+                        exo.prepare()
+                        exo.playWhenReady = true
+                    } else {
+                        Toast.makeText(
+                            requireContext(),
+                            "No se pudo reproducir ${feed.label}: ${error.errorCodeName}",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+            })
+            exo.setMediaItem(MediaItem.fromUri(feed.url))
             exo.prepare()
             exo.playWhenReady = true
         }
 
-        Toast.makeText(requireContext(), camera.name, Toast.LENGTH_SHORT).show()
+        // Ajustar qué controles se muestran según las capacidades de la cámara.
+        updateControlsForCamera(feed.camera)
+        Toast.makeText(requireContext(), feed.label, Toast.LENGTH_SHORT).show()
     }
 
     // ── PTZ ───────────────────────────────────────────────────────────────────
@@ -368,5 +529,20 @@ class LiveViewFragment : BaseMenuFragment() {
         super.onDestroyView()
         player?.release()
         player = null
+        // Si salimos estando en pantalla completa, restaurar el chrome del
+        // sistema y la orientación para no dejar la app "rota" en otras pantallas.
+        if (isFullscreen) {
+            (activity as? AppCompatActivity)?.supportActionBar?.show()
+            setSystemBarsHidden(false)
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            isFullscreen = false
+        }
+        rootLayout = null
+        cameraFeedRef = null
+        controlsCardRef = null
+        joystickCardRef = null
+        bottomRowRefs = emptyList()
+        btnMicRef = null
+        btnFullscreenRef = null
     }
 }

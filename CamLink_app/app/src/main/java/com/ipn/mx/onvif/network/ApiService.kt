@@ -123,4 +123,16 @@ interface ApiService {
     suspend fun deleteNotificationPreference(
         @Path("id") id: Int,
     ): Response<Unit>
+
+    // ── Vinculación de Telegram ───────────────────────────────────────────────
+
+    /** Genera un código de vinculación + deep link para el usuario autenticado. */
+    @POST("telegram/generate-code")
+    suspend fun generateTelegramCode(): Response<TelegramCodeResponse>
+
+    /** Polling: indica si el código ya fue consumido por el bot (linked=true). */
+    @GET("telegram/link-status")
+    suspend fun telegramLinkStatus(
+        @Query("code") code: String,
+    ): Response<TelegramLinkStatusResponse>
 }

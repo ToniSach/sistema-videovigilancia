@@ -6,7 +6,6 @@ from ..database.repositories.camera_repository import CameraRepository
 from ..streaming.frame_buffer import CircularFrameBuffer, FrameData
 from ..streaming.frame_distributor import FrameDistributor
 from ..workers.ffmpeg_worker import FFmpegWorker, WorkerStatus
-from ..streaming.mjpeg_streamer import mjpeg_streamer
 
 
 class CameraManager:
@@ -149,6 +148,56 @@ class CameraManager:
         """Reset del flag de auto-desactivación (llamar al re-activar manualmente)."""
         self._auto_disabled.discard(camera_id)
 
+    def _go2rtc_source_url(self, camera_id: int):
+        """
+        Devuelve la URL del restream de go2rtc para alimentar al FFmpegWorker,
+        o None para que use la cámara directa. Solo aplica si GO2RTC_ENABLED y
+        GO2RTC_AS_SOURCE están activos (cámaras de 1 sola conexión RTSP).
+        """
+        try:
+            from backend.app.config import settings as _s
+            if getattr(_s, "GO2RTC_ENABLED", False) and getattr(_s, "GO2RTC_AS_SOURCE", False):
+                from backend.app.streaming.go2rtc_manager import Go2RtcManager
+                url = Go2RtcManager().rtsp_restream_url(camera_id)
+                self._logger.info(
+                    f"[GO2RTC_AS_SOURCE] Cam {camera_id}: el worker leerá del "
+                    f"restream de go2rtc → {url} (NO directo a la cámara)"
+                )
+                return url
+            else:
+                self._logger.info(
+                    f"Cam {camera_id}: worker lee DIRECTO de la cámara "
+                    f"(GO2RTC_AS_SOURCE={getattr(_s, 'GO2RTC_AS_SOURCE', False)}, "
+                    f"GO2RTC_ENABLED={getattr(_s, 'GO2RTC_ENABLED', False)})"
+                )
+        except Exception as e:
+            self._logger.warning(f"No se pudo resolver source go2rtc cam {camera_id}: {e}")
+        return None
+
+    def _maybe_sync_time(self, camera) -> None:
+        """
+        Sincroniza la hora de la cámara con la del servidor (ONVIF), en un hilo
+        aparte y best-effort, si CAMERA_SYNC_TIME_ON_START está activo. No
+        bloquea el arranque ni falla si la cámara no soporta ONVIF.
+        """
+        try:
+            from backend.app.config import settings as _s
+            if not getattr(_s, "CAMERA_SYNC_TIME_ON_START", True):
+                return
+
+            def _do():
+                try:
+                    from backend.app.cameras.time_sync import sync_camera_time
+                    sync_camera_time(camera)
+                except Exception as e:
+                    self._logger.debug(f"sync hora cam {getattr(camera, 'id', '?')}: {e}")
+
+            threading.Thread(
+                target=_do, name=f"TimeSync-{getattr(camera, 'id', '?')}", daemon=True
+            ).start()
+        except Exception:
+            pass
+
     def start_camera(self, camera: Camera, register_mjpeg: bool = True) -> bool:
         if camera.is_dual_lens:
             return self.start_dual_lens_camera(camera)
@@ -172,10 +221,19 @@ class CameraManager:
                 # Import local: el modelo de settings se inyecta solo en este
                 # método (no estaba a nivel de módulo y rompía cámaras mono).
                 from backend.app.config import settings as _settings
+                # Cámaras de 1 sola conexión RTSP: leer del restream de go2rtc
+                # (si GO2RTC_AS_SOURCE) para que go2rtc sea el único consumidor
+                # de la cámara y no haya contención con la grabación/otros.
+                _src = self._go2rtc_source_url(camera.id)
+                # El restream de go2rtc SOLO acepta RTSP sobre TCP (UDP →
+                # "461 Unsupported transport"). RTSP_TRANSPORT del .env aplica
+                # a la cámara; cuando leemos de go2rtc forzamos tcp.
+                _transport = "tcp" if _src else getattr(_settings, "RTSP_TRANSPORT", "tcp")
                 worker = FFmpegWorker(
                     camera=camera,
                     frame_buffer=buffer,
-                    rtsp_transport=getattr(_settings, "RTSP_TRANSPORT", "tcp"),
+                    rtsp_transport=_transport,
+                    source_url=_src,
                 )
                 worker.set_permanent_failure_callback(self._on_permanent_failure)
 
@@ -186,15 +244,9 @@ class CameraManager:
                 self._buffers[camera.id] = buffer
                 self._distributors[camera.id] = distributor
 
-                if register_mjpeg:
-                    distributor.register_consumer(
-                        "mjpeg",
-                        lambda fd: mjpeg_streamer.update_frame(camera.id, "main", fd),
-                        needs_copy=False
-                    )
-                    self._logger.info(f"MJPEG registrado automáticamente para cámara {camera.id} (stream main)")
-
+                # El directo se sirve por go2rtc (WebRTC/RTSP). MJPEG eliminado.
                 self._wire_recording_manager(camera.id, distributor)
+                self._maybe_sync_time(camera)
 
                 self._logger.info(f"Cámara {camera.id} ({camera.name}) iniciada correctamente")
                 return True
@@ -230,11 +282,14 @@ class CameraManager:
                 dual_width = settings.FFMPEG_DUAL_LENS_WIDTH   # 1280
                 dual_height = settings.FFMPEG_DUAL_LENS_HEIGHT # 1440
 
+                _dual_src = self._go2rtc_source_url(parent_camera.id)
+                _dual_transport = "tcp" if _dual_src else settings.RTSP_TRANSPORT
                 worker = FFmpegWorker(
                     camera=parent_camera,
                     frame_buffer=raw_buffer,
                     target_resolution=(dual_width, dual_height),
-                    rtsp_transport=settings.RTSP_TRANSPORT,
+                    rtsp_transport=_dual_transport,
+                    source_url=_dual_src,
                 )
                 worker.set_permanent_failure_callback(self._on_permanent_failure)
 
@@ -262,17 +317,8 @@ class CameraManager:
                 self._lens_distributors[(parent_camera.id, "l1")] = lens_dist_l1
                 self._lens_distributors[(parent_camera.id, "l2")] = lens_dist_l2
 
-                # MJPEG zero-copy para cada lente
-                lens_dist_l1.register_consumer(
-                    "mjpeg_l1",
-                    lambda fd: mjpeg_streamer.update_frame(parent_camera.id, "l1", fd),
-                    needs_copy=False,
-                )
-                lens_dist_l2.register_consumer(
-                    "mjpeg_l2",
-                    lambda fd: mjpeg_streamer.update_frame(parent_camera.id, "l2", fd),
-                    needs_copy=False,
-                )
+                # El directo por lente se sirve por go2rtc (cam_X_l1/l2). Los
+                # distribuidores de lente quedan para la IA. MJPEG eliminado.
 
                 def split_and_distribute(frame_data: FrameData):
                     # splitter.split() retorna VIEWS (no copia) del frame.
@@ -300,6 +346,7 @@ class CameraManager:
                 # En dual-lens registramos el pre-buffer de grabación contra l1
                 # (asumimos l1 como lente "principal" del par).
                 self._wire_recording_manager(parent_camera.id, lens_dist_l1)
+                self._maybe_sync_time(parent_camera)
 
                 self._logger.info(f"✅ Cámara dual {parent_camera.id} iniciada: "
                                 f"{dual_width}x{dual_height} → l1/l2")
@@ -367,19 +414,6 @@ class CameraManager:
                     ptz_manager.drop(camera_id)
                 except Exception:
                     pass
-
-                # Limpiar streams MJPEG (main y posibles lentes duales)
-                try:
-                    # Para cámara normal o dual, limpiar main
-                    mjpeg_streamer.cleanup_stream(camera_id, "main")
-                except Exception:
-                    pass
-                try:
-                    # Si es dual, limpiar lentes
-                    mjpeg_streamer.cleanup_stream(camera_id, "l1")
-                    mjpeg_streamer.cleanup_stream(camera_id, "l2")
-                except Exception as e:
-                    self._logger.debug(f"Limpieza de streams virtuales: {e}")
 
             else:
                 self._logger.warning(f"No se encontró cámara activa con ID {camera_id}")

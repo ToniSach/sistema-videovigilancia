@@ -126,12 +126,64 @@ data class CameraResponse(
     val name: String,
     @SerializedName("ip_address")       val ipAddress: String,
     @SerializedName("rtsp_url")         val rtspUrl: String,
+    // URL del restream de go2rtc (una sola conexión a la cámara). El backend la
+    // añade cuando GO2RTC_ENABLED=true; si es null se usa rtspUrl directo (modo
+    // actual). Ver migración WebRTC/go2rtc.
+    @SerializedName("stream_url")       val streamUrl: String? = null,
+    @SerializedName("webrtc_url")       val webrtcUrl: String? = null,
+    // Dual-lens: el backend (con go2rtc) entrega un sub-stream recortado por
+    // lente. La app los muestra como dos "feeds" (L1/L2) en la navegación.
+    @SerializedName("is_dual_lens")     val isDualLens: Boolean = false,
+    @SerializedName("stream_url_l1")    val streamUrlL1: String? = null,
+    @SerializedName("stream_url_l2")    val streamUrlL2: String? = null,
+    // HLS (preferido en móvil; ExoPlayer es muy fiable con HLS). RTSP es fallback.
+    @SerializedName("hls_url")          val hlsUrl: String? = null,
+    @SerializedName("hls_url_l1")       val hlsUrlL1: String? = null,
+    @SerializedName("hls_url_l2")       val hlsUrlL2: String? = null,
+    @SerializedName("is_active")        val isActive: Boolean = true,
     @SerializedName("has_ptz")          val hasPtz: Boolean = false,
     @SerializedName("has_audio")        val hasAudio: Boolean = false,
     @SerializedName("connection_type")  val connectionType: String = "rtsp",
     @SerializedName("resolution_width") val resolutionWidth: Int = 1920,
     @SerializedName("resolution_height")val resolutionHeight: Int = 1080,
     val fps: Int = 12
+) {
+    /** Fuente de vídeo en vivo preferida: restream go2rtc si existe, si no el RTSP directo. */
+    val liveUrl: String get() = streamUrl?.takeIf { it.isNotBlank() } ?: rtspUrl
+
+    /** URL HLS del directo combinado (mono) o null si no hay go2rtc. */
+    val liveHlsUrl: String? get() = hlsUrl?.takeIf { it.isNotBlank() }
+}
+
+// ── Vinculación de Telegram ───────────────────────────────────────────────────
+// Flujo: POST /telegram/generate-code → code + deep link → el usuario lo abre en
+// Telegram y envía /vincular CODE → polling GET /telegram/link-status?code=...
+
+data class TelegramCodeData(
+    val code: String,
+    @SerializedName("bot_username")        val botUsername: String? = null,
+    @SerializedName("bot_configured")      val botConfigured: Boolean = false,
+    @SerializedName("expires_in_seconds")  val expiresInSeconds: Int = 300,
+    @SerializedName("telegram_deep_link")  val telegramDeepLink: String? = null,
+    val instructions: List<String> = emptyList(),
+)
+
+data class TelegramCodeResponse(
+    val success: Boolean,
+    val data: TelegramCodeData? = null,
+    val error: String? = null,
+)
+
+data class TelegramLinkStatusData(
+    val code: String,
+    val linked: Boolean = false,
+    val expired: Boolean = false,
+)
+
+data class TelegramLinkStatusResponse(
+    val success: Boolean,
+    val data: TelegramLinkStatusData? = null,
+    val error: String? = null,
 )
 
 data class PtzRequest(
@@ -168,5 +220,10 @@ data class RecordingResponse(
     @SerializedName("duration_seconds")  val durationSeconds: Int = 0,
     @SerializedName("has_alert")         val hasAlert: Boolean = false,
     @SerializedName("is_favorite")       val isFavorite: Boolean = false,
-    @SerializedName("file_url")          val fileUrl: String? = null
+    @SerializedName("file_url")          val fileUrl: String? = null,
+    // URL FIRMADA (relativa) para reproducir sin cabecera Authorization +
+    // miniatura. Las añade el backend (migración VOD firmado). Relativas a la
+    // base del servidor: anteponer RetrofitClient.buildBaseUrl(...).
+    @SerializedName("playback_url")      val playbackUrl: String? = null,
+    @SerializedName("thumbnail_url")     val thumbnailUrl: String? = null
 )

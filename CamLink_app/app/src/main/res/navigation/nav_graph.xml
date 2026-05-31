@@ -128,4 +128,11 @@
         android:label="Notificaciones"
         tools:layout="@layout/fragment_notifications_panel" />
 
+    <!-- Vinculación de cuenta de Telegram (código + deep link + polling). -->
+    <fragment
+        android:id="@+id/telegramLinkFragment"
+        android:name="com.ipn.mx.onvif.ui.TelegramLinkFragment"
+        android:label="Vincular Telegram"
+        tools:layout="@layout/fragment_telegram_link" />
+
 </navigation>

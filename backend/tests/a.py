@@ -4,8 +4,8 @@ import shutil
 def copiar_archivos(origen, destino):
     try:
         for raiz, dirs, files in os.walk(origen):
-            # Ignorar carpetas "env", "objects" y "desktop_app"
-            dirs[:] = [d for d in dirs if d not in ("env", "objects")]
+            # Ignorar carpetas "env" y "objects"
+            dirs[:] = [d for d in dirs if d not in ("env", "objects", "tests")]
 
             for archivo in files:
                 # Ignorar archivos .pyc
@@ -32,8 +32,9 @@ def copiar_archivos(origen, destino):
         print(f"No se pudo acceder a: {origen}")
 
 if __name__ == "__main__":
-    origen = input("Introduce la ruta de la carpeta origen: ").strip()
-    destino = input("Introduce la ruta de la carpeta destino: ").strip()
+    # Rutas fijas según lo solicitado
+    origen = r"C:\Users\tonis\OneDrive\Documentos\ProyectoPrueba-TT\Proyecto-kimi\sistema-videovigilancia\backend\app"
+    destino = r"C:\Users\tonis\OneDrive\Documentos\ProyectoPrueba-TT\Proyecto-kimi\parakimi-actualizado3"
 
     if os.path.exists(origen) and os.path.isdir(origen):
         copiar_archivos(origen, destino)

@@ -24,8 +24,6 @@ from PySide6.QtWidgets import (
     QFrame, QMessageBox, QSizePolicy,
 )
 
-import requests
-
 from desktop_app.src.services.api_client import api_client
 from desktop_app.src.config import config
 
@@ -36,26 +34,32 @@ QR_TTL_SECONDS = 300
 
 
 class _QRFetchWorker(QThread):
-    """Worker que descarga el PNG del QR sin bloquear el UI."""
+    """Worker que descarga el PNG del QR sin bloquear el UI.
+
+    Va a través de api_client._make_request (no requests crudo) para heredar
+    el refresco-y-reintento automático ante 401: el access_token JWT vive
+    ~15 min y antes el QR fallaba con "Token expirado" si el diálogo se abría
+    pasado ese tiempo (la petición cruda no refrescaba el token).
+    """
     fetched = Signal(bytes)
     failed = Signal(str)
 
-    def __init__(self, base_url: str, token: str, parent=None):
-        super().__init__(parent)
-        self._base_url = base_url.rstrip("/")
-        self._token = token
-
     def run(self):
         try:
-            r = requests.post(
-                f"{self._base_url}/qr/generate",
-                headers={"Authorization": f"Bearer {self._token}"},
-                timeout=10,
-            )
-            if r.status_code != 200:
-                self.failed.emit(f"HTTP {r.status_code}: {r.text[:200]}")
+            # stream=True → _make_request devuelve el objeto Response crudo en
+            # .data (el QR es un PNG binario, no JSON). El 401 se maneja dentro
+            # de _make_request: refresca con el refresh_token y reintenta.
+            resp = api_client._make_request("POST", "qr/generate", stream=True)
+            if not resp.success:
+                self.failed.emit(resp.error or "Sesión expirada")
                 return
-            self.fetched.emit(r.content)
+            http = resp.data  # requests.Response
+            if http is None or http.status_code != 200:
+                code = getattr(http, "status_code", "?")
+                text = getattr(http, "text", "")[:200] if http is not None else ""
+                self.failed.emit(f"HTTP {code}: {text}")
+                return
+            self.fetched.emit(http.content)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -85,7 +89,7 @@ class QRLinkDialog(QDialog):
         layout.setSpacing(14)
 
         # Título
-        title = QLabel("📱  Vincular nuevo dispositivo")
+        title = QLabel("Vincular nuevo dispositivo")
         title.setStyleSheet(
             "color: #f1f5f9; font-size: 18px; font-weight: bold;"
         )
@@ -139,7 +143,7 @@ class QRLinkDialog(QDialog):
             QPushButton:disabled { color: #475569; }
         """
 
-        self.btn_refresh = QPushButton("🔄 Regenerar QR")
+        self.btn_refresh = QPushButton("Regenerar QR")
         self.btn_refresh.setStyleSheet(btn_style)
         self.btn_refresh.clicked.connect(self._fetch_qr)
         btn_row.addWidget(self.btn_refresh)
@@ -173,8 +177,7 @@ class QRLinkDialog(QDialog):
         self.lbl_qr.setPixmap(QPixmap())  # libera el anterior
         self.lbl_status.setText("Conectando al servidor…")
 
-        token = api_client.tokens.access_token
-        self._worker = _QRFetchWorker(config.API_BASE_URL, token, parent=self)
+        self._worker = _QRFetchWorker(parent=self)
         self._worker.fetched.connect(self._on_qr_fetched, type=Qt.QueuedConnection)
         self._worker.failed.connect(self._on_qr_failed, type=Qt.QueuedConnection)
         self._worker.finished.connect(self._worker.deleteLater)
@@ -210,7 +213,7 @@ class QRLinkDialog(QDialog):
         self._show_error(f"No se pudo generar el QR: {msg}")
 
     def _show_error(self, msg: str):
-        self.lbl_qr.setText("❌\n\n" + msg)
+        self.lbl_qr.setText("\n\n" + msg)
         self.lbl_status.setText("")
         self.btn_refresh.setEnabled(True)
         self._countdown.stop()
@@ -218,11 +221,11 @@ class QRLinkDialog(QDialog):
     def _tick(self):
         if self._remaining_s <= 0:
             self._countdown.stop()
-            self.lbl_status.setText("⚠ Código expirado. Pulsa «Regenerar QR».")
+            self.lbl_status.setText("Código expirado. Pulsa «Regenerar QR».")
             self.lbl_status.setStyleSheet("color: #ef4444; font-size: 11px;")
             return
         m, s = divmod(self._remaining_s, 60)
-        self.lbl_status.setText(f"⏱  Válido por {m:01d}:{s:02d}")
+        self.lbl_status.setText(f"Válido por {m:01d}:{s:02d}")
         self.lbl_status.setStyleSheet("color: #94a3b8; font-size: 11px;")
         self._remaining_s -= 1
 

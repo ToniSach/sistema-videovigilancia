@@ -53,18 +53,67 @@ class YLOModelPool:
         self._model = None
         self._model_lock = threading.Lock()
         self._ref_count = 0
-        self._model_path = "yolov8n.pt"
-        # Tomar confianza de settings (configurable vía AI_CONFIDENCE en .env)
+        # Config (modelo, runtime, imgsz, hilos) desde settings.
         try:
             from backend.app.config import settings
+            self._model_path = getattr(settings, "AI_MODEL", "yolov8n.pt")
             self._confidence = float(getattr(settings, "AI_CONFIDENCE", 0.35))
+            self._format = getattr(settings, "AI_FORMAT", "auto").lower()
+            self._imgsz = int(getattr(settings, "AI_IMGSZ", 640))
+            self._torch_threads = int(getattr(settings, "AI_TORCH_THREADS", 0))
         except Exception:
+            self._model_path = "yolov8n.pt"
             self._confidence = 0.35
+            self._format = "auto"
+            self._imgsz = 640
+            self._torch_threads = 0
+        self._runtime = "pytorch"  # se ajusta al cargar
         self._device = self._select_device()
         logger.info(
-            f"YLOModelPool inicializado: device={self._device}, "
+            f"YLOModelPool inicializado: model={self._model_path}, "
+            f"device={self._device}, format={self._format}, imgsz={self._imgsz}, "
             f"confidence={self._confidence}"
         )
+
+    def _resolve_model(self) -> tuple[str, str]:
+        """
+        Resuelve qué modelo cargar según AI_FORMAT, exportando a OpenVINO/ONNX si
+        hace falta (una sola vez; se cachea en disco). Devuelve (ruta, runtime).
+        Si el export o la dependencia falla, cae a PyTorch (.pt) — sin romper.
+        """
+        import os as _os
+        fmt = self._format
+        pt = self._model_path
+        if fmt == "auto":
+            # En CPU, OpenVINO suele ser 2-4× más rápido; en GPU, PyTorch/CUDA.
+            fmt = "openvino" if self._device == "cpu" else "pytorch"
+        if fmt == "pytorch" or not pt.endswith(".pt"):
+            return pt, "pytorch"
+
+        base = pt[:-3]  # sin ".pt"
+        try:
+            from ultralytics import YOLO
+            if fmt == "openvino":
+                export_dir = f"{base}_openvino_model"
+                if not _os.path.isdir(export_dir):
+                    logger.info(f"[YOLO] Exportando {pt} → OpenVINO (imgsz={self._imgsz}); puede tardar")
+                    YOLO(pt).export(format="openvino", imgsz=self._imgsz, half=False)
+                if _os.path.isdir(export_dir):
+                    return export_dir, "openvino"
+            elif fmt == "onnx":
+                onnx_path = f"{base}.onnx"
+                if not _os.path.exists(onnx_path):
+                    logger.info(f"[YOLO] Exportando {pt} → ONNX (imgsz={self._imgsz}); puede tardar")
+                    YOLO(pt).export(format="onnx", imgsz=self._imgsz)
+                if _os.path.exists(onnx_path):
+                    return onnx_path, "onnx"
+        except Exception as e:
+            logger.warning(
+                f"[YOLO] Export a {fmt} falló ({e}); usando PyTorch (.pt). "
+                f"Para acelerar: pip install "
+                f"{'openvino' if fmt == 'openvino' else 'onnxruntime'}"
+            )
+        return pt, "pytorch"
 
     def _select_device(self) -> str:
         """Selecciona automáticamente GPU si está disponible."""
@@ -172,17 +221,54 @@ class YLOModelPool:
                 except Exception:
                     pass
 
-                from ultralytics import YOLO
-                self._model = YOLO(self._model_path)
+                # Limitar hilos de torch para que YOLO no acapare la CPU y
+                # compita con FFmpeg (si AI_TORCH_THREADS > 0).
+                if self._torch_threads > 0:
+                    try:
+                        import torch
+                        torch.set_num_threads(self._torch_threads)
+                        logger.info(f"[YOLO] torch.set_num_threads({self._torch_threads})")
+                    except Exception:
+                        pass
 
-                if self._device == "cuda":
+                from ultralytics import YOLO
+                # Resolver runtime (OpenVINO/ONNX/PyTorch) y exportar si hace falta.
+                model_path, self._runtime = self._resolve_model()
+                self._model = YOLO(model_path)
+
+                if self._device == "cuda" and self._runtime == "pytorch":
                     self._model.to("cuda")
 
-                logger.info(f"Modelo YOLO cargado: {self._model_path} en {self._device}")
+                logger.info(
+                    f"Modelo YOLO cargado: {model_path} "
+                    f"(runtime={self._runtime}, device={self._device})"
+                )
 
             except Exception as e:
                 logger.error(f"Error cargando YOLO: {e}")
                 raise
+
+    def warmup(self) -> None:
+        """
+        Carga el modelo Y ejecuta una inferencia dummy para que la PRIMERA
+        detección real sea inmediata. Sin esto, el modelo se cargaba de forma
+        perezosa en el primer frame con movimiento (incluyendo la posible
+        exportación a OpenVINO/ONNX, que tarda segundos) → la primera alerta
+        llegaba con minutos de retraso. Se llama en un hilo aparte al activar
+        la IA. Idempotente (si ya está cargado, solo hace la inferencia dummy).
+        """
+        try:
+            if self._model is None:
+                self._load_model()
+            dummy = np.zeros((self._imgsz, self._imgsz, 3), dtype=np.uint8)
+            with self._model_lock:
+                self._model(dummy, imgsz=self._imgsz, verbose=False)
+            logger.info(
+                f"[YOLO] warmup completado — modelo listo "
+                f"(runtime={self._runtime}, imgsz={self._imgsz})"
+            )
+        except Exception as e:
+            logger.warning(f"[YOLO] warmup falló (se cargará en el primer frame): {e}")
 
     def detect(self, frame: np.ndarray, conf: Optional[float] = None) -> List[Detection]:
         """
@@ -208,7 +294,9 @@ class YLOModelPool:
         h, w = frame.shape[:2]
         with self._model_lock:
             try:
-                results = self._model(frame, conf=confidence, verbose=False)
+                results = self._model(
+                    frame, conf=confidence, imgsz=self._imgsz, verbose=False
+                )
             except Exception as e:
                 logger.error(
                     f"Error en inferencia YOLO (frame {w}x{h}, conf={confidence}): {e}"
@@ -300,6 +388,8 @@ class YLOModelPool:
             "model_loaded": self._model is not None,
             "device": self._device,
             "model_path": self._model_path,
+            "runtime": self._runtime,
+            "imgsz": self._imgsz,
             "reference_count": self._ref_count,
             "classes_supported": list(self.CLASSES_OF_INTEREST.values())
         }

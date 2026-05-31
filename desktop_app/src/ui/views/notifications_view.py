@@ -17,23 +17,29 @@ from PySide6.QtCore import Qt, QTime
 from desktop_app.src.config import config
 from desktop_app.src.services.api_client import api_client
 from desktop_app.src.ui.components.glass_card import GlassCard
+from desktop_app.src.ui.icons import icon
 
 logger = logging.getLogger(__name__)
 
 
 EVENT_TYPES_OPTIONS = [
-    ("person", "🚨 Persona"),
-    ("vehicle", "🚗 Vehículo"),
-    ("motion", "📹 Movimiento"),
-    ("camera_offline", "⚠ Cámara offline"),
-    ("tampering", "🔴 Sabotaje"),
+    ("person", "Persona"),
+    ("vehicle", "Vehículo"),
+    ("motion", "Movimiento"),
+    ("camera_offline", "Cámara offline"),
+    ("tampering", "Sabotaje"),
 ]
+EVENT_ICONS = {
+    "person": "person", "vehicle": "vehicle", "motion": "motion",
+    "camera_offline": "offline", "tampering": "tamper",
+}
 
 CHANNEL_OPTIONS = [
-    ("telegram", "💬 Telegram"),
-    ("push", "📱 Push (móvil)"),
-    ("email", "✉ Email"),
+    ("telegram", "Telegram"),
+    ("push", "Push (móvil)"),
+    ("email", "Email"),
 ]
+CHANNEL_ICONS = {"telegram": "telegram", "push": "push", "email": "email"}
 
 DAY_NAMES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 
@@ -63,7 +69,7 @@ class PreferenceDialog(QDialog):
         # Tipo de evento
         self.cmb_event = QComboBox()
         for key, label in EVENT_TYPES_OPTIONS:
-            self.cmb_event.addItem(label, key)
+            self.cmb_event.addItem(icon(EVENT_ICONS.get(key, "events")), label, key)
         form.addRow("Evento:", self.cmb_event)
 
         # Cámara (None = todas)
@@ -86,6 +92,7 @@ class PreferenceDialog(QDialog):
         self.chk_channels = {}
         for key, label in CHANNEL_OPTIONS:
             cb = QCheckBox(label)
+            cb.setIcon(icon(CHANNEL_ICONS.get(key, "")))
             self.chk_channels[key] = cb
             canales.addWidget(cb)
         self.chk_channels["telegram"].setChecked(True)
@@ -216,6 +223,7 @@ class NotificationPreferencesView(QWidget):
         super().__init__(parent)
         self._prefs: List[dict] = []
         self._cameras: List[dict] = []
+        self._role: str = ""
         self._setup_ui()
 
     def _setup_ui(self):
@@ -224,26 +232,29 @@ class NotificationPreferencesView(QWidget):
         layout.setSpacing(12)
 
         header = QHBoxLayout()
-        title = QLabel("🔔 Notificaciones")
+        title = QLabel("Notificaciones")
         title.setStyleSheet(
             f"color: {config.THEME_TEXT}; font-size: 22px; font-weight: bold;"
         )
         header.addWidget(title)
         header.addStretch()
 
-        self.btn_help = QPushButton("❔")
+        self.btn_help = QPushButton()
+        self.btn_help.setIcon(icon("help"))
         self.btn_help.setToolTip("Ver ayuda sobre notificaciones")
         self.btn_help.setMaximumWidth(36)
         self.btn_help.clicked.connect(self._show_help)
         header.addWidget(self.btn_help)
 
-        self.btn_refresh = QPushButton("🔄")
+        self.btn_refresh = QPushButton()
+        self.btn_refresh.setIcon(icon("refresh"))
         self.btn_refresh.setToolTip("Recargar")
         self.btn_refresh.setMaximumWidth(36)
         self.btn_refresh.clicked.connect(self.refresh)
         header.addWidget(self.btn_refresh)
 
-        self.btn_add = QPushButton("➕ Nueva preferencia")
+        self.btn_add = QPushButton("  Nueva preferencia")
+        self.btn_add.setIcon(icon("add"))
         self.btn_add.clicked.connect(self._add)
         header.addWidget(self.btn_add)
         layout.addLayout(header)
@@ -253,7 +264,7 @@ class NotificationPreferencesView(QWidget):
 
         # ============ SECCIÓN PREFERENCIAS ============
         prefs_header = QHBoxLayout()
-        prefs_title = QLabel("📋  Mis preferencias")
+        prefs_title = QLabel("Mis preferencias")
         prefs_title.setStyleSheet(
             f"color: {config.THEME_TEXT}; font-size: 15px; font-weight: bold;"
         )
@@ -284,18 +295,24 @@ class NotificationPreferencesView(QWidget):
 
         # Acciones
         actions = QHBoxLayout()
-        self.btn_edit = QPushButton("✏ Editar")
+        self.btn_edit = QPushButton("  Editar")
+        self.btn_edit.setIcon(icon("edit"))
         self.btn_edit.clicked.connect(self._edit)
         self.btn_edit.setEnabled(False)
         actions.addWidget(self.btn_edit)
-        self.btn_delete = QPushButton("🗑 Eliminar")
+        self.btn_delete = QPushButton("  Eliminar")
+        self.btn_delete.setIcon(icon("delete"))
         self.btn_delete.clicked.connect(self._delete)
         self.btn_delete.setEnabled(False)
         actions.addWidget(self.btn_delete)
         actions.addStretch()
         layout.addLayout(actions)
 
-    def set_current_user(self, _user_id: int, _role: str):
+    def set_current_user(self, _user_id: int, _role: str = ""):
+        self._role = (_role or "").lower()
+        # El botón de configurar el token del bot solo tiene sentido para admin.
+        if hasattr(self, "btn_telegram_config"):
+            self.btn_telegram_config.setVisible(self._role == "admin")
         self.refresh()
 
     def refresh(self):
@@ -336,7 +353,7 @@ class NotificationPreferencesView(QWidget):
             self.table.setItem(r, 1, QTableWidgetItem(cam_label))
 
             self.table.setItem(
-                r, 2, QTableWidgetItem("✓" if p.get("enabled") else "✗")
+                r, 2, QTableWidgetItem("Sí" if p.get("enabled") else "No")
             )
 
             chans = [ch_labels.get(c, c) for c in (p.get("channels") or [])]
@@ -433,7 +450,7 @@ class NotificationPreferencesView(QWidget):
 
         # Cabecera de la tarjeta
         h = QHBoxLayout()
-        lbl = QLabel("💬  Telegram")
+        lbl = QLabel("Telegram")
         lbl.setStyleSheet(
             f"color: {config.THEME_TEXT}; font-size: 15px; font-weight: bold;"
         )
@@ -446,7 +463,26 @@ class NotificationPreferencesView(QWidget):
         h.addWidget(self.lbl_telegram_status)
         h.addStretch()
 
-        self.btn_telegram_link = QPushButton("📲  Vincular nuevo chat")
+        # Botón solo-admin para definir el token del bot (de @BotFather).
+        # Oculto por defecto; set_current_user lo muestra si el rol es admin.
+        self.btn_telegram_config = QPushButton("Configurar bot")
+        self.btn_telegram_config.setToolTip(
+            "Definir el token del bot de Telegram (solo administradores)"
+        )
+        self.btn_telegram_config.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b; color: #f1f5f9;
+                border: 1px solid rgba(255,255,255,0.15);
+                border-radius: 6px; padding: 7px 12px;
+            }
+            QPushButton:hover { background-color: #334155; }
+        """)
+        self.btn_telegram_config.setVisible(False)
+        self.btn_telegram_config.clicked.connect(self._configure_telegram_bot)
+        h.addWidget(self.btn_telegram_config)
+
+        self.btn_telegram_link = QPushButton("  Vincular nuevo chat")
+        self.btn_telegram_link.setIcon(icon("link"))
         self.btn_telegram_link.setStyleSheet("""
             QPushButton {
                 background-color: #38bdf8; color: #0f172a;
@@ -476,7 +512,8 @@ class NotificationPreferencesView(QWidget):
 
         # Botones de la lista
         h2 = QHBoxLayout()
-        self.btn_telegram_unlink = QPushButton("🗑  Desvincular seleccionado")
+        self.btn_telegram_unlink = QPushButton("  Desvincular seleccionado")
+        self.btn_telegram_unlink.setIcon(icon("unlink"))
         self.btn_telegram_unlink.setStyleSheet("""
             QPushButton {
                 background-color: #1e293b; color: #f87171;
@@ -504,21 +541,21 @@ class NotificationPreferencesView(QWidget):
         """Carga chats vinculados y estado del bot."""
         def on_bot_info(response):
             if not response.success:
-                self.lbl_telegram_status.setText("⚠ Bot no disponible")
+                self.lbl_telegram_status.setText("Bot no disponible")
                 return
             data = response.data or {}
             if not data.get("configured"):
                 self.lbl_telegram_status.setText(
-                    "⚠ Bot no configurado en el servidor"
+                    "Bot no configurado en el servidor"
                 )
                 self.btn_telegram_link.setEnabled(False)
             elif data.get("username"):
                 self.lbl_telegram_status.setText(
-                    f"✓ Conectado al bot @{data['username']}"
+                    f"Conectado al bot @{data['username']}"
                 )
                 self.btn_telegram_link.setEnabled(True)
             else:
-                self.lbl_telegram_status.setText("⏳ Conectando con el bot…")
+                self.lbl_telegram_status.setText("Conectando con el bot…")
         api_client.get("telegram/bot-info", on_bot_info)
 
         def on_chats(response):
@@ -539,7 +576,8 @@ class NotificationPreferencesView(QWidget):
             for c in chats:
                 name = c.get("telegram_username") or "(sin usuario)"
                 linked = c.get("linked_at", "")[:10]
-                item = QListWidgetItem(f"✓  @{name}    ·    Vinculado: {linked}")
+                item = QListWidgetItem(f"@{name}    ·    Vinculado: {linked}")
+                item.setIcon(icon("ok", "#22c55e"))
                 item.setData(Qt.UserRole, c.get("id"))
                 self.list_telegram_chats.addItem(item)
         api_client.get("telegram/chats", on_chats)
@@ -550,6 +588,54 @@ class NotificationPreferencesView(QWidget):
         dlg.exec()
         # Tras cerrar, recargamos por si vinculó
         self._refresh_telegram_chats()
+
+    def _configure_telegram_bot(self):
+        """
+        Configura el token del bot (solo admin). Pide el token de @BotFather y
+        lo envía a POST /telegram/configure, que lo guarda y RECARGA el poller
+        en caliente (sin reiniciar el servidor).
+        """
+        from PySide6.QtWidgets import QInputDialog, QLineEdit
+        token, ok = QInputDialog.getText(
+            self,
+            "Configurar bot de Telegram",
+            "Cómo obtener el token (una sola vez):\n"
+            "  1) En Telegram abre @BotFather y envía  /newbot\n"
+            "  2) Elige nombre y usuario del bot\n"
+            "  3) Copia el token que te da (formato 123456789:AA...)\n\n"
+            "Pega el token aquí:",
+            QLineEdit.Normal,
+            "",
+        )
+        if not ok or not token.strip():
+            return
+
+        def on_cfg(response):
+            if not response.success:
+                QMessageBox.critical(
+                    self, "Error",
+                    response.error or "No se pudo configurar el bot"
+                )
+                return
+            data = response.data or {}
+            if data.get("valid"):
+                QMessageBox.information(
+                    self, "Bot configurado",
+                    f"Bot @{data.get('username')} conectado correctamente.\n\n"
+                    "Ahora los usuarios ya pueden pulsar «Vincular nuevo chat».",
+                )
+            else:
+                QMessageBox.warning(
+                    self, "Token guardado, pero sin respuesta",
+                    "Se guardó el token, pero Telegram no respondió. "
+                    "Revisa que el token sea correcto y que el servidor tenga "
+                    "acceso a internet.",
+                )
+            self._refresh_telegram_chats()
+
+        api_client.post(
+            "telegram/configure", on_cfg, data={"bot_token": token.strip()}
+        )
 
     def _unlink_telegram_chat(self):
         item = self.list_telegram_chats.currentItem()
@@ -584,24 +670,24 @@ class NotificationPreferencesView(QWidget):
         InfoDialog(
             title="Ayuda — Notificaciones",
             sections=[
-                ("📲  ¿Cómo funcionan las notificaciones?",
+                ("¿Cómo funcionan las notificaciones?",
                  "Cuando una cámara detecta un evento (persona, vehículo, "
                  "movimiento) el sistema te avisa por los canales que hayas "
                  "configurado. Necesitas: 1) vincular al menos un canal (Telegram "
                  "es lo más común) y 2) crear preferencias que digan qué eventos "
                  "y de qué cámaras quieres recibir."),
-                ("💬  Telegram",
+                ("Telegram",
                  "Telegram requiere que TÚ envíes el primer mensaje al bot "
                  "(es una regla de Telegram). Pulsa «Vincular nuevo chat» y "
                  "sigue los pasos: el sistema te dará un código, lo envías al "
                  "bot, y automáticamente quedará vinculado. Puedes tener varios "
                  "chats (PC, móvil, grupo familiar...)."),
-                ("📋  Preferencias",
+                ("Preferencias",
                  "Cada preferencia es una regla: «qué evento + qué cámara + "
                  "qué canales + qué horario + qué días». Puedes tener varias. "
                  "Ejemplo: «Persona en cámara puerta, por Telegram, 24/7» y "
                  "«Movimiento en cámara jardín, por push, sólo 22:00-07:00»."),
-                ("⏰  Horario y días",
+                ("Horario y días",
                  "Si no marcas horario, recibes 24 horas. Si marcas días, sólo "
                  "esos días se aplica. Útil para no recibir alertas mientras "
                  "trabajas en casa (las cámaras siguen grabando, sólo silencias "

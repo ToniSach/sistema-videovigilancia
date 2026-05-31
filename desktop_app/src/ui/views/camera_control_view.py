@@ -21,8 +21,8 @@ from PySide6.QtGui import QPixmap
 
 from desktop_app.src.config import config
 from desktop_app.src.services.api_client import api_client
-from desktop_app.src.services.video_streamer import video_streamer, Frame
 from desktop_app.src.ui.components.camera_control_panel import CameraControlPanel
+from desktop_app.src.ui.components.rtsp_video import RtspVideoWidget
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +39,7 @@ class CameraControlView(QWidget):
         self._current_stream_type: str = "main"
         self._is_dual_lens = False
         self._cameras_cache: list = []
-        # PULL-BASED: igual que CameraWidget, polling 15fps en vez de signal
-        self._last_pixmap_seq = -1
         self._setup_ui()
-
-        # QTimer interno que pregunta al thread cada 67ms por el último frame
-        self._pull_timer = QTimer(self)
-        self._pull_timer.setInterval(67)
-        self._pull_timer.timeout.connect(self._pull_latest_frame)
-        self._pull_timer.start()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -114,13 +106,8 @@ class CameraControlView(QWidget):
         video_layout = QVBoxLayout(video_container)
         video_layout.setContentsMargins(2, 2, 2, 2)
 
-        self.video_label = QLabel("Selecciona una cámara…")
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setStyleSheet(
-            "background-color: #000; color: #888; font-size: 14px;"
-        )
-        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        video_layout.addWidget(self.video_label)
+        self.video_widget = RtspVideoWidget(placeholder="Selecciona una cámara…")
+        video_layout.addWidget(self.video_widget)
 
         self.splitter.addWidget(video_container)
 
@@ -136,13 +123,7 @@ class CameraControlView(QWidget):
         self.splitter.setSizes([900, 360])
 
         layout.addWidget(self.splitter, 1)
-
-        # FPS counter
-        self._paint_count = 0
-        self._paint_last_t = 0
-        self._fps_timer = QTimer(self)
-        self._fps_timer.timeout.connect(self._update_fps)
-        self._fps_timer.start(1000)
+        self.lbl_fps.setText("go2rtc")
 
     # ------------------------------------------------------------------
     # API pública
@@ -190,12 +171,9 @@ class CameraControlView(QWidget):
     def _on_camera_change(self, idx: int):
         camera_id = self.cmb_camera.itemData(idx)
         self._stop_current_stream()
-        # Reset del seq para que el pull recoja frames desde 0 con la nueva cámara
-        self._last_pixmap_seq = -1
 
         if camera_id is None:
-            self.video_label.setText("Selecciona una cámara…")
-            self.video_label.setPixmap(QPixmap())
+            self.video_widget.show_message("Selecciona una cámara…")
             self._current_camera_id = None
             return
 
@@ -235,86 +213,46 @@ class CameraControlView(QWidget):
         self._current_stream_type = lens
         self._start_stream()
 
+    def _pick_url(self, camera, stream_type: str) -> str:
+        """URL go2rtc para (cámara, lente). Calidad alta por defecto."""
+        if camera is None:
+            return ""
+        urls = getattr(camera, "stream_urls", None) or {}
+        key = stream_type if stream_type in ("l1", "l2") else "main"
+        by_q = urls.get(key) or {}
+        legacy = {
+            "l1": getattr(camera, "stream_url_l1", None),
+            "l2": getattr(camera, "stream_url_l2", None),
+        }.get(stream_type)
+        return by_q.get("high") or legacy or (getattr(camera, "stream_url", "") or "")
+
     def _start_stream(self):
         if self._current_camera_id is None:
             return
-        token = api_client.get_stream_token() or ""
-        video_streamer.set_base_url(config.API_BASE_URL)
-        self.video_label.setText(
-            f"🔄 Conectando a cámara {self._current_camera_id} "
-            f"({self._current_stream_type})…"
+        camera = next(
+            (c for c in self._cameras_cache if c.id == self._current_camera_id), None
         )
-        video_streamer.start_stream(
-            self._current_camera_id, token,
-            stream_type=self._current_stream_type
-        )
+        url = self._pick_url(camera, self._current_stream_type)
+        if url:
+            self.video_widget.play(url)
+        else:
+            self.video_widget.show_message(
+                "Sin stream go2rtc (¿GO2RTC_ENABLED en el backend?)"
+            )
 
     def _stop_current_stream(self):
-        if self._current_camera_id is not None:
-            try:
-                video_streamer.stop_stream(
-                    self._current_camera_id, self._current_stream_type
-                )
-            except Exception:
-                pass
-
-    def _pull_latest_frame(self):
-        """Pull-based: pregunta al MJPEGThread por el último pixmap a 15fps."""
-        if self._current_camera_id is None:
-            return
         try:
-            pixmap, seq, age_ms = video_streamer.pop_latest_pixmap(
-                self._current_camera_id,
-                self._current_stream_type,
-                self._last_pixmap_seq,
-            )
-            if pixmap is None or seq == self._last_pixmap_seq:
-                return
-            self._last_pixmap_seq = seq
-
-            scaled = pixmap.scaled(
-                self.video_label.size(),
-                Qt.KeepAspectRatio,
-                Qt.FastTransformation,
-            )
-            self.video_label.setPixmap(scaled)
-            self._paint_count += 1
-        except Exception as e:
-            logger.debug(f"Error pull frame: {e}")
-
-    @Slot(Frame)
-    def _on_frame(self, frame):
-        """[LEGACY] ya no se conecta. Usamos _pull_latest_frame con QTimer."""
-        pass
-
-    def _update_fps(self):
-        import time
-        now = time.time()
-        if self._paint_last_t > 0:
-            dt = now - self._paint_last_t
-            if dt > 0:
-                fps = self._paint_count / dt
-                color = "#22c55e" if fps >= 10 else (
-                    "#fbbf24" if fps >= 5 else "#ef4444"
-                )
-                self.lbl_fps.setText(f"{fps:5.1f} fps")
-                self.lbl_fps.setStyleSheet(
-                    f"color: {color}; font-family: monospace; "
-                    f"font-size: 11px; padding: 0 8px; font-weight: bold;"
-                )
-        self._paint_count = 0
-        self._paint_last_t = now
+            self.video_widget.stop()
+        except Exception:
+            pass
 
     def showEvent(self, event):
         super().showEvent(event)
         # Si volvemos a la vista, restaurar stream
         if self._current_camera_id is not None:
             self._start_stream()
-        if not self._fps_timer.isActive():
-            self._fps_timer.start(1000)
 
     def hideEvent(self, event):
         # Liberar stream cuando se cambia de vista (ahorra red+CPU)
         self._stop_current_stream()
-        self._fps_timer.stop()
         super().hideEvent(event)

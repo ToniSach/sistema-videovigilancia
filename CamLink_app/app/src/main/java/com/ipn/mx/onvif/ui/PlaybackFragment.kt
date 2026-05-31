@@ -118,7 +118,14 @@ class PlaybackFragment : Fragment() {
         viewLifecycleOwner.lifecycleScope.launch {
             try {
                 val recording = api.getRecording(id).data
-                val url = recording.fileUrl
+
+                // Preferir la URL FIRMADA (relativa) que no exige cabecera
+                // Authorization: ExoPlayer no envía el JWT al pedir el vídeo.
+                // playback_url es relativa → anteponer la base del servidor.
+                // Si no existe, caer al file_url clásico (modo actual).
+                val url = recording.playbackUrl
+                    ?.let { if (it.startsWith("http")) it else baseUrl + it }
+                    ?: recording.fileUrl
 
                 if (url.isNullOrEmpty()) {
                     Toast.makeText(requireContext(), "URL de grabación no disponible", Toast.LENGTH_LONG).show()

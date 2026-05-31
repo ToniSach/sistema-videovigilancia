@@ -43,7 +43,7 @@ class SettingsView(QWidget):
         
         # Título + botón ayuda
         title_row = QHBoxLayout()
-        title = QLabel("⚙️ Configuración del Sistema")
+        title = QLabel("Configuración del Sistema")
         title.setStyleSheet(f"""
             color: {config.THEME_TEXT};
             font-size: 24px;
@@ -103,7 +103,7 @@ class SettingsView(QWidget):
         self.btn_reset.clicked.connect(self._load_settings)
         btn_layout.addWidget(self.btn_reset)
         
-        self.btn_save = QPushButton("💾 Guardar Cambios")
+        self.btn_save = QPushButton("Guardar Cambios")
         self.btn_save.setMinimumHeight(40)
         self.btn_save.setStyleSheet(f"""
             QPushButton {{
@@ -177,7 +177,7 @@ class SettingsView(QWidget):
         telegram_layout = QFormLayout(telegram_group)
 
         # Banner de estado
-        self.lbl_telegram_status = QLabel("⏳ Cargando configuración…")
+        self.lbl_telegram_status = QLabel("Cargando configuración…")
         self.lbl_telegram_status.setStyleSheet(
             f"background:#1e293b; color:{config.THEME_TEXT_MUTED}; "
             f"padding:8px; border-radius:4px; font-size:11px;"
@@ -188,7 +188,7 @@ class SettingsView(QWidget):
         self.txt_bot_token = QLineEdit()
         self.txt_bot_token.setPlaceholderText("123456789:AABBccDDeeFFggHHiiJJkkLL...")
         self.txt_bot_token.setEchoMode(QLineEdit.Password)
-        # Botón "👁" para mostrar/ocultar el token
+        # Botón "" para mostrar/ocultar el token
         telegram_layout.addRow("Bot Token:", self.txt_bot_token)
 
         self.chk_show_token = QCheckBox("Mostrar token")
@@ -250,13 +250,13 @@ class SettingsView(QWidget):
         self.cmb_test_camera = QComboBox()
         self.cmb_test_camera.setMinimumWidth(220)
         cam_row.addWidget(self.cmb_test_camera, 1)
-        self.btn_reload_cams = QPushButton("🔄")
+        self.btn_reload_cams = QPushButton("")
         self.btn_reload_cams.setMaximumWidth(40)
         self.btn_reload_cams.clicked.connect(self._reload_test_cameras)
         cam_row.addWidget(self.btn_reload_cams)
         test_layout.addLayout(cam_row)
 
-        self.btn_test_event = QPushButton("📤 Enviar evento de prueba a Telegram")
+        self.btn_test_event = QPushButton("Enviar evento de prueba a Telegram")
         self.btn_test_event.setMinimumHeight(40)
         self.btn_test_event.setStyleSheet(f"""
             QPushButton {{
@@ -320,7 +320,7 @@ class SettingsView(QWidget):
         self.lbl_storage_info.setStyleSheet(f"color: {config.THEME_TEXT_MUTED};")
         storage_layout.addRow(self.lbl_storage_info)
         
-        self.btn_cleanup_now = QPushButton("🧹 Limpiar Ahora")
+        self.btn_cleanup_now = QPushButton("Limpiar Ahora")
         self.btn_cleanup_now.clicked.connect(self._cleanup_storage)
         storage_layout.addRow(self.btn_cleanup_now)
         
@@ -361,7 +361,7 @@ class SettingsView(QWidget):
             # Banner de estado
             if token and chat_ids and enabled:
                 self.lbl_telegram_status.setText(
-                    f"✓ Telegram configurado y activo. "
+                    f"Telegram configurado y activo. "
                     f"Chat(s): {chat_ids}. "
                     f"Token: {'•' * 10}{token[-4:] if len(token) >= 4 else ''}"
                 )
@@ -371,7 +371,7 @@ class SettingsView(QWidget):
                 )
             elif token and chat_ids:
                 self.lbl_telegram_status.setText(
-                    "⚠ Telegram configurado pero DESACTIVADO. "
+                    "Telegram configurado pero DESACTIVADO. "
                     "Guarda los cambios para activarlo."
                 )
                 self.lbl_telegram_status.setStyleSheet(
@@ -380,7 +380,7 @@ class SettingsView(QWidget):
                 )
             else:
                 self.lbl_telegram_status.setText(
-                    "✗ Telegram NO configurado. "
+                    "Telegram NO configurado. "
                     "Añade el bot token y chat ID, luego guarda los cambios."
                 )
                 self.lbl_telegram_status.setStyleSheet(
@@ -508,7 +508,7 @@ class SettingsView(QWidget):
             for c in (response.data or []):
                 ws = c.get("worker_status") or {}
                 status = ws.get("status") if isinstance(ws, dict) else None
-                marker = "🟢 " if status == "running" else "⚫ "
+                marker = "" if status == "running" else ""
                 label = f"{marker}{c.get('name', '')}  (id={c.get('id')})"
                 self.cmb_test_camera.addItem(label, c.get("id"))
         api_client.get("cameras/", on_cams)
@@ -536,9 +536,9 @@ class SettingsView(QWidget):
             return
 
         self.btn_test_event.setEnabled(False)
-        self.btn_test_event.setText("⏳ Enviando... (espera ~25s)")
+        self.btn_test_event.setText("Enviando... (espera ~25s)")
         self.lbl_test_status.setText(
-            "🔄 Capturando snapshot y grabando video, "
+            "Capturando snapshot y grabando video, "
             "después se enviará a Telegram…"
         )
         self.lbl_test_status.setStyleSheet(
@@ -547,18 +547,18 @@ class SettingsView(QWidget):
 
         def on_response(response):
             self.btn_test_event.setEnabled(True)
-            self.btn_test_event.setText("📤 Enviar evento de prueba a Telegram")
+            self.btn_test_event.setText("Enviar evento de prueba a Telegram")
 
             if response.success or response.status_code == 202:
                 msg = response.data.get("message", "") if response.data else ""
                 self.lbl_test_status.setText(
-                    f"✓ Solicitud aceptada. {msg}\n"
+                    f"Solicitud aceptada. {msg}\n"
                     f"Revisa tu Telegram en unos segundos."
                 )
                 self.lbl_test_status.setStyleSheet("color: #22c55e;")
             else:
                 err = response.error or "Error desconocido"
-                self.lbl_test_status.setText(f"✗ Error: {err}")
+                self.lbl_test_status.setText(f"Error: {err}")
                 self.lbl_test_status.setStyleSheet(
                     f"color: {config.THEME_DANGER};"
                 )

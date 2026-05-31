@@ -1,37 +1,42 @@
 package com.ipn.mx.onvif.ui
 
-import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.ImageButton
-import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.annotation.OptIn
 import androidx.lifecycle.lifecycleScope
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
 import androidx.navigation.fragment.findNavController
 import com.ipn.mx.onvif.R
 import com.ipn.mx.onvif.model.CameraResponse
 import com.ipn.mx.onvif.network.RetrofitClient
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import java.io.ByteArrayOutputStream
-import java.util.concurrent.TimeUnit
 
+/**
+ * Grid de cámaras (2 por página) con vista previa en vivo.
+ *
+ * MIGRACIÓN: antes decodificaba el endpoint MJPEG `/cameras/{id}/stream`
+ * (eliminado del backend). Ahora cada slot usa un ExoPlayer sobre el restream
+ * RTSP de go2rtc (camera.liveUrl), igual que LiveViewFragment, así no hay
+ * transcodificación MJPEG ni una segunda conexión a la cámara.
+ */
 class CameraListFragment : BaseMenuFragment() {
 
     // ── Estado ────────────────────────────────────────────────────────────────
     private var cameras: List<CameraResponse> = emptyList()
     private var pageIndex = 0                          // página actual (2 cámaras por página)
     private val pageSize  = 2
-    private val streamJobs = mutableMapOf<Int, Job>()  // slot (0 o 1) → corrutina MJPEG
+    private val players = arrayOfNulls<ExoPlayer>(2)   // un ExoPlayer por slot
 
     // ── Vistas ────────────────────────────────────────────────────────────────
     private lateinit var feedCam1:      FrameLayout
@@ -40,17 +45,11 @@ class CameraListFragment : BaseMenuFragment() {
     private lateinit var btnRemoveCam2: ImageButton
     private lateinit var tvCamName1:    TextView
     private lateinit var tvCamName2:    TextView
-    private lateinit var imgFeed1:      ImageView
-    private lateinit var imgFeed2:      ImageView
+    private lateinit var playerView1:   PlayerView
+    private lateinit var playerView2:   PlayerView
     private lateinit var btnPrevPage:   ImageButton
     private lateinit var btnNextPage:   ImageButton
     private lateinit var tvPageInfo:    TextView
-
-    // ── OkHttp dedicado para MJPEG (sin timeout de lectura) ──────────────────
-    private val mjpegClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0,  TimeUnit.SECONDS)   // streaming infinito
-        .build()
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -68,13 +67,13 @@ class CameraListFragment : BaseMenuFragment() {
         btnRemoveCam1 = view.findViewById(R.id.btnRemoveCam1)
         btnRemoveCam2 = view.findViewById(R.id.btnRemoveCam2)
 
-        // Agregar ImageView y TextView dinámicamente a cada feed
-        imgFeed1   = addImageViewTo(feedCam1)
-        imgFeed2   = addImageViewTo(feedCam2)
-        tvCamName1 = addNameLabelTo(feedCam1)
-        tvCamName2 = addNameLabelTo(feedCam2)
+        // Agregar PlayerView y TextView dinámicamente a cada feed
+        playerView1 = addPlayerViewTo(feedCam1)
+        playerView2 = addPlayerViewTo(feedCam2)
+        tvCamName1  = addNameLabelTo(feedCam1)
+        tvCamName2  = addNameLabelTo(feedCam2)
 
-        // Botones de paginación — se inflan dinámicamente si no están en el XML
+        // Botones de paginación
         btnPrevPage = view.findViewById(R.id.btnPrevPage)
         btnNextPage = view.findViewById(R.id.btnNextPage)
         tvPageInfo  = view.findViewById(R.id.tvPageInfo)
@@ -83,9 +82,9 @@ class CameraListFragment : BaseMenuFragment() {
         feedCam1.setOnClickListener { navigateToLiveView(pageIndex * pageSize) }
         feedCam2.setOnClickListener { navigateToLiveView(pageIndex * pageSize + 1) }
 
-        // Desconectar cámara (por ahora detiene el stream local)
-        btnRemoveCam1.setOnClickListener { stopSlot(0); hideSlot(feedCam1, imgFeed1, tvCamName1) }
-        btnRemoveCam2.setOnClickListener { stopSlot(1); hideSlot(feedCam2, imgFeed2, tvCamName2) }
+        // Desconectar cámara (detiene el stream local del slot)
+        btnRemoveCam1.setOnClickListener { stopSlot(0); hideSlot(feedCam1, tvCamName1) }
+        btnRemoveCam2.setOnClickListener { stopSlot(1); hideSlot(feedCam2, tvCamName2) }
 
         // Paginación
         btnPrevPage.setOnClickListener {
@@ -160,8 +159,6 @@ class CameraListFragment : BaseMenuFragment() {
         stopAllStreams()
 
         val totalPages = ((cameras.size - 1) / pageSize) + 1
-        // getString con placeholders en vez de concatenar texto: pasa lint
-        // SetTextI18n y permite traducciones futuras.
         tvPageInfo.text = getString(R.string.page_format, pageIndex + 1, totalPages)
         btnPrevPage.isEnabled = pageIndex > 0
         btnNextPage.isEnabled = pageIndex < totalPages - 1
@@ -172,7 +169,7 @@ class CameraListFragment : BaseMenuFragment() {
         if (cam1 != null) {
             feedCam1.visibility = View.VISIBLE
             tvCamName1.text = cam1.name
-            startMjpegStream(cam1, slot = 0, imageView = imgFeed1)
+            startRtspStream(cam1, slot = 0, playerView = playerView1)
         } else {
             feedCam1.visibility = View.INVISIBLE
         }
@@ -180,88 +177,64 @@ class CameraListFragment : BaseMenuFragment() {
         if (cam2 != null) {
             feedCam2.visibility = View.VISIBLE
             tvCamName2.text = cam2.name
-            startMjpegStream(cam2, slot = 1, imageView = imgFeed2)
+            startRtspStream(cam2, slot = 1, playerView = playerView2)
         } else {
             feedCam2.visibility = View.INVISIBLE
         }
     }
 
-    // ── MJPEG: decodificar stream multipart/x-mixed-replace ──────────────────
+    // ── Stream (go2rtc) por slot: HLS preferido, RTSP de fallback ────────────
 
-    private fun startMjpegStream(camera: CameraResponse, slot: Int, imageView: ImageView) {
-        val baseUrl = RetrofitClient.buildBaseUrl(requireContext()) ?: return
-        val token   = RetrofitClient.getAccessToken(requireContext()) ?: return
+    private fun startRtspStream(camera: CameraResponse, slot: Int, playerView: PlayerView) {
+        players[slot]?.release()
 
-        // El endpoint requiere el token como query param (no en header)
-        val streamUrl = "${baseUrl}/api/v1/cameras/${camera.id}/stream?token=${token}"
+        // Para dual-lens, en la rejilla mostramos el primer lente (L1). HLS
+        // preferido (ExoPlayer fiable); RTSP de respaldo si el HLS falla.
+        val url: String
+        val fallback: String?
+        if (camera.isDualLens && !camera.streamUrlL1.isNullOrBlank()) {
+            url = camera.hlsUrlL1?.takeIf { it.isNotBlank() } ?: camera.streamUrlL1!!
+            fallback = camera.streamUrlL1
+        } else {
+            url = camera.liveHlsUrl ?: camera.liveUrl
+            fallback = camera.liveUrl
+        }
 
-        val job = viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                val request  = Request.Builder().url(streamUrl).build()
-                val response = mjpegClient.newCall(request).execute()
-                val body     = response.body ?: return@launch
-
-                val inputStream = body.byteStream()
-                val buffer      = ByteArrayOutputStream()
-                val byteArray   = ByteArray(4096)
-                var prevByte    = -1
-
-                while (isActive) {
-                    val byte = inputStream.read()
-                    if (byte == -1) break
-
-                    buffer.write(byte)
-
-                    // Detectar fin de frame JPEG: 0xFF 0xD9
-                    if (prevByte == 0xFF && byte == 0xD9) {
-                        val frameBytes = buffer.toByteArray()
-                        buffer.reset()
-
-                        // Buscar inicio del JPEG (0xFF 0xD8) dentro del buffer acumulado
-                        val jpegStart = findJpegStart(frameBytes)
-                        if (jpegStart >= 0) {
-                            val jpegBytes = frameBytes.copyOfRange(jpegStart, frameBytes.size)
-                            val bitmap    = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-                            if (bitmap != null) {
-                                withContext(Dispatchers.Main) {
-                                    if (isActive) imageView.setImageBitmap(bitmap)
-                                }
-                            }
-                        }
+        var triedFallback = false
+        players[slot] = ExoPlayer.Builder(requireContext()).build().also { exo ->
+            playerView.player = exo
+            exo.addListener(object : Player.Listener {
+                override fun onPlayerError(error: PlaybackException) {
+                    if (!triedFallback && !fallback.isNullOrBlank() && fallback != url) {
+                        triedFallback = true
+                        exo.setMediaItem(MediaItem.fromUri(fallback))
+                        exo.prepare()
+                        exo.playWhenReady = true
                     }
-                    prevByte = byte
                 }
-            } catch (_: Exception) {
-                // Stream interrumpido al cambiar página o salir — es esperado
-            }
+            })
+            exo.setMediaItem(MediaItem.fromUri(url))
+            exo.prepare()
+            exo.playWhenReady = true
+            exo.volume = 0f  // rejilla en silencio
         }
-
-        streamJobs[slot]?.cancel()
-        streamJobs[slot] = job
-    }
-
-    /** Encuentra el índice del marcador de inicio JPEG (0xFF 0xD8) en el array. */
-    private fun findJpegStart(bytes: ByteArray): Int {
-        for (i in 0 until bytes.size - 1) {
-            if (bytes[i] == 0xFF.toByte() && bytes[i + 1] == 0xD8.toByte()) return i
-        }
-        return -1
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun stopSlot(slot: Int) {
-        streamJobs[slot]?.cancel()
-        streamJobs.remove(slot)
+        players[slot]?.release()
+        players[slot] = null
     }
 
     private fun stopAllStreams() {
-        streamJobs.values.forEach { it.cancel() }
-        streamJobs.clear()
+        for (i in players.indices) {
+            players[i]?.release()
+            players[i] = null
+        }
     }
 
-    private fun hideSlot(feed: FrameLayout, img: ImageView, label: TextView) {
-        img.setImageBitmap(null)
+    private fun hideSlot(feed: FrameLayout, label: TextView) {
         label.text = ""
         feed.visibility = View.INVISIBLE
     }
@@ -272,17 +245,19 @@ class CameraListFragment : BaseMenuFragment() {
         findNavController().navigate(R.id.action_cameraList_to_liveView, bundle)
     }
 
-    /** Añade un ImageView que ocupa todo el FrameLayout. */
-    private fun addImageViewTo(parent: FrameLayout): ImageView {
-        val img = ImageView(requireContext()).apply {
+    /** Añade un PlayerView de Media3 que ocupa todo el FrameLayout. */
+    @OptIn(UnstableApi::class)
+    private fun addPlayerViewTo(parent: FrameLayout): PlayerView {
+        val pv = PlayerView(requireContext()).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
-            scaleType = ImageView.ScaleType.CENTER_CROP
+            useController = false
+            resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
         }
-        parent.addView(img, 0)
-        return img
+        parent.addView(pv, 0)
+        return pv
     }
 
     /** Añade un TextView con el nombre de la cámara en la parte inferior del feed. */

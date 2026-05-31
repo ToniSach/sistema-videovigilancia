@@ -333,9 +333,7 @@ def create_app(config_name='default'):
         from backend.app.infrastructure.metrics.collector import metrics_collector
         logger.info("MetricsCollector activo")
 
-        # LiveHLSService (singleton, ya se autoinicia)
-        from backend.app.streaming.live_hls_service import live_hls_service
-        logger.info("LiveHLSService activo")
+        # (LiveHLSService eliminado: el directo se sirve por go2rtc/WebRTC.)
 
         # ================== NUEVO: Consistency Checker ==================
         try:
@@ -362,6 +360,26 @@ def create_app(config_name='default'):
             logger.info("Stalled camera monitor iniciado (threshold=25s)")
         except Exception as e:
             logger.error(f"Error iniciando monitor de cámaras congeladas: {e}")
+
+        # ================== go2rtc (capa de medios, OPCIONAL) ==================
+        # Solo arranca si GO2RTC_ENABLED=true. Aditivo: si está desactivado
+        # (default) no hace nada y el sistema sigue con MJPEG/HLS como hoy.
+        try:
+            from backend.app.streaming.go2rtc_manager import Go2RtcManager
+            from backend.app.database.repositories.camera_repository import CameraRepository
+
+            go2rtc = Go2RtcManager()
+            if go2rtc.is_enabled():
+                cams = CameraRepository().get_all()
+                if go2rtc.start(cams):
+                    app.go2rtc = go2rtc
+                    logger.info("go2rtc iniciado (capa de medios)")
+                else:
+                    logger.warning("go2rtc habilitado pero no se pudo arrancar")
+            else:
+                logger.info("go2rtc desactivado (GO2RTC_ENABLED=false)")
+        except Exception as e:
+            logger.error(f"Error iniciando go2rtc: {e}")
 
         app._container_initialized = True
         logger.info("Contenedor inicializado")
@@ -551,13 +569,13 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Error deteniendo GlobalExecutor: {e}")
         
-        # Detener LiveHLSService
+        # Detener go2rtc (si estaba activo)
         try:
-            from backend.app.streaming.live_hls_service import live_hls_service
-            live_hls_service.shutdown()
-            logger.info("LiveHLSService detenido")
+            from backend.app.streaming.go2rtc_manager import Go2RtcManager
+            Go2RtcManager().stop()
+            logger.info("go2rtc detenido")
         except Exception as e:
-            logger.error(f"Error deteniendo LiveHLSService: {e}")
+            logger.error(f"Error deteniendo go2rtc: {e}")
 
         # ================== NUEVO: Detener ConsistencyChecker ==================
         if hasattr(app, 'consistency_checker'):

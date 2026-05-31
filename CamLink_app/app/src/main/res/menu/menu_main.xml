@@ -13,6 +13,16 @@
         app:showAsAction="never" />
 
     <item
+        android:id="@+id/menuConfigNotificaciones"
+        android:title="@string/menu_config_notificaciones"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/menuVincularTelegram"
+        android:title="@string/menu_vincular_telegram"
+        app:showAsAction="never" />
+
+    <item
         android:id="@+id/menuCerrarSesion"
         android:title="@string/menu_cerrar_sesion"
         app:showAsAction="never" />

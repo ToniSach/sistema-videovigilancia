@@ -15,6 +15,7 @@ from PySide6.QtCore import Qt, Signal, QThread, QTimer, Slot
 from PySide6.QtGui import QIcon, QFont, QPixmap, QImage
 
 from desktop_app.src.config import config
+from desktop_app.src.ui.icons import icon
 from desktop_app.src.models.camera import Camera
 from desktop_app.src.services.api_client import api_client
 from desktop_app.src.ui.components.glass_card import GlassCard
@@ -432,13 +433,15 @@ class CameraManagementView(QWidget):
         header.addStretch()
 
         # Botón descubrir
-        self.btn_discover = QPushButton("🔍 Descubrir Cámaras")
+        self.btn_discover = QPushButton("  Descubrir Cámaras")
+        self.btn_discover.setIcon(icon("search"))
         self.btn_discover.setMinimumHeight(40)
         self.btn_discover.clicked.connect(self._discover_cameras)
         header.addWidget(self.btn_discover)
-        
+
         # Botón agregar
-        self.btn_add = QPushButton("➕ Agregar Cámara")
+        self.btn_add = QPushButton("  Agregar Cámara")
+        self.btn_add.setIcon(icon("add"))
         self.btn_add.setMinimumHeight(40)
         self.btn_add.clicked.connect(self._add_camera)
         header.addWidget(self.btn_add)
@@ -481,17 +484,20 @@ class CameraManagementView(QWidget):
         list_layout.addWidget(self.list_cameras)
         
         # Botones de acción para item seleccionado
-        self.btn_edit = QPushButton("✏️ Editar")
+        self.btn_edit = QPushButton("  Editar")
+        self.btn_edit.setIcon(icon("edit"))
         self.btn_edit.clicked.connect(self._edit_selected)
         self.btn_edit.setEnabled(False)
         list_layout.addWidget(self.btn_edit)
-        
-        self.btn_delete = QPushButton("🗑️ Eliminar")
+
+        self.btn_delete = QPushButton("  Eliminar")
+        self.btn_delete.setIcon(icon("delete"))
         self.btn_delete.clicked.connect(self._delete_selected)
         self.btn_delete.setEnabled(False)
         list_layout.addWidget(self.btn_delete)
-        
-        self.btn_toggle = QPushButton("⏯ Activar/Desactivar")
+
+        self.btn_toggle = QPushButton("  Activar/Desactivar")
+        self.btn_toggle.setIcon(icon("power"))
         self.btn_toggle.clicked.connect(self._toggle_selected)
         self.btn_toggle.setEnabled(False)
         list_layout.addWidget(self.btn_toggle)
@@ -504,7 +510,7 @@ class CameraManagementView(QWidget):
         details_layout.setSpacing(12)
 
         self.lbl_details = QLabel(
-            "👈  Selecciona una cámara de la lista\n   para ver el preview y detalles"
+            "Selecciona una cámara de la lista\n   para ver el preview y detalles"
         )
         self.lbl_details.setAlignment(Qt.AlignCenter)
         self.lbl_details.setStyleSheet(
@@ -543,15 +549,10 @@ class CameraManagementView(QWidget):
         self.preview_lens_widget.hide()  # solo se muestra para dual-lens
         info_v.addWidget(self.preview_lens_widget)
 
-        self.preview_label = QLabel("📷  Conectando al stream…")
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(400, 240)
-        self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.preview_label.setStyleSheet(
-            "background-color: #000000; color: #94a3b8; "
-            "border-radius: 6px; font-size: 12px;"
-        )
-        info_v.addWidget(self.preview_label, 1)
+        from desktop_app.src.ui.components.rtsp_video import RtspVideoWidget
+        self.preview_video = RtspVideoWidget(placeholder="Selecciona una cámara…")
+        self.preview_video.setMinimumSize(400, 240)
+        info_v.addWidget(self.preview_video, 1)
 
         # --- Info textual ---
         info_form = QFormLayout()
@@ -592,11 +593,7 @@ class CameraManagementView(QWidget):
         # se queda detrás. Un QTimer cada 67ms (15fps) pide el último frame.
         self._preview_camera_id: Optional[int] = None
         self._preview_stream_type: str = "main"
-        self._preview_last_seq: int = -1
-        self._preview_timer = QTimer(self)
-        self._preview_timer.setInterval(67)
-        self._preview_timer.timeout.connect(self._pull_preview_frame)
-        self._preview_timer.start()
+        self._preview_camera = None  # objeto Camera actual (para stream_url por lente)
     
     def _load_cameras(self):
         """Carga lista de cámaras desde API."""
@@ -645,7 +642,7 @@ class CameraManagementView(QWidget):
             self.lbl_info_name.setText(camera.name)
             self.lbl_info_ip.setText(camera.ip_address)
             
-            status = "🟢 Activa" if getattr(camera, 'is_active', True) else "🔴 Inactiva"
+            status = "Activa" if getattr(camera, 'is_active', True) else "Inactiva"
             self.lbl_info_status.setText(status)
             
             caps = []
@@ -678,17 +675,21 @@ class CameraManagementView(QWidget):
     # ------------------------------------------------------------------
     # Preview MJPEG en panel de detalles
     # ------------------------------------------------------------------
+    def _pick_preview_url(self, camera, stream_type: str) -> str:
+        """URL go2rtc para (cámara, lente). Calidad alta para el preview."""
+        if camera is None:
+            return ""
+        urls = getattr(camera, "stream_urls", None) or {}
+        key = stream_type if stream_type in ("l1", "l2") else "main"
+        by_q = urls.get(key) or {}
+        legacy = {
+            "l1": getattr(camera, "stream_url_l1", None),
+            "l2": getattr(camera, "stream_url_l2", None),
+        }.get(stream_type)
+        return by_q.get("high") or legacy or (getattr(camera, "stream_url", "") or "")
+
     def _start_preview(self, camera: Camera):
-        """Inicia el stream MJPEG de la cámara seleccionada."""
-        from desktop_app.src.services.video_streamer import video_streamer
-        from desktop_app.src.services.api_client import api_client
-
-        token = api_client.get_stream_token() or ""
-        if not token:
-            self.preview_label.setText("⚠ No hay sesión activa")
-            return
-
-        # Detener preview previo si existe
+        """Inicia el preview en vivo (go2rtc/VLC) de la cámara seleccionada."""
         self._stop_preview()
 
         # Configurar selector de lente
@@ -704,103 +705,39 @@ class CameraManagementView(QWidget):
             stream_type = "main"
         self.cmb_preview_lens.blockSignals(False)
 
+        self._preview_camera = camera
         self._preview_camera_id = camera.id
         self._preview_stream_type = stream_type
-        self._preview_last_seq = -1  # reset para nueva cámara
 
-        video_streamer.set_base_url(config.API_BASE_URL)
-        self.preview_label.setText(
-            f"📷  Conectando a {camera.name}\n   ({stream_type})…"
-        )
-        video_streamer.start_stream(camera.id, token, stream_type=stream_type)
+        url = self._pick_preview_url(camera, stream_type)
+        if url:
+            self.preview_video.play(url)
+        else:
+            self.preview_video.show_message("Sin stream go2rtc disponible")
 
     def _on_preview_lens_change(self, idx: int):
-        """Cambia el lente que se muestra en la previsualización."""
-        if self._preview_camera_id is None:
+        """Cambia el lente mostrado en el preview (sin recrear el player)."""
+        if self._preview_camera is None:
             return
         new_lens = self.cmb_preview_lens.itemData(idx)
         if not new_lens or new_lens == self._preview_stream_type:
             return
-
-        from desktop_app.src.services.video_streamer import video_streamer
-        from desktop_app.src.services.api_client import api_client
-
-        token = api_client.get_stream_token() or ""
-        if not token:
-            return
-
-        cam_id = self._preview_camera_id
-        # Detener el lente anterior
-        try:
-            video_streamer.stop_stream(cam_id, self._preview_stream_type)
-        except Exception:
-            pass
-
         self._preview_stream_type = new_lens
-        self._preview_last_seq = -1
-        self.preview_label.setText(f"📷  Cambiando a lente {new_lens}…")
-        video_streamer.start_stream(cam_id, token, stream_type=new_lens)
+        url = self._pick_preview_url(self._preview_camera, new_lens)
+        if url:
+            self.preview_video.set_url(url)
 
     def _stop_preview(self):
         """Detiene el preview actual si está activo."""
-        from desktop_app.src.services.video_streamer import video_streamer
-        if self._preview_camera_id is not None:
-            try:
-                video_streamer.stop_stream(
-                    self._preview_camera_id, self._preview_stream_type
-                )
-            except Exception as e:
-                logger.debug(f"Error parando preview: {e}")
+        try:
+            self.preview_video.stop()
+        except Exception as e:
+            logger.debug(f"Error parando preview: {e}")
+        self._preview_camera = None
         self._preview_camera_id = None
         self._preview_stream_type = "main"
-        self._preview_last_seq = -1
         self.preview_lens_widget.hide()
-        self.preview_label.setPixmap(QPixmap())
-        self.preview_label.setText("📷  Preview detenido")
-
-    def _pull_preview_frame(self):
-        """
-        Polling pull-based del frame de preview (consistente con LiveView).
-        Si no hay frame nuevo del lente seleccionado, no hace nada.
-        """
-        if self._preview_camera_id is None:
-            return
-        from desktop_app.src.services.video_streamer import video_streamer
-        try:
-            pixmap, seq, _ = video_streamer.pop_latest_pixmap(
-                self._preview_camera_id,
-                self._preview_stream_type,
-                self._preview_last_seq,
-            )
-            if pixmap is None or seq == self._preview_last_seq:
-                return
-            self._preview_last_seq = seq
-            scaled = pixmap.scaled(
-                self.preview_label.size(),
-                Qt.KeepAspectRatio,
-                Qt.FastTransformation,
-            )
-            self.preview_label.setPixmap(scaled)
-        except Exception as e:
-            logger.debug(f"Error pull preview: {e}")
-
-    @Slot(object)
-    def _on_preview_frame(self, frame):
-        """[LEGACY] ya no se conecta a signal. Usamos _pull_preview_frame."""
-        if self._preview_camera_id is None:
-            return
-        if frame.camera_id != self._preview_camera_id:
-            return
-        if getattr(frame, "stream_type", "main") != self._preview_stream_type:
-            return
-        try:
-            scaled = frame.pixmap.scaled(
-                self.preview_label.size(),
-                Qt.KeepAspectRatio, Qt.FastTransformation,
-            )
-            self.preview_label.setPixmap(scaled)
-        except Exception as e:
-            logger.debug(f"Error pintando preview: {e}")
+        self.preview_video.show_message("Preview detenido")
 
     def hideEvent(self, event):
         """Detener preview al salir de la pestaña (ahorra red y CPU)."""
@@ -898,7 +835,7 @@ class CameraManagementView(QWidget):
 
         # Diálogo modal de progreso (con animación indeterminada)
         self._progress_dialog = QProgressDialog(
-            "🔍  Buscando cámaras ONVIF en la red…\n\n"
+            "Buscando cámaras ONVIF en la red…\n\n"
             "Esto puede tardar 15-30 segundos:\n"
             "  • WS-Discovery (multicast)\n"
             "  • Escaneo del subnet local\n"
@@ -976,7 +913,7 @@ class CameraManagementView(QWidget):
         # tiene sentido intentar agregarlas porque el backend tampoco podrá
         # arrancar su worker.
         if unreachable:
-            warn = "⚠️ Cámaras detectadas pero NO alcanzables desde este PC:\n\n"
+            warn = "Cámaras detectadas pero NO alcanzables desde este PC:\n\n"
             for cam in unreachable:
                 ip = cam.get("ip_address", "?")
                 warn += f"  • {ip}\n"

@@ -9,10 +9,10 @@ from PySide6.QtWidgets import QPushButton
 
 
 class HelpButton(QPushButton):
-    """Botón ❔ que abre el InfoDialog con la ayuda de una vista."""
+    """Botón que abre el InfoDialog con la ayuda de una vista."""
 
     def __init__(self, view_key: str, parent=None):
-        super().__init__("❔", parent)
+        super().__init__("", parent)
         self._view_key = view_key
         self.setMaximumWidth(36)
         self.setToolTip("Ayuda")

@@ -21,17 +21,18 @@ from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QBrush
 from desktop_app.src.config import config
 from desktop_app.src.services.api_client import api_client
 from desktop_app.src.ui.components.glass_card import GlassCard
+from desktop_app.src.ui.icons import icon
 
 logger = logging.getLogger(__name__)
 
 
-# Tipos de evento conocidos con etiqueta legible y emoji
+# Tipos de evento conocidos con etiqueta legible y color
 EVENT_TYPES = {
-    "person": ("🚨 Persona", "#ef4444"),
-    "vehicle": ("🚗 Vehículo", "#f59e0b"),
-    "motion": ("📹 Movimiento", "#38bdf8"),
-    "camera_offline": ("⚠ Cámara offline", "#fa6"),
-    "tampering": ("🔴 Sabotaje", "#ef4444"),
+    "person": ("Persona", "#ef4444"),
+    "vehicle": ("Vehículo", "#f59e0b"),
+    "motion": ("Movimiento", "#38bdf8"),
+    "camera_offline": ("Cámara offline", "#fa6"),
+    "tampering": ("Sabotaje", "#ef4444"),
 }
 
 
@@ -98,7 +99,7 @@ class EventsView(QWidget):
 
         # Header
         header = QHBoxLayout()
-        title = QLabel("🔔 Eventos y Alarmas")
+        title = QLabel("Eventos y Alarmas")
         title.setStyleSheet(
             f"color: {config.THEME_TEXT}; font-size: 22px; font-weight: bold;"
         )
@@ -113,7 +114,8 @@ class EventsView(QWidget):
         self.lbl_count.setStyleSheet(f"color: {config.THEME_TEXT_MUTED};")
         header.addWidget(self.lbl_count)
 
-        self.btn_refresh = QPushButton("🔄 Refrescar")
+        self.btn_refresh = QPushButton("  Refrescar")
+        self.btn_refresh.setIcon(icon("refresh"))
         self.btn_refresh.clicked.connect(self._load_events)
         header.addWidget(self.btn_refresh)
         layout.addLayout(header)
@@ -145,7 +147,7 @@ class EventsView(QWidget):
         f_layout.addWidget(self.spin_hours)
 
         f_layout.addStretch()
-        self.lbl_auto = QLabel("⏱ Auto-refresh: ON")
+        self.lbl_auto = QLabel("Auto-refresh: ON")
         self.lbl_auto.setStyleSheet(f"color: {config.THEME_ACCENT}; font-size: 11px;")
         f_layout.addWidget(self.lbl_auto)
         layout.addWidget(filters)
@@ -194,11 +196,13 @@ class EventsView(QWidget):
         d_layout.addWidget(self.lbl_info)
 
         btns = QHBoxLayout()
-        self.btn_ack = QPushButton("✓ Marcar como revisado")
+        self.btn_ack = QPushButton("  Marcar como revisado")
+        self.btn_ack.setIcon(icon("ok"))
         self.btn_ack.setEnabled(False)
         self.btn_ack.clicked.connect(self._acknowledge_selected)
         btns.addWidget(self.btn_ack)
-        self.btn_jump = QPushButton("▶ Ver en Playback")
+        self.btn_jump = QPushButton("  Ver en Playback")
+        self.btn_jump.setIcon(icon("playback"))
         self.btn_jump.setEnabled(False)
         self.btn_jump.clicked.connect(self._jump_selected)
         btns.addWidget(self.btn_jump)
@@ -319,7 +323,7 @@ class EventsView(QWidget):
 
             # Estado
             ack = bool(ev.get("acknowledged", False))
-            it_ack = QTableWidgetItem("✓ Revisado" if ack else "🔔 Nuevo")
+            it_ack = QTableWidgetItem("Revisado" if ack else "Nuevo")
             it_ack.setForeground(QBrush(QColor("#94a3b8" if ack else "#f59e0b")))
             self.table.setItem(r, 4, it_ack)
 
@@ -464,10 +468,10 @@ class EventsView(QWidget):
     def showEvent(self, event):
         if not self._refresh_timer.isActive():
             self._refresh_timer.start(10000)
-        self.lbl_auto.setText("⏱ Auto-refresh: ON")
+        self.lbl_auto.setText("Auto-refresh: ON")
         super().showEvent(event)
 
     def hideEvent(self, event):
         self._refresh_timer.stop()
-        self.lbl_auto.setText("⏱ Auto-refresh: OFF")
+        self.lbl_auto.setText("Auto-refresh: OFF")
         super().hideEvent(event)

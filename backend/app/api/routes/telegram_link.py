@@ -149,6 +149,64 @@ def bot_info():
     }), 200
 
 
+@telegram_link_bp.route("/configure", methods=["POST"])
+@jwt_required()
+def configure_bot():
+    """
+    Configura el bot de Telegram del servidor (SOLO admin) y RECARGA el poller
+    en caliente, sin reiniciar el backend.
+
+    PIPELINE:
+      Paso 1. Verificar que el solicitante es admin.
+      Paso 2. Guardar el token en SystemConfig['telegram_bot_token'] (+ habilitar).
+      Paso 3. Recargar el TelegramBotPoller para que lea el nuevo token y arranque.
+      Paso 4. Devolver el estado del bot (configurado / corriendo / @username) para
+              que el desktop confirme inmediatamente si el token es válido.
+
+    Body: { "bot_token": "123456:ABC-DEF..." }
+    El token NUNCA se devuelve en la respuesta (es un secreto).
+    """
+    try:
+        user_id = int(get_jwt_identity())
+        from backend.app.services.user_service import UserService
+        if not UserService().is_admin(user_id):
+            return jsonify({"success": False, "error": "Se requiere rol admin"}), 403
+
+        data = request.get_json(silent=True) or {}
+        token = (data.get("bot_token") or "").strip()
+        if not token or ":" not in token:
+            return jsonify({
+                "success": False,
+                "error": "Token inválido. Pega el token completo que te dio @BotFather "
+                         "(formato 123456789:AA...).",
+            }), 400
+
+        # Paso 2: persistir token + habilitar Telegram.
+        with db_manager.get_session() as session:
+            session.merge(SystemConfig(key="telegram_bot_token", value=token))
+            session.merge(SystemConfig(key="telegram_enabled", value="true"))
+            session.commit()
+
+        # Paso 3: recargar el poller en caliente.
+        from backend.app.notifications.telegram_bot_poller import telegram_bot_poller
+        telegram_bot_poller.reload()
+
+        # Paso 4: estado para feedback inmediato (username presente = token válido).
+        username = telegram_bot_poller.get_bot_username()
+        return jsonify({
+            "success": True,
+            "data": {
+                "configured": telegram_bot_poller.is_configured(),
+                "running": telegram_bot_poller.is_running(),
+                "username": username,
+                "valid": bool(username),
+                "deep_link_base": f"https://t.me/{username}" if username else None,
+            },
+        }), 200
+    except Exception:
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
+
+
 @telegram_link_bp.route("/verify", methods=["POST"])
 def verify_code():
     """

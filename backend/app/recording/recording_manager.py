@@ -738,11 +738,29 @@ class RecordingManager:
             logging.info(f"✅ Grabación continua iniciada para cámara {camera_id}")
             return True
 
+    def _use_recording_copy_mode(self) -> bool:
+        """
+        Paso 0 (decisión). ¿Grabar por remux (`-c copy`) en vez de recodificar?
+
+        Requiere RECORDING_COPY_MODE=true Y go2rtc activo, porque el modo copia
+        lee el restream RTSP estable de go2rtc (no el pipe de frames raw). Si
+        cualquiera de las dos condiciones falla, se usa el camino clásico
+        (libx264) sin cambios → comportamiento por defecto idéntico al actual.
+        """
+        try:
+            return bool(settings.RECORDING_COPY_MODE and settings.GO2RTC_ENABLED)
+        except Exception:
+            return False
+
     def _continuous_loop(self, camera_id: int, stop_event: threading.Event) -> None:
         """
         FIX CRÍTICO: Streaming directo sin acumular frames en RAM.
         Cada frame se escribe inmediatamente al stdin de FFmpeg.
         """
+        # Desvío al modo -c copy si está habilitado (CPU ≈ 0, sin recodificar).
+        if self._use_recording_copy_mode():
+            return self._continuous_loop_copy(camera_id, stop_event)
+
         segment_count = 0
         
         while not stop_event.is_set():
@@ -886,6 +904,158 @@ class RecordingManager:
                 time.sleep(1)
         
         logging.info(f"⏹️ Grabación continua finalizada cámara {camera_id} ({segment_count} segmentos)")
+
+    def _continuous_loop_copy(self, camera_id: int, stop_event: threading.Event) -> None:
+        """
+        PIPELINE de grabación continua en modo `-c copy` (sin recodificar).
+
+        Coste de CPU ≈ 0: copia el H.264 que ya emite la cámara, vía el restream
+        de go2rtc, directamente a disco. No toca píxeles, no usa el pipe de
+        frames raw ni libx264.
+
+          Paso 1. Resolver la URL RTSP del restream de go2rtc para la cámara.
+          Paso 2. Por cada segmento, lanzar ffmpeg que LEE ese RTSP y COPIA el
+                  vídeo a un MP4 durante CONTINUOUS_SEGMENT_DURATION segundos
+                  (ffmpeg se autodetiene con `-t`).
+          Paso 3. Al cerrar el segmento: registrarlo en BD + generar thumbnail.
+          Paso 4. Repetir hasta stop_event. Si el segmento sale vacío (fuente
+                  caída / red inestable), backoff y reintento — resiliencia.
+
+        Nota: el MP4 se escribe fragmentado (+frag_keyframe+empty_moov) para que
+        el SPLICE de eventos pueda leerlo mientras se graba, igual que el modo
+        clásico.
+        """
+        from backend.app.streaming.go2rtc_manager import Go2RtcManager
+
+        rtsp_url = Go2RtcManager().rtsp_restream_url(camera_id)
+        segment_count = 0
+
+        # H265/HEVC en MP4 requiere la etiqueta 'hvc1' para que los
+        # reproductores (VLC/QuickTime/navegador) lo abran; con 'hev1' muchos
+        # muestran pantalla negra. Detectamos el códec UNA vez y, si es HEVC,
+        # añadimos -tag:v hvc1. Para H264 no se añade nada (lo rompería).
+        vcodec = self._probe_video_codec(rtsp_url)
+        tag_args = ["-tag:v", "hvc1"] if vcodec == "hevc" else []
+        logging.info(
+            f"Grabación continua (-c copy) cámara {camera_id} desde {rtsp_url} "
+            f"(códec vídeo={vcodec or 'desconocido'}{' → tag hvc1' if tag_args else ''})"
+        )
+
+        while not stop_event.is_set():
+            segment_start = datetime.utcnow()
+            process = None
+            try:
+                cam_dir = os.path.join(self._recordings_dir, str(camera_id), "continuous")
+                os.makedirs(cam_dir, exist_ok=True)
+                filename = f"{camera_id}_{segment_start.strftime('%Y%m%d_%H%M%S')}.mp4"
+                output_path = os.path.join(cam_dir, filename)
+
+                cmd = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                    # go2rtc sirve RTSP solo por TCP (UDP → 461). Este loop
+                    # siempre lee del restream de go2rtc, así que forzamos tcp.
+                    "-rtsp_transport", "tcp",
+                    "-i", rtsp_url,
+                    "-t", str(self.CONTINUOUS_SEGMENT_DURATION),
+                    "-an",
+                    "-c:v", "copy",
+                    *tag_args,
+                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                    "-frag_duration", "500000",
+                    output_path,
+                ]
+                t0 = time.time()
+                process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+
+                # Esperar a que ffmpeg termine el segmento (-t) O a que pidan parar.
+                while process.poll() is None:
+                    if stop_event.is_set():
+                        try:
+                            process.terminate()
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        break
+                    time.sleep(0.5)
+
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                    output_path = self._remux_fragmented_to_regular(output_path)
+                    file_size = os.path.getsize(output_path)
+                    recording = Recording(
+                        camera_id=camera_id,
+                        start_time=segment_start,
+                        end_time=datetime.utcnow(),
+                        file_path=output_path,
+                        file_size_bytes=file_size,
+                        duration_seconds=max(0.0, time.time() - t0),
+                    )
+                    self._recording_repo.create(recording)
+                    self._generate_thumbnail(output_path)
+                    segment_count += 1
+                elif not stop_event.is_set():
+                    # Segmento vacío → fuente probablemente caída: backoff.
+                    logging.warning(
+                        f"Segmento -c copy vacío cámara {camera_id}; "
+                        f"¿go2rtc/cámara accesibles? Reintentando en 2s"
+                    )
+                    time.sleep(2)
+            except Exception as e:
+                logging.error(f"Error en segmento -c copy cámara {camera_id}: {e}")
+                time.sleep(2)
+
+        logging.info(
+            f"⏹️ Grabación continua (-c copy) finalizada cámara {camera_id} "
+            f"({segment_count} segmentos)"
+        )
+
+    def _probe_video_codec(self, url: str) -> "str | None":
+        """
+        Detecta el códec de vídeo (p.ej. 'hevc', 'h264') de una fuente RTSP con
+        ffprobe. Best-effort: si falla devuelve None. Se usa una sola vez al
+        arrancar la grabación para decidir el etiquetado del MP4.
+        """
+        try:
+            out = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-rtsp_transport", "tcp",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name",
+                    "-of", "default=nokey=1:noprint_wrappers=1",
+                    url,
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15,
+            )
+            codec = out.stdout.decode(errors="ignore").strip().lower()
+            return codec or None
+        except Exception as e:
+            logging.warning(f"ffprobe no pudo detectar códec de {url}: {e}")
+            return None
+
+    def _generate_thumbnail(self, video_path: str) -> "str | None":
+        """
+        Genera un thumbnail JPEG (~320px de ancho) del primer segundo del vídeo
+        para los listados de grabaciones en móvil/desktop.
+
+        Best-effort: barato, no recodifica el vídeo y NUNCA interrumpe la
+        grabación si falla (devuelve None).
+        """
+        try:
+            thumb_path = os.path.splitext(video_path)[0] + ".jpg"
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", "1", "-i", video_path, "-frames:v", "1",
+                "-vf", "scale=320:-2", thumb_path,
+            ]
+            subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15
+            )
+            return thumb_path if os.path.exists(thumb_path) else None
+        except Exception as e:
+            logging.warning(f"No se pudo generar thumbnail de {video_path}: {e}")
+            return None
 
     def stop_continuous_recording(self, camera_id: int) -> bool:
         """Detiene grabación continua de forma segura."""

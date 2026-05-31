@@ -145,6 +145,24 @@ class Settings:
             # Sube a 0.50+ si tienes muchos falsos positivos.
             self.AI_CONFIDENCE: float = float(os.getenv("AI_CONFIDENCE", "0.35"))
 
+            # ── Modelo y runtime de IA (optimización de CPU) ──
+            # AI_MODEL: archivo del modelo (yolov8n.pt por defecto; prueba
+            #   yolo11n.pt para mejor precisión a igual coste).
+            # AI_FORMAT: runtime de inferencia:
+            #   "auto"     → OpenVINO en CPU (2-4× más rápido), PyTorch en GPU.
+            #   "openvino" → fuerza OpenVINO (requiere: pip install openvino).
+            #   "onnx"     → ONNX Runtime (requiere: pip install onnxruntime).
+            #   "pytorch"  → comportamiento clásico (sin export).
+            #   Si el export/instalación falla, cae a PyTorch automáticamente.
+            # AI_IMGSZ: resolución de inferencia. 640 = precisión actual;
+            #   320 = ~4× más rápido pero detecta peor objetos pequeños/lejanos.
+            # AI_TORCH_THREADS: hilos de torch (0 = no tocar). Útil para que
+            #   YOLO no compita con FFmpeg por los núcleos.
+            self.AI_MODEL: str = os.getenv("AI_MODEL", "yolov8n.pt")
+            self.AI_FORMAT: str = os.getenv("AI_FORMAT", "auto").lower()
+            self.AI_IMGSZ: int = int(os.getenv("AI_IMGSZ", "640"))
+            self.AI_TORCH_THREADS: int = int(os.getenv("AI_TORCH_THREADS", "0"))
+
             # Intervalo de inferencia: 1 cada N frames (a 15fps).
             # low_cpu=5 → 3 inferencias/s; suficiente para detectar a una
             # persona caminando (cruzar el FOV típico tarda 2-4s).
@@ -226,7 +244,99 @@ class Settings:
             # ==============================
             self.SERVER_HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
             self.SERVER_PORT: int = int(os.getenv("SERVER_PORT", "5000"))
-            
+
+            # ==============================
+            # MIGRACIÓN STREAMING (go2rtc / WebRTC / -c copy)
+            # ==============================
+            # TODOS estos flags vienen DESACTIVADOS por defecto: el sistema se
+            # comporta exactamente igual que antes (MJPEG + grabación libx264)
+            # hasta que se activen explícitamente. Esto permite desplegar la
+            # nueva infraestructura en paralelo y hacer rollback con un flag.
+            #
+            # go2rtc: servidor de medios (proceso sidecar) que habla RTSP con
+            # las cámaras UNA sola vez y reexpone WebRTC/RTSP/MSE sin transcode.
+            self.GO2RTC_ENABLED: bool = (
+                os.getenv("GO2RTC_ENABLED", "false").lower() == "true"
+            )
+            # Binario: ruta absoluta o nombre en PATH. Se valida con shutil.which.
+            self.GO2RTC_BINARY: str = os.getenv("GO2RTC_BINARY", "go2rtc")
+            # API de go2rtc. Sirve el dashboard Y los flujos HLS/MSE/WebRTC.
+            # Por defecto 0.0.0.0 para que la app MÓVIL pueda consumir HLS
+            # (http://<lan-ip>:1984/api/stream.m3u8?src=cam_X) desde la LAN —
+            # ExoPlayer-RTSP es poco fiable, HLS es el transporte robusto. Es un
+            # appliance de LAN; si se quiere restringir, fijar 127.0.0.1.
+            self.GO2RTC_API_HOST: str = os.getenv("GO2RTC_API_HOST", "0.0.0.0")
+            self.GO2RTC_API_PORT: int = int(os.getenv("GO2RTC_API_PORT", "1984"))
+            # Puerto RTSP de restream (lo consumen desktop, móvil, grabación, IA).
+            self.GO2RTC_RTSP_PORT: int = int(os.getenv("GO2RTC_RTSP_PORT", "8554"))
+            # Puerto WebRTC (ICE). Debe ser alcanzable desde los clientes en LAN.
+            self.GO2RTC_WEBRTC_PORT: int = int(os.getenv("GO2RTC_WEBRTC_PORT", "8555"))
+            # Ruta donde Go2RtcManager escribe el go2rtc.yaml generado desde la BD.
+            self.GO2RTC_CONFIG_PATH: str = os.getenv(
+                "GO2RTC_CONFIG_PATH",
+                os.path.join(self.RECORDINGS_PATH, "..", "go2rtc.generated.yaml"),
+            )
+            # Host/IP del servidor anunciado a los clientes para el restream y los
+            # candidatos ICE de WebRTC. Si está vacío, Go2RtcManager intenta
+            # autodetectar la IP LAN. Útil fijarlo en despliegues con varias NICs.
+            self.GO2RTC_PUBLIC_HOST: str = os.getenv("GO2RTC_PUBLIC_HOST", "")
+            # Candidatos ICE extra (coma-separados), ej. "stun:stun.l.google.com:19302"
+            # o una IP pública/TURN para acceso remoto. Vacío = solo LAN (host).
+            self.GO2RTC_WEBRTC_CANDIDATES: str = os.getenv("GO2RTC_WEBRTC_CANDIDATES", "")
+
+            # WebRTC signaling (WHEP) en el backend. Requiere GO2RTC_ENABLED.
+            self.WEBRTC_ENABLED: bool = (
+                os.getenv("WEBRTC_ENABLED", "false").lower() == "true"
+            )
+
+            # Cuando True, el FFmpegWorker (decodifica para MJPEG/IA) lee del
+            # RESTREAM de go2rtc en vez de la cámara directa. CRÍTICO para
+            # cámaras que solo aceptan 1 conexión RTSP (XiongMai, muchos
+            # chinos baratos): así go2rtc es el ÚNICO que habla con la cámara
+            # y todos los demás (worker, grabación) consumen go2rtc sin
+            # contención. Requiere GO2RTC_ENABLED y que go2rtc YA esté
+            # sirviendo el stream. Default false: actívalo SOLO cuando hayas
+            # confirmado que go2rtc puede leer la cámara (revisa go2rtc.log).
+            self.GO2RTC_AS_SOURCE: bool = (
+                os.getenv("GO2RTC_AS_SOURCE", "false").lower() == "true"
+            )
+
+            # Grabación continua en modo "-c copy" (remux del H.264 de la cámara,
+            # CPU ≈ 0) en vez de re-encodear con libx264. Requiere una fuente RTSP
+            # estable (idealmente el restream de go2rtc). Default false para no
+            # alterar la grabación actual hasta validar.
+            self.RECORDING_COPY_MODE: bool = (
+                os.getenv("RECORDING_COPY_MODE", "false").lower() == "true"
+            )
+
+            # Sincronizar la hora de la cámara con la del servidor (ONVIF
+            # SetSystemDateAndTime) al arrancarla. Corrige cámaras con la fecha
+            # desfasada (XiongMai, etc.) → OSD y marcas de evento correctas.
+            self.CAMERA_SYNC_TIME_ON_START: bool = (
+                os.getenv("CAMERA_SYNC_TIME_ON_START", "true").lower() == "true"
+            )
+
+            # Las cámaras inactivas (status != active / sin worker) NO aparecen en
+            # el "en vivo". Activado por defecto: comportamiento esperado de un VMS.
+            self.LIVE_HIDE_INACTIVE_CAMERAS: bool = (
+                os.getenv("LIVE_HIDE_INACTIVE_CAMERAS", "true").lower() == "true"
+            )
+
+            # ==============================
+            # URLS FIRMADAS DE MEDIOS (seguridad)
+            # ==============================
+            # Los reproductores nativos (ExoPlayer/AVPlayer/VLC) NO envían el
+            # header Authorization al pedir segmentos/MP4. Para no exponer medios
+            # sin auth, se firman URLs con HMAC y caducidad corta. El secreto cae
+            # por defecto al JWT_SECRET_KEY si no se define uno dedicado.
+            self.MEDIA_URL_SECRET: str = (
+                os.getenv("MEDIA_URL_SECRET") or self.JWT_SECRET_KEY
+            )
+            # Caducidad por defecto de un token de medios (segundos).
+            self.MEDIA_URL_TTL_SECONDS: int = int(
+                os.getenv("MEDIA_URL_TTL_SECONDS", "300")
+            )
+
             # ==============================
             # SETUP
             # ==============================

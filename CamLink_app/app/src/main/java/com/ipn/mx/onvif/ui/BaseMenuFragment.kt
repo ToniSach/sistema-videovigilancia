@@ -50,9 +50,16 @@ abstract class BaseMenuFragment : Fragment(), MenuProvider {
             }
             R.id.menuNotificaciones -> {
                 // Abre el PANEL de historial (NotificationsPanelFragment).
-                // El CRUD de preferencias (EventConfigFragment) queda accesible
-                // desde un botón "Configurar" dentro del panel.
                 nav.navigate(R.id.notificationsPanelFragment)
+                true
+            }
+            R.id.menuConfigNotificaciones -> {
+                // CRUD de preferencias (qué eventos, canales, días).
+                nav.navigate(R.id.eventConfigFragment)
+                true
+            }
+            R.id.menuVincularTelegram -> {
+                nav.navigate(R.id.telegramLinkFragment)
                 true
             }
             R.id.menuCerrarSesion -> {

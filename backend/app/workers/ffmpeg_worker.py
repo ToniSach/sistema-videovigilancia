@@ -61,7 +61,8 @@ class FFmpegWorker:
 
     def __init__(self, camera: Camera, frame_buffer: CircularFrameBuffer,
                  rtsp_transport: str = "tcp",
-                 target_resolution: Optional[Tuple[int, int]] = None):
+                 target_resolution: Optional[Tuple[int, int]] = None,
+                 source_url: Optional[str] = None):
         """
         Args:
             camera: Modelo Camera con datos de conexión
@@ -69,9 +70,13 @@ class FFmpegWorker:
             rtsp_transport: tcp o udp
             target_resolution: (width, height) opcional para sobreescribir la resolución de salida.
                                Si es None, se usa TARGET_WIDTH, TARGET_HEIGHT de la clase.
+            source_url: URL RTSP de origen alternativa (p.ej. el restream de
+                        go2rtc). Si se indica, el worker lee de aquí en vez de
+                        camera.rtsp_url — evita la contención en cámaras de 1
+                        sola conexión RTSP.
         """
         self.camera_id = camera.id
-        self.rtsp_url = camera.rtsp_url
+        self.rtsp_url = source_url or camera.rtsp_url
         self.fps = camera.fps
         self.camera_name = camera.name
         self.rtsp_transport = rtsp_transport

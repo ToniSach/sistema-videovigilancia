@@ -25,6 +25,7 @@ from PySide6.QtGui import (
 
 from desktop_app.src.models.camera import Camera
 from desktop_app.src.services.video_streamer import video_streamer, Frame
+from desktop_app.src.ui.icons import icon
 
 logger = logging.getLogger(__name__)
 
@@ -46,24 +47,29 @@ class CameraWidget(QFrame):
     config_requested = Signal(int)
 
     def __init__(self, camera_id: int, camera_name: str,
-                 stream_type: str = "main", parent=None):
+                 stream_type: str = "main", stream_url: str = "", parent=None):
         super().__init__(parent)
 
         self.camera_id = camera_id
         self.camera_name = camera_name
         self.stream_type = stream_type  # "main" | "l1" | "l2"
+        self.stream_url = stream_url or ""
+        # Modo RTSP/go2rtc (OPT-IN). Si hay stream_url Y USE_GO2RTC_LIVE=true,
+        # el directo se reproduce con VLC (baja latencia, una sola conexión a
+        # la cámara) en vez de MJPEG. Si no, comportamiento clásico intacto.
+        from desktop_app.src.config import config as _cfg
+        self._use_rtsp = bool(self.stream_url) and getattr(_cfg, "USE_GO2RTC_LIVE", False)
+        self._vlc = None
         self.is_maximized = False
         self._signal_connected = False
-        # PULL-BASED rendering: en lugar de recibir cada frame por signal
-        # (que se acumulaba en la queue de Qt si el GUI iba lento), tenemos
-        # un QTimer que cada 67ms pregunta al thread por el último frame
-        # decodificado. Si no hay nuevo no hace nada. Si hay, lo pinta.
-        # Esto elimina TODO el delay acumulado.
+        # PULL-BASED rendering (modo MJPEG): un QTimer cada 67ms pregunta al
+        # thread por el último frame decodificado. En modo RTSP NO se usa.
         self._last_pixmap_seq = -1
         self._pull_timer = QTimer(self)
         self._pull_timer.setInterval(67)  # ~15 fps
         self._pull_timer.timeout.connect(self._pull_latest_frame)
-        self._pull_timer.start()
+        if not self._use_rtsp:
+            self._pull_timer.start()
 
         self.setMinimumSize(280, 200)
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
@@ -94,7 +100,8 @@ class CameraWidget(QFrame):
         self.lbl_status.setStyleSheet("color: #22c55e; font-size: 10px;")
         info_layout.addWidget(self.lbl_status, alignment=Qt.AlignRight)
 
-        self.btn_config = QPushButton("⚙")
+        self.btn_config = QPushButton()
+        self.btn_config.setIcon(icon("settings"))
         self.btn_config.setMaximumWidth(30)
         self.btn_config.setStyleSheet("""
             QPushButton {
@@ -117,7 +124,113 @@ class CameraWidget(QFrame):
         # Mantenemos la conexión para errores (camera_error) por compat.
         self._signal_connected = False
 
+        # Modo RTSP: arrancar VLC tras tener winId nativo (QTimer 0ms).
+        if self._use_rtsp:
+            self.lbl_video.setText("Conectando (RTSP)…")
+            QTimer.singleShot(0, self._start_rtsp)
+
+    def _start_rtsp(self):
+        """
+        Reproduce el restream RTSP de go2rtc con VLC, tuneado a LATENCIA MÍNIMA
+        para directo (no VOD). VLC pinta directamente sobre el HWND/xwindow del
+        QLabel de vídeo, así que no pasa por el pipeline MJPEG/pixmaps.
+        """
+        try:
+            from desktop_app.src.services.playback_service import VLCPlayer
+            import os as _os
+            opts = [
+                "--quiet", "--no-video-title-show",
+                "--network-caching=150",   # buffer mínimo (ms)
+                "--rtsp-tcp",              # RTSP sobre TCP (robusto en WiFi)
+                "--clock-jitter=0", "--clock-synchro=0",
+            ]
+            self._vlc = VLCPlayer(config_options=opts)
+            wid = int(self.lbl_video.winId())
+            if _os.name == "nt":
+                self._vlc.set_hwnd(wid)
+            else:
+                self._vlc.set_xwindow(wid)
+            self._vlc.error.connect(
+                lambda m: logger.error(f"VLC live cam {self.camera_id}: {m}")
+            )
+            self._vlc.play_url(self.stream_url)
+            # Rellenar el panel completo (sin barras negras). Se aplica tras un
+            # instante (cuando el vídeo ya tiene tamaño) y en cada resize.
+            QTimer.singleShot(300, self._apply_fill)
+            self.lbl_status.setStyleSheet("color: #22c55e;")
+        except Exception as e:
+            logger.error(f"No se pudo iniciar RTSP live cam {self.camera_id}: {e}")
+            self.lbl_video.setText("Error RTSP")
+
+    def _apply_fill(self):
+        """
+        Hace que el vídeo RELLENE todo el panel (sin barras negras). Fuerza la
+        relación de aspecto al tamaño del contenedor → VLC estira para llenar.
+        Se llama al iniciar y en cada resize.
+        """
+        try:
+            if self._vlc is None:
+                return
+            w = max(1, self.lbl_video.width())
+            h = max(1, self.lbl_video.height())
+            self._vlc.player.video_set_aspect_ratio(f"{w}:{h}".encode("ascii"))
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if getattr(self, "_use_rtsp", False):
+            self._apply_fill()
+
+    def set_live_url(self, url: str):
+        """
+        Cambia la fuente del directo SIN recrear el player (evita el crash de
+        destruir/crear VLC). Reutiliza la misma ventana: VLC hace stop+play.
+        Usado por el selector de calidad.
+        """
+        if not getattr(self, "_use_rtsp", False) or not url or self._vlc is None:
+            return
+        if url == self.stream_url:
+            return
+        self.stream_url = url
+        try:
+            self._vlc.play_url(url)
+            QTimer.singleShot(300, self._apply_fill)
+        except Exception as e:
+            logger.error(f"set_live_url cam {self.camera_id}: {e}")
+
+    def stop_video(self):
+        """
+        Detiene VLC y lo DESLIGA de la ventana (idempotente). Desligar el HWND
+        antes de que el QLabel se destruya evita que VLC pinte sobre una ventana
+        liberada (causa típica de crash nativo al cerrar/cambiar de vista).
+        """
+        try:
+            if self._vlc is None:
+                return
+            import os as _os
+            p = self._vlc.player
+            try:
+                p.stop()
+            except Exception:
+                pass
+            try:
+                if _os.name == "nt":
+                    p.set_hwnd(0)
+                else:
+                    p.set_xwindow(0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        self.stop_video()
+        super().closeEvent(event)
+
     def _pull_latest_frame(self):
+        if self._use_rtsp:
+            return  # en modo RTSP VLC pinta solo; no hay pull de pixmaps
         """
         Polling 15fps que pregunta al MJPEGThread por el último pixmap.
         Si hay uno nuevo lo pinta. Si no, no hace nada.
@@ -295,6 +408,9 @@ class LiveView(QWidget):
         self._grid_cols = 2
         self._current_page = 0
         self._restart_timer: Optional[QTimer] = None
+        # Calidad del directo: "auto" | "high" | "medium" | "low".
+        # "auto" se resuelve UNA vez por nº de núcleos (sin monitoreo continuo).
+        self._quality = "auto"
 
         self._setup_ui()
         self._setup_shortcuts()
@@ -322,7 +438,8 @@ class LiveView(QWidget):
         header.addWidget(self.lbl_title)
 
         # Botón de ayuda contextual
-        self.btn_help = QPushButton("❔")
+        self.btn_help = QPushButton()
+        self.btn_help.setIcon(icon("help"))
         self.btn_help.setToolTip("Ayuda — Cámaras en vivo")
         self.btn_help.setMaximumWidth(36)
         self.btn_help.setStyleSheet("""
@@ -342,9 +459,9 @@ class LiveView(QWidget):
         header.addWidget(QLabel("Vista:"))
         self.cmb_layout = QComboBox()
         for text, cols in [
-            ("⬜  1×1 (cámara grande)", 1),
-            ("⬜⬜  2×2 (4 cámaras)", 2),
-            ("⬜⬜⬜  3×3 (9 cámaras)", 3),
+            ("1×1 (cámara grande)", 1),
+            ("2×2 (4 cámaras)", 2),
+            ("3×3 (9 cámaras)", 3),
         ]:
             self.cmb_layout.addItem(text, cols)
         self.cmb_layout.setCurrentIndex(1)
@@ -360,6 +477,29 @@ class LiveView(QWidget):
             }
         """)
         header.addWidget(self.cmb_layout)
+
+        # Selector de CALIDAD del directo. "Auto" decide por CPU (una vez, sin
+        # monitoreo continuo). Solo afecta al directo (no a grabación/IA).
+        header.addWidget(QLabel("Calidad:"))
+        self.cmb_quality = QComboBox()
+        for text, val in [
+            ("Auto", "auto"), ("Alta", "high"), ("Media", "medium"), ("Baja", "low"),
+        ]:
+            self.cmb_quality.addItem(text, val)
+        self.cmb_quality.setCurrentIndex(0)
+        self.cmb_quality.setToolTip(
+            "Alta = sin recodificar (más calidad). Media/Baja = transcode "
+            "(menos red/CPU del cliente). Auto = según los núcleos del equipo."
+        )
+        self.cmb_quality.currentIndexChanged.connect(self._on_quality_change)
+        self.cmb_quality.setStyleSheet("""
+            QComboBox {
+                background-color: #1e293b; color: #f1f5f9;
+                border: 1px solid rgba(255,255,255,0.15);
+                border-radius: 6px; padding: 6px 12px; min-width: 90px;
+            }
+        """)
+        header.addWidget(self.cmb_quality)
 
         # Separador
         sep = QFrame()
@@ -380,7 +520,8 @@ class LiveView(QWidget):
             QPushButton:hover:!disabled { background-color: #334155; }
             QPushButton:disabled { color: #475569; }
         """
-        self.btn_prev = QPushButton("◀ Anterior")
+        self.btn_prev = QPushButton("  Anterior")
+        self.btn_prev.setIcon(icon("prev"))
         self.btn_prev.setStyleSheet(btn_style)
         self.btn_prev.setToolTip("Página anterior (Page Up)")
         self.btn_prev.clicked.connect(self._on_prev_page)
@@ -394,7 +535,8 @@ class LiveView(QWidget):
         )
         header.addWidget(self.lbl_page)
 
-        self.btn_next = QPushButton("Siguiente ▶")
+        self.btn_next = QPushButton("Siguiente  ")
+        self.btn_next.setIcon(icon("next"))
         self.btn_next.setStyleSheet(btn_style)
         self.btn_next.setToolTip("Página siguiente (Page Down)")
         self.btn_next.clicked.connect(self._on_next_page)
@@ -537,7 +679,12 @@ class LiveView(QWidget):
             key = (cam_id, stream_type)
             widget = self._widget_cache.get(key)
             if widget is None:
-                widget = CameraWidget(cam_id, label, stream_type=stream_type)
+                stream_url = self._pick_stream_url(
+                    _cam, stream_type, self._effective_quality()
+                )
+                widget = CameraWidget(
+                    cam_id, label, stream_type=stream_type, stream_url=stream_url
+                )
                 widget.clicked.connect(self._on_camera_click)
                 widget.double_clicked.connect(self._on_camera_double_click)
                 widget.ptz_requested.connect(self._on_ptz_request)
@@ -545,12 +692,14 @@ class LiveView(QWidget):
                 widget.config_requested.connect(self._on_config_request)
                 self._widget_cache[key] = widget
 
-                # Arrancar el stream (escalonado para no martillar el server)
-                QTimer.singleShot(
-                    i * 200,
-                    lambda c=cam_id, t=self._current_api_token, s=stream_type:
-                        self._start_stream(c, t, s)
-                )
+                # En modo RTSP (go2rtc) el widget arranca VLC solo; NO registramos
+                # cliente MJPEG. En modo MJPEG, arrancamos el stream escalonado.
+                if not widget._use_rtsp:
+                    QTimer.singleShot(
+                        i * 200,
+                        lambda c=cam_id, t=self._current_api_token, s=stream_type:
+                            self._start_stream(c, t, s)
+                    )
             else:
                 # Reutilizado del cache: actualizar label por si cambió el name
                 widget.lbl_name.setText(label)
@@ -601,6 +750,55 @@ class LiveView(QWidget):
         self._current_page = 0
         # No destruye nada — sólo recoloca desde el cache
         self._load_page(0)
+
+    # ------------------------------------------------------------------
+    # Calidad del directo
+    # ------------------------------------------------------------------
+    def _effective_quality(self) -> str:
+        """
+        Resuelve la calidad concreta. "auto" se decide UNA vez por nº de núcleos
+        (coste cero, sin monitoreo continuo): <4 → baja, 4-7 → media, ≥8 → alta.
+        """
+        if self._quality != "auto":
+            return self._quality
+        import os
+        cores = os.cpu_count() or 4
+        if cores < 4:
+            return "low"
+        if cores < 8:
+            return "medium"
+        return "high"
+
+    def _pick_stream_url(self, cam, stream_type: str, quality: str) -> str:
+        """URL de go2rtc para (cam, lente, calidad), con fallbacks."""
+        urls = getattr(cam, "stream_urls", None) or {}
+        key = stream_type if stream_type in ("l1", "l2") else "main"
+        by_q = urls.get(key) or {}
+        legacy = {
+            "l1": getattr(cam, "stream_url_l1", None),
+            "l2": getattr(cam, "stream_url_l2", None),
+        }.get(stream_type)
+        return (
+            by_q.get(quality)
+            or by_q.get("high")
+            or legacy
+            or (getattr(cam, "stream_url", "") or "")
+        )
+
+    def _on_quality_change(self, idx: int):
+        new_q = self.cmb_quality.itemData(idx)
+        if new_q == self._quality:
+            return
+        self._quality = new_q
+        q = self._effective_quality()
+        # IMPORTANTE: NO destruimos/recreamos widgets (eso crasheaba VLC). Solo
+        # le pedimos a cada player que reproduzca la nueva URL de calidad
+        # (VLC hace stop+set_media+play reutilizando la misma ventana).
+        for (cam_id, stream_type), widget in list(self._widget_cache.items()):
+            cam = next((c for c in self._camera_list if c.id == cam_id), None)
+            if cam is None:
+                continue
+            widget.set_live_url(self._pick_stream_url(cam, stream_type, q))
 
     # ------------------------------------------------------------------
     # Streams
@@ -678,6 +876,10 @@ class LiveView(QWidget):
         de QPixmap en GPU.
         """
         for key, widget in list(self._widget_cache.items()):
+            try:
+                widget.stop_video()  # cierra VLC si estaba en modo RTSP/go2rtc
+            except Exception:
+                pass
             widget.release_resources()
             widget.hide()
             widget.setParent(None)

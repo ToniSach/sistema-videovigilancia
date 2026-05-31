@@ -106,7 +106,7 @@ class TelegramLinkDialog(QDialog):
         layout.setSpacing(16)
 
         # Título
-        title = QLabel("🤖  Vincular Telegram")
+        title = QLabel("Vincular Telegram")
         title.setStyleSheet(
             "color: #f1f5f9; font-size: 20px; font-weight: bold;"
         )
@@ -181,14 +181,14 @@ class TelegramLinkDialog(QDialog):
         actions = QHBoxLayout()
         actions.setSpacing(8)
 
-        self.btn_open_telegram = QPushButton("📲  Abrir Telegram")
+        self.btn_open_telegram = QPushButton("Abrir Telegram")
         self.btn_open_telegram.setStyleSheet(self._primary_button_style())
         self.btn_open_telegram.setMinimumHeight(40)
         self.btn_open_telegram.clicked.connect(self._open_telegram)
         self.btn_open_telegram.setEnabled(False)
         actions.addWidget(self.btn_open_telegram, 2)
 
-        self.btn_copy = QPushButton("📋  Copiar")
+        self.btn_copy = QPushButton("Copiar")
         self.btn_copy.setStyleSheet(self._secondary_button_style())
         self.btn_copy.setMinimumHeight(40)
         self.btn_copy.clicked.connect(self._copy_code)
@@ -210,7 +210,7 @@ class TelegramLinkDialog(QDialog):
         # Botones inferiores
         footer = QHBoxLayout()
 
-        self.btn_refresh = QPushButton("🔄 Nuevo código")
+        self.btn_refresh = QPushButton("Nuevo código")
         self.btn_refresh.setStyleSheet(self._secondary_button_style())
         self.btn_refresh.clicked.connect(self._fetch_code)
         footer.addWidget(self.btn_refresh)
@@ -267,7 +267,7 @@ class TelegramLinkDialog(QDialog):
         self.btn_copy.setEnabled(False)
         self.lbl_code.setText("……")
         self.lbl_command.setText("Generando…")
-        self.lbl_status.setText("⏳ Generando código…")
+        self.lbl_status.setText("Generando código…")
         self.lbl_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
 
         self._worker = _APIWorker("POST", "/telegram/generate-code", parent=self)
@@ -288,7 +288,7 @@ class TelegramLinkDialog(QDialog):
 
         if not bot_configured:
             self.lbl_status.setText(
-                "⚠ El bot de Telegram no está configurado en el servidor. "
+                "El bot de Telegram no está configurado en el servidor. "
                 "Pídele al administrador que lo configure en Sistema → Telegram."
             )
             self.lbl_status.setStyleSheet("color: #f59e0b; font-size: 12px;")
@@ -338,7 +338,7 @@ class TelegramLinkDialog(QDialog):
             chat = payload.get("chat") or {}
             who = chat.get("telegram_username") or "tu cuenta de Telegram"
             self.lbl_status.setText(
-                f"✅ ¡Vinculado correctamente con {who}! El diálogo se cerrará…"
+                f"¡Vinculado correctamente con {who}! El diálogo se cerrará…"
             )
             self.lbl_status.setStyleSheet(
                 "color: #22c55e; font-size: 14px; font-weight: bold;"
@@ -349,19 +349,19 @@ class TelegramLinkDialog(QDialog):
         if payload.get("expired"):
             self._poll_timer.stop()
             self._countdown.stop()
-            self.lbl_status.setText("⚠ Código expirado. Pulsa «Nuevo código».")
+            self.lbl_status.setText("Código expirado. Pulsa «Nuevo código».")
             self.lbl_status.setStyleSheet("color: #ef4444; font-size: 12px;")
 
     # ------------------------------------------------------------------
     def _tick_countdown(self):
         if self._remaining_s <= 0:
             self._countdown.stop()
-            self.lbl_status.setText("⚠ Código expirado. Pulsa «Nuevo código».")
+            self.lbl_status.setText("Código expirado. Pulsa «Nuevo código».")
             self.lbl_status.setStyleSheet("color: #ef4444; font-size: 12px;")
             return
         m, s = divmod(self._remaining_s, 60)
         self.lbl_status.setText(
-            f"⏱  Esperando confirmación del bot…  válido {m:01d}:{s:02d}"
+            f"Esperando confirmación del bot…  válido {m:01d}:{s:02d}"
         )
         self.lbl_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
         self._remaining_s -= 1
@@ -374,11 +374,11 @@ class TelegramLinkDialog(QDialog):
         if not self._code:
             return
         QApplication.clipboard().setText(f"/vincular {self._code}")
-        self.lbl_status.setText("📋 Comando copiado. Pégalo en el chat del bot.")
+        self.lbl_status.setText("Comando copiado. Pégalo en el chat del bot.")
         self.lbl_status.setStyleSheet("color: #22c55e; font-size: 12px;")
 
     def _show_error(self, msg: str):
-        self.lbl_code.setText("❌")
+        self.lbl_code.setText("")
         self.lbl_command.setText("")
         self.lbl_status.setText(msg)
         self.lbl_status.setStyleSheet("color: #ef4444; font-size: 12px;")

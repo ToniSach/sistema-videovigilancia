@@ -17,10 +17,11 @@ from PySide6.QtWidgets import (
     QStackedWidget, QPushButton, QLabel,
     QStatusBar, QMessageBox, QDialog, QFrame,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QAction, QKeySequence, QFont
 
 from desktop_app.src.config import config
+from desktop_app.src.ui.icons import icon
 from desktop_app.src.models.user import User
 from desktop_app.src.services.api_client import api_client
 from desktop_app.src.services.video_streamer import video_streamer
@@ -172,7 +173,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 16, 12, 12)
 
         # Logo
-        lbl_logo = QLabel("📹 NVR VMS")
+        lbl_logo = QLabel("NVR VMS")
         lbl_logo.setStyleSheet(f"""
             color: {config.THEME_ACCENT};
             font-size: 20px;
@@ -184,27 +185,27 @@ class MainWindow(QMainWindow):
 
         # ===== Sección MONITOREO =====
         layout.addWidget(self._section_label("MONITOREO"))
-        self._add_nav(layout, "📹  En vivo", VIEW_LIVE, active=True)
-        self._add_nav(layout, "🔔  Eventos", VIEW_EVENTS)
-        self._add_nav(layout, "⏯  Reproducción", VIEW_PLAYBACK)
+        self._add_nav(layout, "En vivo", VIEW_LIVE, active=True, icon_name="live")
+        self._add_nav(layout, "Eventos", VIEW_EVENTS, icon_name="events")
+        self._add_nav(layout, "Reproducción", VIEW_PLAYBACK, icon_name="playback")
 
         layout.addSpacing(12)
 
         # ===== Sección CONFIGURACIÓN =====
         layout.addWidget(self._section_label("CONFIGURACIÓN"))
-        self._add_nav(layout, "📷  Cámaras", VIEW_CAMERAS)
-        self._add_nav(layout, "🔔  Notificaciones", VIEW_NOTIFICATIONS)
-        self._add_nav(layout, "📊  Sistema", VIEW_SYSTEM)
+        self._add_nav(layout, "Cámaras", VIEW_CAMERAS, icon_name="cameras")
+        self._add_nav(layout, "Notificaciones", VIEW_NOTIFICATIONS, icon_name="notifications")
+        self._add_nav(layout, "Sistema", VIEW_SYSTEM, icon_name="system")
 
         layout.addSpacing(12)
 
         # ===== Sección ADMINISTRACIÓN (solo admin) =====
         self.lbl_section_admin = self._section_label("ADMINISTRACIÓN")
         layout.addWidget(self.lbl_section_admin)
-        self._add_nav(layout, "👥  Usuarios", VIEW_USERS, admin_only=True)
-        self._add_nav(layout, "🔐  Permisos", VIEW_PERMISSIONS, admin_only=True)
+        self._add_nav(layout, "Usuarios", VIEW_USERS, admin_only=True, icon_name="users")
+        self._add_nav(layout, "Permisos", VIEW_PERMISSIONS, admin_only=True, icon_name="permissions")
         if SETTINGS_AVAILABLE:
-            self._add_nav(layout, "⚙  Ajustes", VIEW_SETTINGS, admin_only=True)
+            self._add_nav(layout, "Ajustes", VIEW_SETTINGS, admin_only=True, icon_name="settings")
 
         layout.addStretch()
 
@@ -229,7 +230,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lbl_user_role)
 
         # Botón para abrir el tutorial otra vez
-        self.btn_tutorial = QPushButton("🎓  Tutorial")
+        self.btn_tutorial = QPushButton("  Tutorial")
+        self.btn_tutorial.setIcon(icon("tutorial"))
+        self.btn_tutorial.setIconSize(QSize(18, 18))
         self.btn_tutorial.setMinimumHeight(36)
         self.btn_tutorial.setToolTip("Ver el tutorial de bienvenida otra vez")
         self.btn_tutorial.clicked.connect(self._open_tutorial)
@@ -237,13 +240,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.btn_tutorial)
 
         # Botón para vincular móvil (QR)
-        self.btn_link_mobile = QPushButton("📱  Vincular móvil")
+        self.btn_link_mobile = QPushButton("  Vincular móvil")
+        self.btn_link_mobile.setIcon(icon("link_mobile"))
+        self.btn_link_mobile.setIconSize(QSize(18, 18))
         self.btn_link_mobile.setMinimumHeight(36)
         self.btn_link_mobile.clicked.connect(self._open_qr_link_dialog)
         self.btn_link_mobile.setStyleSheet(self._nav_button_style())
         layout.addWidget(self.btn_link_mobile)
 
-        self.btn_logout = QPushButton("🚪  Cerrar sesión")
+        self.btn_logout = QPushButton("  Cerrar sesión")
+        self.btn_logout.setIcon(icon("logout"))
+        self.btn_logout.setIconSize(QSize(18, 18))
         self.btn_logout.setMinimumHeight(36)
         self.btn_logout.clicked.connect(self._logout)
         self.btn_logout.setStyleSheet(self._logout_button_style())
@@ -263,8 +270,12 @@ class MainWindow(QMainWindow):
         return lbl
 
     def _add_nav(self, layout: QVBoxLayout, text: str, view_index: int,
-                 active: bool = False, admin_only: bool = False):
-        btn = QPushButton(text)
+                 active: bool = False, admin_only: bool = False,
+                 icon_name: str = None):
+        btn = QPushButton("  " + text if icon_name else text)
+        if icon_name:
+            btn.setIcon(icon(icon_name))
+            btn.setIconSize(QSize(20, 20))
         btn.setCheckable(True)
         btn.setChecked(active)
         btn.setMinimumHeight(40)
@@ -354,9 +365,9 @@ class MainWindow(QMainWindow):
             accessible_cameras=user_data.get("accessible_cameras", []),
         )
 
-        self.lbl_user.setText(f"👤  {self.current_user.username}")
+        self.lbl_user.setText(self.current_user.username)
         is_admin = (role == "admin")
-        self.lbl_user_role.setText("🔑 Administrador" if is_admin else "👁 Usuario")
+        self.lbl_user_role.setText("Administrador" if is_admin else "Usuario")
 
         # Mostrar/ocultar opciones admin
         self.lbl_section_admin.setVisible(is_admin)

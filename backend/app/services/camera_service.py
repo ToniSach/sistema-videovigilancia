@@ -7,7 +7,6 @@ from ..database.models import Camera
 from ..database.repositories.camera_repository import CameraRepository
 from ..streaming.frame_distributor import FrameDistributor
 from ..streaming.frame_buffer import FrameData
-from ..streaming.mjpeg_streamer import mjpeg_streamer
 
 
 class CameraService:
@@ -25,7 +24,6 @@ class CameraService:
         self._camera_repo = camera_repo
         self._camera_manager = camera_manager
         self._onvif_discovery = onvif_discovery
-        self._mjpeg = mjpeg_streamer
         self._logger = logging.getLogger(__name__)
 
     def get_all_cameras(self) -> list[dict]:

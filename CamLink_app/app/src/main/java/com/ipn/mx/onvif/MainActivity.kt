@@ -15,6 +15,7 @@ import androidx.core.app.ActivityCompat
 import androidx.navigation.fragment.NavHostFragment
 import androidx.navigation.ui.AppBarConfiguration
 import androidx.navigation.ui.setupActionBarWithNavController
+import com.google.android.material.appbar.MaterialToolbar
 import com.ipn.mx.onvif.network.JwtAuthenticator
 import com.ipn.mx.onvif.network.RetrofitClient
 import com.ipn.mx.onvif.service.NotificationWebSocketService
@@ -63,11 +64,18 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // Toolbar propia como ActionBar de soporte (el tema es NoActionBar).
+        // Sin esto, setupActionBarWithNavController lanzaba IllegalStateException
+        // y, sobre todo, el menú (Notificaciones/Telegram/Grabaciones) no tenía
+        // dónde mostrarse.
+        val toolbar = findViewById<MaterialToolbar>(R.id.topToolbar)
+        setSupportActionBar(toolbar)
+
         val navHostFragment = supportFragmentManager
             .findFragmentById(R.id.navHostFragment) as NavHostFragment
         val navController = navHostFragment.navController
 
-        // QR y LiveView son destinos raíz — sin flecha de atrás en ellos
+        // QR y LiveView son destinos raíz — sin flecha de atrás en ellos.
         val appBarConfig = AppBarConfiguration(
             setOf(R.id.qrScanFragment, R.id.liveViewFragment)
         )

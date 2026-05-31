@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 
 from desktop_app.src.config import config
+from desktop_app.src.ui.icons import icon
 from desktop_app.src.services.api_client import api_client
 from desktop_app.src.ui.components.glass_card import GlassCard
 
@@ -120,25 +121,27 @@ class UsersView(QWidget):
         layout.setSpacing(12)
 
         header = QHBoxLayout()
-        title = QLabel("👥 Gestión de Usuarios")
+        title = QLabel("Gestión de Usuarios")
         title.setStyleSheet(
             f"color: {config.THEME_TEXT}; font-size: 22px; font-weight: bold;"
         )
         header.addWidget(title)
         header.addStretch()
 
-        self.btn_refresh = QPushButton("🔄 Refrescar")
+        self.btn_refresh = QPushButton("  Refrescar")
+        self.btn_refresh.setIcon(icon("refresh"))
         self.btn_refresh.clicked.connect(self.refresh)
         header.addWidget(self.btn_refresh)
 
-        self.btn_add = QPushButton("➕ Nuevo usuario")
+        self.btn_add = QPushButton("  Nuevo usuario")
+        self.btn_add.setIcon(icon("add"))
         self.btn_add.clicked.connect(self._add)
         header.addWidget(self.btn_add)
         layout.addLayout(header)
 
         # Banner si no es admin
         self.lbl_warn = QLabel(
-            "⚠ Esta sección solo está disponible para administradores."
+            "Esta sección solo está disponible para administradores."
         )
         self.lbl_warn.setStyleSheet(
             f"background:{config.THEME_DANGER}; color:white; padding:8px; "
@@ -163,12 +166,14 @@ class UsersView(QWidget):
 
         # Botones inferiores
         actions = QHBoxLayout()
-        self.btn_edit = QPushButton("✏ Editar")
+        self.btn_edit = QPushButton("  Editar")
+        self.btn_edit.setIcon(icon("edit"))
         self.btn_edit.clicked.connect(self._edit)
         self.btn_edit.setEnabled(False)
         actions.addWidget(self.btn_edit)
 
-        self.btn_delete = QPushButton("🗑 Eliminar")
+        self.btn_delete = QPushButton("  Eliminar")
+        self.btn_delete.setIcon(icon("delete"))
         self.btn_delete.clicked.connect(self._delete)
         self.btn_delete.setEnabled(False)
         actions.addWidget(self.btn_delete)
@@ -215,7 +220,7 @@ class UsersView(QWidget):
             self.table.setItem(r, 1, QTableWidgetItem(u.get("username", "")))
             self.table.setItem(r, 2, QTableWidgetItem(u.get("role", "user")))
             active = u.get("is_active", True)
-            self.table.setItem(r, 3, QTableWidgetItem("✓ Activo" if active else "✗ Inactivo"))
+            self.table.setItem(r, 3, QTableWidgetItem("Activo" if active else "Inactivo"))
             created = u.get("created_at", "")
             self.table.setItem(r, 4, QTableWidgetItem(str(created)[:19]))
 

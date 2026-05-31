@@ -19,6 +19,7 @@ from desktop_app.src.services.playback_service import playback_service
 from desktop_app.src.ui.components.glass_card import GlassCard
 from desktop_app.src.ui.components.timeline_widget import TimelineWidget
 from desktop_app.src.ui.components.video_player import VideoPlayerWidget
+from desktop_app.src.ui.icons import icon
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,13 @@ class PlaybackView(QWidget):
         self.current_camera_id: Optional[int] = None
         self.current_date: Optional[str] = None
         self.segments: list = []
-        
+        # id_cámara -> bool (es dual-lens). La grabación es el stream COMBINADO
+        # (ambos lentes apilados verticalmente, -c copy nativo). El selector de
+        # lente recorta en VLC (sin doble coste de grabación). Geometría coherente
+        # con el split en vivo: l2=mitad superior, l1=mitad inferior.
+        self._cam_dual: dict = {}
+        self._lens = "full"  # "full" | "l1" | "l2"
+
         self._setup_ui()
         self._connect_signals()
     
@@ -44,7 +51,7 @@ class PlaybackView(QWidget):
 
         # Título + botón de ayuda
         title_row = QHBoxLayout()
-        title_lbl = QLabel("⏯  Reproducción de grabaciones")
+        title_lbl = QLabel("Reproducción de grabaciones")
         title_lbl.setStyleSheet(
             f"color: {config.THEME_TEXT}; font-size: 22px; font-weight: bold;"
         )
@@ -88,7 +95,22 @@ class PlaybackView(QWidget):
         """)
         controls.addWidget(QLabel("Cámara:"))
         controls.addWidget(self.cmb_camera)
-        
+        self.cmb_camera.currentIndexChanged.connect(self._on_camera_combo_change)
+
+        # Selector de lente (solo cámaras dual-lens). Recorta la grabación
+        # combinada en reproducción → "Lente 1" / "Lente 2" / "Completa".
+        self.lbl_lens = QLabel("Lente:")
+        self.cmb_lens = QComboBox()
+        self.cmb_lens.addItem("Completa", "full")
+        self.cmb_lens.addItem("Lente 1", "l1")
+        self.cmb_lens.addItem("Lente 2", "l2")
+        self.cmb_lens.setStyleSheet(self.cmb_camera.styleSheet())
+        self.cmb_lens.currentIndexChanged.connect(self._on_lens_change)
+        self.lbl_lens.setVisible(False)
+        self.cmb_lens.setVisible(False)
+        controls.addWidget(self.lbl_lens)
+        controls.addWidget(self.cmb_lens)
+
         # Selector de fecha
         self.date_edit = QDateEdit()
         self.date_edit.setCalendarPopup(True)
@@ -144,9 +166,12 @@ class PlaybackView(QWidget):
         # Controles de playback
         playback_controls = QHBoxLayout()
         
-        self.btn_play = QPushButton("▶ Play")
-        self.btn_pause = QPushButton("⏸ Pause")
-        self.btn_stop = QPushButton("⏹ Stop")
+        self.btn_play = QPushButton("  Play")
+        self.btn_play.setIcon(icon("play"))
+        self.btn_pause = QPushButton("  Pause")
+        self.btn_pause.setIcon(icon("pause"))
+        self.btn_stop = QPushButton("  Stop")
+        self.btn_stop.setIcon(icon("stop"))
         
         for btn in [self.btn_play, self.btn_pause, self.btn_stop]:
             btn.setMinimumWidth(80)
@@ -199,7 +224,8 @@ class PlaybackView(QWidget):
         playback_controls.addWidget(self.cmb_speed)
         
         # Botón exportar
-        self.btn_export = QPushButton("⬇ Exportar")
+        self.btn_export = QPushButton("  Exportar")
+        self.btn_export.setIcon(icon("export"))
         self.btn_export.clicked.connect(self._export_video)
         playback_controls.addWidget(self.btn_export)
         
@@ -233,8 +259,54 @@ class PlaybackView(QWidget):
     def set_cameras(self, cameras: list):
         """Carga lista de cámaras."""
         self.cmb_camera.clear()
+        self._cam_dual.clear()
         for cam in cameras:
             self.cmb_camera.addItem(cam.name, cam.id)
+            self._cam_dual[cam.id] = bool(getattr(cam, "is_dual_lens", False))
+        self._on_camera_combo_change()
+
+    def _on_camera_combo_change(self, *args):
+        """Muestra el selector de lente solo si la cámara es dual-lens."""
+        cam_id = self.cmb_camera.currentData()
+        is_dual = self._cam_dual.get(cam_id, False)
+        self.lbl_lens.setVisible(is_dual)
+        self.cmb_lens.setVisible(is_dual)
+        if not is_dual:
+            # Cámara mono: sin recorte y reset del selector.
+            self._lens = "full"
+            self.cmb_lens.blockSignals(True)
+            self.cmb_lens.setCurrentIndex(0)
+            self.cmb_lens.blockSignals(False)
+            playback_service.player.set_crop(None)
+
+    def _on_lens_change(self, *args):
+        """Cambia el lente visualizado aplicando un recorte de VLC."""
+        self._lens = self.cmb_lens.currentData() or "full"
+        self._apply_lens_crop()
+
+    def _apply_lens_crop(self):
+        """Aplica el recorte del lente sobre la grabación combinada.
+
+        La grabación dual contiene los dos lentes apilados verticalmente. El
+        recorte se calcula a partir del tamaño real del vídeo (video_get_size),
+        por lo que es independiente de la resolución nativa de la cámara.
+        l2 = mitad superior, l1 = mitad inferior (coherente con el split en vivo).
+        """
+        if self._lens == "full":
+            playback_service.player.set_crop(None)
+            return
+        w, h = playback_service.player.get_video_size()
+        if not w or not h:
+            # El vídeo aún no ha cargado; reintentar en breve.
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(300, self._apply_lens_crop)
+            return
+        half = h // 2
+        if self._lens == "l2":      # mitad superior
+            geom = f"{w}x{half}+0+0"
+        else:                        # l1 → mitad inferior
+            geom = f"{w}x{half}+0+{half}"
+        playback_service.player.set_crop(geom)
     
     def _load_timeline(self):
         """Carga timeline desde backend."""
@@ -290,6 +362,10 @@ class PlaybackView(QWidget):
         """Archivo descargado."""
         self.progress_download.setVisible(False)
         self.lbl_status.setText(f"Reproduciendo: {path}")
+        # Reaplicar el recorte del lente cuando el vídeo ya tenga tamaño válido.
+        if self._lens != "full":
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(600, self._apply_lens_crop)
     
     def _on_download_error(self, error: str):
         """Error en descarga."""

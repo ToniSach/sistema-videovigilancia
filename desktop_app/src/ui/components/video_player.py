@@ -35,18 +35,30 @@ class VideoPlayerWidget(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
 
-        # Frame contenedor (necesario para VLC: get winId() válido)
+        # Frame contenedor (necesario para VLC: get winId() válido).
+        # WA_NativeWindow fuerza una ventana nativa real → winId() válido y VLC
+        # NO abre una ventana flotante ni pinta en una ventana inexistente.
         self._video_frame = QFrame()
+        self._video_frame.setAttribute(Qt.WA_NativeWindow, True)
         self._video_frame.setStyleSheet(
             "background-color: black; border-radius: 8px;"
         )
         self._layout.addWidget(self._video_frame)
 
-        # Registrar ESTA ventana en el VLC de playback_service tras
-        # que el QFrame esté realmente creado en el toolkit nativo.
-        # 100ms es suficiente en práctica; si la ventana cambia de tamaño,
-        # resizeEvent vuelve a registrarla.
-        QTimer.singleShot(150, self._bind_to_playback_service)
+        # El enlace real se hace en showEvent (cuando la pestaña es VISIBLE y el
+        # winId ya es una ventana válida). Antes se hacía a los 150ms del
+        # arranque, cuando la pestaña de Reproducción aún no se había mostrado →
+        # VLC quedaba enlazado a una ventana no realizada y no se veía nada.
+
+    def showEvent(self, event):
+        """Enlaza VLC cuando la pestaña se hace VISIBLE (winId ya válido).
+
+        Se difiere 50ms porque, justo en el primer showEvent, el QFrame puede
+        no tener todavía su ventana nativa realizada; un pequeño retardo
+        garantiza un winId() válido.
+        """
+        super().showEvent(event)
+        QTimer.singleShot(50, self._bind_to_playback_service)
 
     def _bind_to_playback_service(self):
         """Conecta el VLC singleton de playback_service a este QFrame."""

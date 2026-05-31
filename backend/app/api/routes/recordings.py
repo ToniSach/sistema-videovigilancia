@@ -10,6 +10,7 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 
 from backend.app.services.permission_service import PermissionService
 from backend.app.database.repositories.recording_repository import RecordingRepository
+from backend.app.services.signed_url_service import get_signed_url_service
 from backend.app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,76 @@ permission_service = PermissionService()
 def get_recording_repo():
     """Repositorio sin parámetro de db_manager."""
     return RecordingRepository()  # ← CORREGIDO: sin parámetros
+
+
+# ---------------------------------------------------------------------------
+# URLs firmadas de medios (para reproductores que NO envían Authorization)
+# ---------------------------------------------------------------------------
+# PIPELINE de reproducción segura desde móvil/desktop:
+#   Paso 1. El cliente (autenticado por JWT) pide GET /recordings/<id>/playback-url
+#           → el servidor valida permiso 'view' y devuelve una URL FIRMADA.
+#   Paso 2. El cliente entrega esa URL a ExoPlayer/AVPlayer/VLC.
+#   Paso 3. El reproductor pide GET /recordings/<id>/media?token=... (sin JWT).
+#   Paso 4. El servidor valida el token (HMAC + caducidad, ligado a ESTE id) y
+#           sirve el MP4 con soporte Range (seek). Sin token válido → 403.
+def _media_resource(recording_id: int) -> str:
+    """Recurso canónico que firma/valida el token de vídeo de una grabación."""
+    return f"recording:{recording_id}"
+
+
+def _thumb_resource(recording_id: int) -> str:
+    """Recurso canónico del thumbnail de una grabación."""
+    return f"thumb:{recording_id}"
+
+
+def _signed_playback_url(recording_id: int) -> str:
+    svc = get_signed_url_service()
+    return f"/api/v1/recordings/{recording_id}/media?{svc.query_param(_media_resource(recording_id))}"
+
+
+def _signed_thumbnail_url(recording_id: int) -> str:
+    svc = get_signed_url_service()
+    return f"/api/v1/recordings/{recording_id}/thumbnail?{svc.query_param(_thumb_resource(recording_id))}"
+
+
+def _thumbnail_path_for(file_path: str) -> str:
+    """El thumbnail vive junto al MP4 con extensión .jpg (lo genera RecordingManager)."""
+    return os.path.splitext(file_path or "")[0] + ".jpg"
+
+
+def _serve_file_with_range(file_path: str, mime_type: str):
+    """
+    Sirve un archivo con soporte de Range Requests (seek). Reutilizado por los
+    endpoints de medios firmados. Devuelve 206 si hay Range, 200 si no.
+    """
+    file_size = os.path.getsize(file_path)
+    range_header = request.headers.get("Range", None)
+    if range_header:
+        try:
+            byte_range = range_header.replace("bytes=", "").split("-")
+            start = int(byte_range[0]) if byte_range[0] else 0
+            end = int(byte_range[1]) if byte_range[1] else file_size - 1
+        except Exception:
+            start, end = 0, file_size - 1
+        length = end - start + 1
+
+        def generate(initial_length=length):
+            remaining = initial_length
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                while remaining > 0:
+                    data = f.read(min(8192, remaining))
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+
+        response = Response(generate(), 206, mimetype=mime_type, direct_passthrough=True)
+        response.headers.add("Content-Range", f"bytes {start}-{end}/{file_size}")
+        response.headers.add("Accept-Ranges", "bytes")
+        response.headers.add("Content-Length", str(length))
+        return response
+    return send_file(file_path, mimetype=mime_type, as_attachment=False, conditional=True)
 
 
 @recordings_bp.route("/", methods=["GET"])
@@ -52,9 +123,21 @@ def get_recordings():
                 recordings.extend(recs)
             recordings = sorted(recordings, key=lambda x: x.start_time, reverse=True)[:limit]
 
+        # Enriquecer cada grabación con URLs FIRMADAS listas para reproductores
+        # nativos (no necesitan cabecera Authorization) + thumbnail si existe.
+        data = []
+        for r in recordings:
+            d = r.to_dict()
+            rid = d.get("id")
+            if rid is not None:
+                d["playback_url"] = _signed_playback_url(rid)
+                if r.file_path and os.path.exists(_thumbnail_path_for(r.file_path)):
+                    d["thumbnail_url"] = _signed_thumbnail_url(rid)
+            data.append(d)
+
         return jsonify({
             "success": True,
-            "data": [r.to_dict() for r in recordings],
+            "data": data,
             "count": len(recordings)
         }), 200
 
@@ -63,6 +146,126 @@ def get_recordings():
             "success": False,
             "error": str(e)
         }), 500
+
+
+@recordings_bp.route("/<int:recording_id>", methods=["GET"])
+@jwt_required()
+def get_recording_detail(recording_id):
+    """
+    Detalle de UNA grabación con URLs firmadas (la app móvil lo usa antes de
+    reproducir: PlaybackFragment necesita playback_url). Antes NO existía esta
+    ruta GET → getRecording(id) daba 404 y la reproducción móvil fallaba.
+    """
+    try:
+        user_id = int(get_jwt_identity())
+        repo = get_recording_repo()
+        recording = repo.get_by_id(recording_id)
+        if not recording:
+            return jsonify({"success": False, "error": "Grabación no encontrada"}), 404
+        if not permission_service.check_permission(user_id, recording.camera_id, "view"):
+            return jsonify({"success": False, "error": "Permiso denegado"}), 403
+
+        d = recording.to_dict()
+        d["playback_url"] = _signed_playback_url(recording_id)
+        if recording.file_path and os.path.exists(_thumbnail_path_for(recording.file_path)):
+            d["thumbnail_url"] = _signed_thumbnail_url(recording_id)
+        return jsonify({"success": True, "data": d}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@recordings_bp.route("/<int:recording_id>/playback-url", methods=["GET"])
+@jwt_required()
+def get_playback_url(recording_id):
+    """
+    Paso 1 del pipeline de reproducción segura. Valida permiso 'view' y devuelve
+    una URL FIRMADA (con caducidad) que el cliente entrega a su reproductor.
+    """
+    try:
+        user_id = int(get_jwt_identity())
+        repo = get_recording_repo()
+        recording = repo.get_by_id(recording_id)
+        if not recording:
+            return jsonify({"success": False, "error": "Grabación no encontrada"}), 404
+        if not permission_service.check_permission(user_id, recording.camera_id, "view"):
+            return jsonify({"success": False, "error": "Permiso denegado"}), 403
+
+        resp = {
+            "success": True,
+            "data": {
+                "playback_url": _signed_playback_url(recording_id),
+                "expires_in": settings.MEDIA_URL_TTL_SECONDS,
+            },
+        }
+        if recording.file_path and os.path.exists(_thumbnail_path_for(recording.file_path)):
+            resp["data"]["thumbnail_url"] = _signed_thumbnail_url(recording_id)
+        return jsonify(resp), 200
+    except Exception:
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
+
+
+@recordings_bp.route("/<int:recording_id>/media", methods=["GET"])
+def get_signed_media(recording_id):
+    """
+    Pasos 3-4. Endpoint SIN @jwt_required: la autorización va en el token firmado
+    del query string (los reproductores nativos no envían Authorization). Valida
+    HMAC + caducidad ligados a ESTE recording_id y sirve el MP4 con Range.
+    """
+    try:
+        token = request.args.get("token")
+        if not get_signed_url_service().verify(_media_resource(recording_id), token):
+            return jsonify({"success": False, "error": "Token de medios inválido o caducado"}), 403
+
+        repo = get_recording_repo()
+        recording = repo.get_by_id(recording_id)
+        if not recording:
+            return jsonify({"success": False, "error": "Grabación no encontrada"}), 404
+
+        file_path = recording.file_path or ""
+        if file_path and not os.path.isabs(file_path):
+            file_path = os.path.abspath(file_path)
+        if not file_path or not os.path.exists(file_path) or os.path.getsize(file_path) < 1024:
+            return jsonify({"success": False, "error": "Archivo no disponible"}), 404
+
+        mime_type, _ = mimetypes.guess_type(file_path)
+        return _serve_file_with_range(file_path, mime_type or "video/mp4")
+    except Exception:
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
+
+
+@recordings_bp.route("/<int:recording_id>/thumbnail", methods=["GET"])
+def get_signed_thumbnail(recording_id):
+    """
+    Sirve el thumbnail JPEG de una grabación. Acepta token firmado (query) para
+    reproductores/listas, O JWT en cabecera para clientes que lo manden.
+    """
+    try:
+        token = request.args.get("token")
+        authorized = get_signed_url_service().verify(_thumb_resource(recording_id), token)
+        if not authorized:
+            # Fallback a JWT + permiso (clientes que sí mandan cabecera).
+            from flask_jwt_extended import verify_jwt_in_request
+            try:
+                verify_jwt_in_request()
+                user_id = int(get_jwt_identity())
+                rec = get_recording_repo().get_by_id(recording_id)
+                authorized = bool(
+                    rec and permission_service.check_permission(user_id, rec.camera_id, "view")
+                )
+            except Exception:
+                authorized = False
+        if not authorized:
+            return jsonify({"success": False, "error": "No autorizado"}), 403
+
+        recording = get_recording_repo().get_by_id(recording_id)
+        if not recording or not recording.file_path:
+            return jsonify({"success": False, "error": "No encontrado"}), 404
+        thumb = _thumbnail_path_for(recording.file_path)
+        if not os.path.exists(thumb):
+            return jsonify({"success": False, "error": "Sin miniatura"}), 404
+        return send_file(thumb, mimetype="image/jpeg", as_attachment=False)
+    except Exception:
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @recordings_bp.route("/timeline", methods=["GET"])

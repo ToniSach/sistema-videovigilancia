@@ -64,7 +64,7 @@ class PTZJoystick(QWidget):
         """)
 
         # Título
-        title = QLabel("🎮  Control PTZ")
+        title = QLabel("Control PTZ")
         title.setStyleSheet(
             f"color: {config.THEME_ACCENT}; font-weight: bold; font-size: 14px;"
         )
@@ -103,7 +103,7 @@ class PTZJoystick(QWidget):
         layout.addWidget(sep)
 
         # === Zoom in/out ===
-        zoom_label = QLabel("🔍 Zoom")
+        zoom_label = QLabel("Zoom")
         zoom_label.setStyleSheet(
             f"color: {config.THEME_TEXT_MUTED}; font-size: 11px; font-weight: bold;"
         )
@@ -111,7 +111,7 @@ class PTZJoystick(QWidget):
 
         zoom_row = QHBoxLayout()
         zoom_row.addStretch()
-        btn_zin = QPushButton("➕ Acercar")
+        btn_zin = QPushButton("Acercar")
         btn_zin.setFixedHeight(40)
         btn_zin.setMinimumWidth(110)
         btn_zin.setCursor(Qt.PointingHandCursor)
@@ -120,7 +120,7 @@ class PTZJoystick(QWidget):
         btn_zin.released.connect(self._on_release)
         zoom_row.addWidget(btn_zin)
 
-        btn_zout = QPushButton("➖ Alejar")
+        btn_zout = QPushButton("Alejar")
         btn_zout.setFixedHeight(40)
         btn_zout.setMinimumWidth(110)
         btn_zout.setCursor(Qt.PointingHandCursor)

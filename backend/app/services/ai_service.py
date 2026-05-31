@@ -252,6 +252,17 @@ class AIService:
             scheduler.start(distributor)
             self._schedulers[key] = scheduler
 
+        # Precargar el modelo YA (en segundo plano) para que la primera
+        # detección sea inmediata y no se pague la carga/export en el primer
+        # frame con movimiento. El pool es singleton → warmup idempotente.
+        import threading
+        from ..processing.ai.model_pool import YLOModelPool as _Pool
+        threading.Thread(
+            target=_Pool().warmup,
+            name=f"YoloWarmup-cam{camera_id}",
+            daemon=True,
+        ).start()
+
         logger.info(f"IA activada | cámara={camera_id} | lens={lens} | modo={mode}")
         # Persistir has_ai=True para reactivar en el próximo arranque del backend
         self._persist_has_ai(camera_id, True)

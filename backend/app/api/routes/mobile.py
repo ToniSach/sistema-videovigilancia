@@ -14,7 +14,6 @@ from backend.app.infrastructure.metrics.collector import metrics_collector
 from backend.app.database.repositories.event_repository import EventRepository
 from backend.app.database.repositories.recording_repository import RecordingRepository
 from backend.app.cameras.camera_manager import CameraManager
-from backend.app.streaming.live_hls_service import live_hls_service
 
 logger = logging.getLogger(__name__)
 
@@ -271,112 +270,7 @@ def get_camera_thumbnail(camera_id: int):
         return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
-@mobile_bp.route("/streaming/hls/<int:camera_id>/master.m3u8", methods=["GET"])
-@jwt_required()
-def get_hls_manifest(camera_id: int):
-    """
-    Endpoint HLS para app móvil (Master Playlist).
-    Inicia stream HLS si no está activo y retorna el manifest.
-    """
-    try:
-        user_id = int(get_jwt_identity())
-        permission_service = PermissionService()
-        
-        if not permission_service.check_permission(user_id, camera_id, 'view'):
-            return jsonify({"success": False, "error": "Permiso denegado"}), 403
-        
-        # Obtener RTSP de la cámara
-        from backend.app.database.repositories.camera_repository import CameraRepository
-        cam_repo = CameraRepository()
-        camera = cam_repo.get_by_id(camera_id)
-        
-        if not camera or not camera.rtsp_url:
-            return jsonify({"success": False, "error": "Cámara no configurada"}), 400
-        
-        # Iniciar stream HLS si no está activo
-        if camera_id not in live_hls_service._active_streams:
-            success = live_hls_service.start_stream(camera_id, camera.rtsp_url)
-            if not success:
-                return jsonify({"success": False, "error": "No se pudo iniciar stream HLS"}), 503
-        
-        # Esperar a que el manifest exista (max 3 segundos)
-        manifest_path = None
-        for _ in range(6):  # 6 intentos * 0.5s = 3s
-            manifest_path = live_hls_service.get_manifest(camera_id)
-            if manifest_path:
-                break
-            time.sleep(0.5)
-        
-        if not manifest_path:
-            return jsonify({"success": False, "error": "Stream HLS no disponible aún, intente en unos segundos"}), 202
-        
-        from flask import send_file
-        return send_file(
-            manifest_path,
-            mimetype="application/vnd.apple.mpegurl",
-            as_attachment=False
-        )
-        
-    except Exception as e:
-        logger.error(f"Error en HLS manifest: {e}")
-        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
-
-
-@mobile_bp.route("/streaming/hls/<int:camera_id>/<string:profile>/<string:filename>", methods=["GET"])
-@jwt_required()
-def get_hls_segment(camera_id: int, profile: str, filename: str):
-    """
-    Endpoint para segmentos TS individuales (HLS).
-
-    Path traversal cerrado: profile y filename solo pueden ser nombres
-    alfanuméricos cortos; el path real se resuelve y se verifica que
-    siga dentro de la carpeta HLS_LIVE de la cámara.
-    """
-    try:
-        import re
-        from pathlib import Path
-        from flask import send_file
-
-        # Validación de inputs — antes podía pasar "../../etc/passwd"
-        if not re.match(r"^[A-Za-z0-9_\-]{1,32}$", profile):
-            return jsonify({"success": False, "error": "profile inválido"}), 400
-        if not re.match(r"^[A-Za-z0-9_\-]{1,64}\.(ts|m3u8)$", filename):
-            return jsonify({"success": False, "error": "filename inválido"}), 400
-
-        user_id = int(get_jwt_identity())
-        permission_service = PermissionService()
-        if not permission_service.check_permission(user_id, camera_id, 'view'):
-            return jsonify({"success": False, "error": "Permiso denegado"}), 403
-
-        segment_path = live_hls_service.get_segment(camera_id, profile, filename)
-        if not segment_path:
-            return jsonify({"success": False, "error": "Segmento no encontrado"}), 404
-
-        # Defensa en profundidad: el path debe estar dentro del directorio
-        # HLS de la cámara (por si el servicio devolvió algo raro).
-        resolved = Path(segment_path).resolve(strict=True)
-        expected_root = (
-            live_hls_service._base_path / str(camera_id)
-        ).resolve()
-        try:
-            resolved.relative_to(expected_root)
-        except ValueError:
-            logger.error(
-                f"Intento de path traversal HLS: cam={camera_id} path={resolved}"
-            )
-            return jsonify({"success": False, "error": "Acceso denegado"}), 403
-
-        return send_file(
-            str(resolved),
-            mimetype="video/MP2T" if filename.endswith(".ts") else "application/vnd.apple.mpegurl",
-            as_attachment=False,
-        )
-
-    except FileNotFoundError:
-        return jsonify({"success": False, "error": "Segmento no encontrado"}), 404
-    except Exception as e:
-        logger.error(f"Error sirviendo segmento HLS: {e}", exc_info=True)
-        return jsonify({"success": False, "error": "Error interno"}), 500
+# (Endpoints HLS-live eliminados: el directo móvil usa RTSP/go2rtc vía ExoPlayer.)
 
 
 # ============================================================================

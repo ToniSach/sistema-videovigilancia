@@ -31,6 +31,8 @@
     <!-- Popup menu -->
     <string name="menu_grabaciones">Grabaciones</string>
     <string name="menu_notificaciones">Notificaciones</string>
+    <string name="menu_config_notificaciones">Configurar notificaciones</string>
+    <string name="menu_vincular_telegram">Vincular Telegram</string>
     <string name="menu_cerrar_sesion">Cerrar sesion</string>
 
     <!-- Recordings -->

@@ -326,6 +326,15 @@ class TelegramBotPoller:
 
         # Normalizar
         if text.startswith("/start"):
+            # Deep link de Telegram: t.me/<bot>?start=CODIGO llega como
+            # "/start CODIGO" → vincula directamente (un toque desde la app).
+            # Sin parámetro (o si no parece código) → bienvenida normal.
+            parts = text.split(maxsplit=1)
+            if len(parts) >= 2:
+                arg = parts[1].strip().upper()
+                if _CODE_RE.match(arg):
+                    self._cmd_verify(chat_id, username, arg)
+                    return
             self._cmd_start(chat_id, username)
             return
 

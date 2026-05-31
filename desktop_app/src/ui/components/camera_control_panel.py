@@ -34,7 +34,7 @@ class LEDControlWidget(GlassCard):
         layout.setContentsMargins(16, 16, 16, 16)
         
         # Título
-        lbl_title = QLabel("💡 Control de Iluminación")
+        lbl_title = QLabel("Control de Iluminación")
         lbl_title.setStyleSheet(f"""
             color: {config.THEME_ACCENT};
             font-weight: bold;
@@ -130,7 +130,7 @@ class AudioControlWidget(GlassCard):
         layout.setContentsMargins(16, 16, 16, 16)
 
         # Título
-        lbl_title = QLabel("🎤 Audio Bidireccional")
+        lbl_title = QLabel("Audio Bidireccional")
         lbl_title.setStyleSheet(f"""
             color: {config.THEME_ACCENT};
             font-weight: bold;
@@ -153,7 +153,7 @@ class AudioControlWidget(GlassCard):
             }}
         """)
         mic_row.addWidget(self.cmb_mic, 1)
-        self.btn_reload_mics = QPushButton("🔄")
+        self.btn_reload_mics = QPushButton("")
         self.btn_reload_mics.setMaximumWidth(36)
         self.btn_reload_mics.setToolTip("Detectar micrófonos disponibles")
         self.btn_reload_mics.clicked.connect(self._load_mics)
@@ -161,7 +161,7 @@ class AudioControlWidget(GlassCard):
         layout.addLayout(mic_row)
 
         # Botón PTT (Push to Talk)
-        self.btn_ptt = QPushButton("🔴 MANTENER PRESIONADO PARA HABLAR")
+        self.btn_ptt = QPushButton("MANTENER PRESIONADO PARA HABLAR")
         self.btn_ptt.setMinimumHeight(50)
         self.btn_ptt.setStyleSheet(f"""
             QPushButton {{
@@ -181,7 +181,7 @@ class AudioControlWidget(GlassCard):
         layout.addWidget(self.btn_ptt)
 
         # Botón Listen (toggle)
-        self.btn_listen = QPushButton("🔊 Escuchar cámara")
+        self.btn_listen = QPushButton("Escuchar cámara")
         self.btn_listen.setMinimumHeight(40)
         self.btn_listen.setCheckable(True)
         self.btn_listen.toggled.connect(self._toggle_listen)
@@ -243,7 +243,7 @@ class AudioControlWidget(GlassCard):
             return
 
         self._talking = True
-        self.lbl_status.setText("🔴 Transmitiendo...")
+        self.lbl_status.setText("Transmitiendo...")
         self.lbl_status.setStyleSheet(f"color: {config.THEME_DANGER}; font-weight: bold;")
 
         # Incluir el mic seleccionado (o nada si está en "default")
@@ -283,26 +283,26 @@ class AudioControlWidget(GlassCard):
             return
 
         if checked:
-            self.btn_listen.setText("🔇 Detener escucha")
+            self.btn_listen.setText("Detener escucha")
 
             def on_started(response):
                 if response.success:
                     self._listening = True
-                    self.lbl_status.setText("🔊 Escuchando audio de la cámara")
+                    self.lbl_status.setText("Escuchando audio de la cámara")
                     self.lbl_status.setStyleSheet(
                         f"color: {config.THEME_ACCENT}; font-weight: bold;"
                     )
                 else:
                     err = response.error or "Error"
                     self.btn_listen.setChecked(False)
-                    self.btn_listen.setText("🔊 Escuchar cámara")
+                    self.btn_listen.setText("Escuchar cámara")
                     self.lbl_status.setText(f"Listen falló: {err[:60]}")
                     self.lbl_status.setStyleSheet(f"color: {config.THEME_DANGER};")
                     QMessageBox.warning(self, "Escuchar", f"No se pudo iniciar:\n{err[:300]}")
 
             api_client.post(f"cameras/{self.camera_id}/audio/listen/start", on_started)
         else:
-            self.btn_listen.setText("🔊 Escuchar cámara")
+            self.btn_listen.setText("Escuchar cámara")
 
             def on_stopped(response):
                 self._listening = False
@@ -339,7 +339,7 @@ class AIControlWidget(GlassCard):
         layout.setSpacing(12)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        lbl_title = QLabel("🤖 Inteligencia Artificial (YOLOv8)")
+        lbl_title = QLabel("Inteligencia Artificial (YOLOv8)")
         lbl_title.setStyleSheet(f"""
             color: {config.THEME_ACCENT};
             font-weight: bold;
@@ -369,7 +369,7 @@ class AIControlWidget(GlassCard):
         btn_layout = QHBoxLayout()
         self.btn_activate = QPushButton("▶ Activar IA")
         self.btn_activate.clicked.connect(self._activate)
-        self.btn_deactivate = QPushButton("⏸ Desactivar")
+        self.btn_deactivate = QPushButton("Desactivar")
         self.btn_deactivate.clicked.connect(self._deactivate)
         for b in (self.btn_activate, self.btn_deactivate):
             b.setStyleSheet(self._button_style())
@@ -511,7 +511,7 @@ class RecordingControlWidget(GlassCard):
         layout.setSpacing(12)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        lbl_title = QLabel("⏺ Grabación manual")
+        lbl_title = QLabel("Grabación manual")
         lbl_title.setStyleSheet(f"""
             color: {config.THEME_ACCENT};
             font-weight: bold;
@@ -520,9 +520,9 @@ class RecordingControlWidget(GlassCard):
         layout.addWidget(lbl_title)
 
         btn_layout = QHBoxLayout()
-        self.btn_start = QPushButton("⏺ Iniciar")
+        self.btn_start = QPushButton("Iniciar")
         self.btn_start.clicked.connect(self._start)
-        self.btn_stop = QPushButton("⏹ Detener")
+        self.btn_stop = QPushButton("Detener")
         self.btn_stop.clicked.connect(self._stop)
         for b in (self.btn_start, self.btn_stop):
             b.setStyleSheet(f"""
@@ -557,7 +557,7 @@ class RecordingControlWidget(GlassCard):
         def on_response(response):
             if response.success:
                 self._recording = True
-                self.lbl_status.setText("🔴 Grabando")
+                self.lbl_status.setText("Grabando")
                 self.lbl_status.setStyleSheet(
                     f"color: {config.THEME_DANGER}; font-weight: bold;"
                 )
@@ -588,7 +588,7 @@ class RecordingControlWidget(GlassCard):
             if response.success and response.data:
                 self._recording = response.data.get("recording", False)
                 if self._recording:
-                    self.lbl_status.setText("🔴 Grabando")
+                    self.lbl_status.setText("Grabando")
                     self.lbl_status.setStyleSheet(
                         f"color: {config.THEME_DANGER}; font-weight: bold;"
                     )
@@ -625,7 +625,7 @@ class CameraControlPanel(QWidget):
         outer.setSpacing(0)
 
         # Header
-        header = QLabel("🎛️ Controles de Cámara")
+        header = QLabel("Controles de Cámara")
         header.setStyleSheet(f"""
             color: {config.THEME_TEXT};
             font-size: 18px;
@@ -667,13 +667,13 @@ class CameraControlPanel(QWidget):
         outer.addWidget(self.tabs, 1)
 
         # ============= PESTAÑA 1: MOVIMIENTO (PTZ + presets) =============
-        self.tabs.addTab(self._build_movement_tab(), "🎮  Movimiento")
+        self.tabs.addTab(self._build_movement_tab(), "Movimiento")
 
         # ============= PESTAÑA 2: IA + Grabación =============
-        self.tabs.addTab(self._build_ai_recording_tab(), "🤖  IA / REC")
+        self.tabs.addTab(self._build_ai_recording_tab(), "IA / REC")
 
         # ============= PESTAÑA 3: Audio + LEDs =============
-        self.tabs.addTab(self._build_audio_leds_tab(), "🔊  Audio / Luz")
+        self.tabs.addTab(self._build_audio_leds_tab(), "Audio / Luz")
 
     def _scroll_wrap(self, content: QWidget) -> QScrollArea:
         """Envuelve un widget en QScrollArea (fallback si contenido es alto)."""
@@ -715,7 +715,7 @@ class CameraControlPanel(QWidget):
         preset_layout.setContentsMargins(12, 12, 12, 12)
         preset_layout.setSpacing(8)
 
-        preset_title = QLabel("📍 Presets PTZ")
+        preset_title = QLabel("Presets PTZ")
         preset_title.setStyleSheet(
             f"color: {config.THEME_ACCENT}; font-weight: bold; font-size: 13px;"
         )
@@ -741,7 +741,7 @@ class CameraControlPanel(QWidget):
         self.btn_go_preset = QPushButton("▶  Ir")
         self.btn_go_preset.setMinimumHeight(34)
         self.btn_go_preset.clicked.connect(self._go_to_preset)
-        self.btn_save_preset = QPushButton("💾  Guardar actual")
+        self.btn_save_preset = QPushButton("Guardar actual")
         self.btn_save_preset.setMinimumHeight(34)
         self.btn_save_preset.clicked.connect(self._save_preset)
         for b in (self.btn_go_preset, self.btn_save_preset):

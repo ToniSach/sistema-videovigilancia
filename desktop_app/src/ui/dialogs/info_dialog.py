@@ -7,8 +7,8 @@ Uso:
     InfoDialog(
         title="Ayuda — Cámaras",
         sections=[
-            ("📹  ¿Qué es esta vista?", "Aquí ves y administras…"),
-            ("➕  Añadir una cámara",   "Pulsa el botón…"),
+            ("¿Qué es esta vista?", "Aquí ves y administras…"),
+            ("Añadir una cámara",   "Pulsa el botón…"),
         ],
         parent=self,
     ).exec()

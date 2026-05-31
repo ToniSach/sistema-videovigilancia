@@ -4,15 +4,60 @@ import logging
 import time
 
 from ...container import get_container
-from ...streaming.mjpeg_streamer import mjpeg_streamer
 from backend.app.services.permission_service import PermissionService, require_camera_permission
 from backend.app.api.helpers import api_error_response, require_admin
 from ...cameras.camera_manager import CameraManager
 from ...workers.ffmpeg_worker import WorkerStatus
 from backend.app.services.ptz_lock_service import ptz_lock_service
 from backend.app.services.user_service import UserService
+from ...config import settings
+from ...streaming.go2rtc_manager import Go2RtcManager
+from ...streaming.webrtc_signaling import webrtc_signaling, WebRTCSignalingError
 
 cameras_bp = Blueprint("cameras", __name__, url_prefix="/api/v1/cameras")
+
+
+def _enrich_live_fields(cam: dict) -> dict:
+    """
+    Enriquece el dict de una cámara con campos de "en vivo" cuando go2rtc está
+    activo. Aditivo: si go2rtc está desactivado, devuelve el dict tal cual y los
+    clientes siguen usando `rtsp_url` / MJPEG como hoy.
+
+      - stream_url: URL RTSP del restream de go2rtc (desktop/móvil la consumen
+                    con ExoPlayer/VLC, una sola conexión a la cámara).
+      - webrtc_url: ruta de signaling WebRTC (si WEBRTC_ENABLED).
+    """
+    try:
+        go2rtc = Go2RtcManager()
+        if go2rtc.is_enabled() and cam.get("id") is not None:
+            cam = dict(cam)
+            cid = cam["id"]
+            qualities = ("high", "medium", "low")
+            if cam.get("is_dual_lens"):
+                # Dual-lens: por lente y por calidad.
+                cam["stream_url"] = go2rtc.rtsp_restream_url(cid)  # combinado (fallback)
+                cam["stream_url_l1"] = go2rtc.rtsp_restream_url(cid, "l1")
+                cam["stream_url_l2"] = go2rtc.rtsp_restream_url(cid, "l2")
+                cam["stream_urls"] = {
+                    "l1": {q: go2rtc.rtsp_restream_url(cid, "l1", q) for q in qualities},
+                    "l2": {q: go2rtc.rtsp_restream_url(cid, "l2", q) for q in qualities},
+                }
+                # HLS por lente (la móvil lo prefiere; RTSP queda como fallback).
+                cam["hls_url"] = go2rtc.hls_url(cid)
+                cam["hls_url_l1"] = go2rtc.hls_url(cid, "l1")
+                cam["hls_url_l2"] = go2rtc.hls_url(cid, "l2")
+            else:
+                cam["stream_url"] = go2rtc.rtsp_restream_url(cid)
+                cam["stream_urls"] = {
+                    "main": {q: go2rtc.rtsp_restream_url(cid, None, q) for q in qualities}
+                }
+                cam["hls_url"] = go2rtc.hls_url(cid)
+            if settings.WEBRTC_ENABLED:
+                cam["webrtc_url"] = f"/api/v1/cameras/{cid}/webrtc"
+    except Exception:
+        # El enriquecimiento NUNCA debe tumbar el listado de cámaras.
+        pass
+    return cam
 logger = logging.getLogger(__name__)
 
 def _get_service():
@@ -42,6 +87,15 @@ def get_cameras():
         perm_service = PermissionService()
         accessible_ids = set(perm_service.get_accessible_cameras(user_id))
         filtered = [c for c in all_cameras if c.get("id") in accessible_ids]
+
+        # Filtro de "EN VIVO": con ?live=1 se ocultan las cámaras inactivas
+        # (requisito: las inactivas no deben aparecer en el en vivo). Las vistas
+        # de gestión NO pasan live=1 y siguen viendo todas.
+        live = request.args.get("live", "").lower() in ("1", "true", "yes")
+        if live and settings.LIVE_HIDE_INACTIVE_CAMERAS:
+            filtered = [c for c in filtered if c.get("is_active", False)]
+
+        filtered = [_enrich_live_fields(c) for c in filtered]
         return jsonify({"success": True, "data": filtered})
     except Exception as e:
         return api_error_response(e, message="Error al obtener cámaras")
@@ -55,9 +109,71 @@ def get_camera(camera_id: int):
         camera = service.get_camera(camera_id)
         if not camera:
             return jsonify({"success": False, "error": "Cámara no encontrada"}), 404
-        return jsonify({"success": True, "data": camera})
+        return jsonify({"success": True, "data": _enrich_live_fields(camera)})
     except Exception as e:
         return api_error_response(e, message="Error al obtener cámara")
+
+
+@cameras_bp.route("/<int:camera_id>/sync-time", methods=["POST"])
+@jwt_required()
+@require_camera_permission("view")
+def sync_camera_time_endpoint(camera_id: int):
+    """
+    Empuja la hora del servidor a la cámara por ONVIF (SetSystemDateAndTime).
+    Corrige el reloj/OSD de cámaras desfasadas (XiongMai, etc.).
+    """
+    try:
+        from ...database.repositories.camera_repository import CameraRepository
+        from ...cameras.time_sync import sync_camera_time
+
+        cam = CameraRepository().get_by_id(camera_id)
+        if not cam:
+            return jsonify({"success": False, "error": "Cámara no encontrada"}), 404
+
+        ok = sync_camera_time(cam)
+        if ok:
+            return jsonify({"success": True, "message": "Hora sincronizada con la cámara"}), 200
+        return jsonify({
+            "success": False,
+            "error": "La cámara no aceptó la sincronización (¿soporta ONVIF?)",
+        }), 502
+    except Exception as e:
+        return api_error_response(e, message="Error sincronizando la hora de la cámara")
+
+
+@cameras_bp.route("/<int:camera_id>/webrtc", methods=["POST"])
+@jwt_required()
+@require_camera_permission("view")
+def webrtc_offer(camera_id: int):
+    """
+    Signaling WebRTC (WHEP) — PIPELINE:
+      Paso 1. Cliente autenticado (JWT) con permiso 'view' envía su SDP offer.
+      Paso 2. Validamos que go2rtc + WebRTC estén habilitados.
+      Paso 3. Reenviamos el offer a go2rtc y devolvemos su SDP answer.
+    El medio viaja peer-a-peer; el backend solo autoriza y hace de proxy.
+
+    Acepta el offer como SDP plano (Content-Type: application/sdp) o como
+    JSON {"sdp": "..."} para clientes que prefieran JSON.
+    """
+    try:
+        go2rtc = Go2RtcManager()
+        if not (go2rtc.is_enabled() and settings.WEBRTC_ENABLED):
+            return jsonify({
+                "success": False,
+                "error": "WebRTC no disponible (go2rtc/WEBRTC_ENABLED desactivado)",
+            }), 503
+
+        offer = request.get_data(as_text=True) or ""
+        if offer.lstrip().startswith("{"):
+            payload = request.get_json(silent=True) or {}
+            offer = payload.get("sdp", "")
+
+        answer = webrtc_signaling.exchange(camera_id, offer)
+        return Response(answer, mimetype="application/sdp")
+    except WebRTCSignalingError as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+    except Exception as e:
+        return api_error_response(e, message="Error en signaling WebRTC")
 
 @cameras_bp.route("/", methods=["POST"])
 @jwt_required()
@@ -459,128 +575,21 @@ def stream_latency(camera_id: int):
     del GOP de la cámara (ajustar en su panel web a ≤30) o de la red.
     """
     try:
-        stream = request.args.get("stream", "main")
-        from backend.app.streaming.mjpeg_streamer import mjpeg_streamer as ms
-
+        # El directo ya no pasa por el backend (lo sirve go2rtc por WebRTC/RTSP),
+        # así que aquí solo reportamos el estado del FFmpegWorker (que decodifica
+        # para la IA). La latencia de vídeo se mide ahora en el cliente (VLC) o
+        # en el dashboard de go2rtc.
         cm = CameraManager()
         worker = cm.get_worker(camera_id)
         worker_info = worker.get_status() if worker else None
-
-        mjpeg = ms.get_latency_stats(camera_id, stream)
-
-        # Sugerencia rápida según los datos.
-        # IMPORTANTE: frame_age mide SOLO la latencia interna del backend
-        # (captura → encoder → enviado al socket). NO incluye TCP buffering,
-        # serialización Flask, ni latencia del cliente. Si VLC abre la misma
-        # cámara y va fluido pero la app va lenta, el delay está entre el
-        # socket TCP del backend y la pantalla del cliente Qt (no en la cámara).
-        hint = "OK"
-        age_max = (mjpeg.get("frame_age") or {}).get("max_ms")
-        enc_max = (mjpeg.get("encode") or {}).get("max_ms")
-        if age_max is None:
-            hint = "Sin tráfico — abre el stream al menos 30s para tener muestras"
-        elif age_max > 1500:
-            hint = ("frame_age alto: cuello en el backend (CPU saturada por "
-                    "IA/recording, o encode JPEG lento)")
-        elif age_max > 500:
-            hint = ("frame_age moderado: probablemente IA o grabación "
-                    "compiten por CPU")
-        elif enc_max and enc_max > 50:
-            hint = "encode JPEG lento: revisa MJPEG_MAX_WIDTH/MJPEG_QUALITY"
-        else:
-            hint = ("Backend interno fluido. Si VLC va fluido y la app no, "
-                    "el delay está en el cliente Qt o en el TCP entre backend "
-                    "y cliente (verifica TCP_NODELAY y direct_passthrough).")
-
         return jsonify({
             "success": True,
             "data": {
-                "mjpeg": mjpeg,
                 "worker": worker_info,
-                "hint": hint,
+                "hint": ("La latencia del directo se mide en el cliente/go2rtc. "
+                         "Si hay lag, baja el GOP de la cámara o usa calidad Media/Baja."),
             }
         }), 200
     except Exception as e:
         logger.error(f"Error en latency: {e}", exc_info=True)
         return jsonify({"success": False, "error": "Error interno del servidor"}), 500
-
-
-# FIX F0.5 + NUEVO: Endpoint de streaming con soporte para lentes duales
-@cameras_bp.route("/<int:camera_id>/stream", methods=["GET"])
-def get_camera_stream(camera_id: int):
-    """
-    Endpoint de streaming MJPEG con validación de token y permisos de cámara.
-    Soporta parámetro 'type': main (default), l1, l2 para cámaras dual-lens.
-    """
-    try:
-        # 1. Obtener tipo de stream (main, l1, l2)
-        stream_type = request.args.get("type", "main")
-        
-        # Validar tipo permitido
-        if stream_type not in ("main", "l1", "l2"):
-            return jsonify({"success": False, "error": "Tipo de stream inválido. Use main, l1 o l2"}), 400
-
-        # 2. Validación de Token obligatoria
-        token = request.args.get("token")
-        if not token:
-            return jsonify({"success": False, "error": "Token requerido"}), 401
-        
-        try:
-            decoded = decode_token(token)
-            user_id = int(decoded['sub'])  # 'sub' es el identity (user_id)
-        except Exception as e:
-            logger.warning(f"Token inválido en stream cámara {camera_id}: {e}")
-            return jsonify({"success": False, "error": "Token inválido"}), 401
-
-        # 3. Verificar permiso 'view' sobre la cámara (el permiso es para la cámara física, no por lente)
-        permission_service = PermissionService()
-        if not permission_service.check_permission(user_id, camera_id, 'view'):
-            logger.warning(f"Usuario {user_id} intentó acceder a stream cámara {camera_id} sin permiso")
-            return jsonify({"success": False, "error": "Permiso denegado para esta cámara"}), 403
-
-        # 4. Generar ID de cliente único para esta solicitud
-        # BUG fix: antes era f"http_{int(time.time())}_{id(request)}". El
-        # `id(request)` puede colisionar entre requests concurrentes porque
-        # Python recicla direcciones de memoria. Cuando dos clientes llegaban
-        # con el mismo client_id, el segundo SOBREESCRIBÍA al primero en el
-        # dict del MJPEGStreamer; el primero quedaba huérfano (su queue ya
-        # no estaba en _clients[key], el encoder no le mandaba frames más).
-        # Con uuid4 es imposible que colisionen.
-        import uuid as _uuid
-        client_id = f"http_{_uuid.uuid4().hex}"
-
-        # 5. Registrar cliente en el MJPEG streamer, pasando camera_id y stream_type
-        queue = mjpeg_streamer.register_client(camera_id, stream_type, client_id)
-
-        if queue is None:
-            return jsonify({
-                "success": False, 
-                "error": f"Límite de conexiones alcanzado para el stream {stream_type} de esta cámara (máx 5)"
-            }), 503
-
-        # 6. Retornar la respuesta de streaming
-        # direct_passthrough=True   → CRÍTICO: Flask envía cada `yield` del
-        #                              generator inmediatamente al socket, sin
-        #                              acumular en su buffer interno. Sin esto,
-        #                              Flask agrupaba varios frames antes de
-        #                              hacer flush, añadiendo 100-500ms de delay.
-        # X-Accel-Buffering=no      → evita que nginx/proxies bufferen la
-        #                              respuesta si algún día se pone delante.
-        # Connection: keep-alive    → mantiene la conexión abierta para
-        #                              streaming continuo.
-        return Response(
-            mjpeg_streamer.generate_stream(camera_id, stream_type, client_id),
-            mimetype="multipart/x-mixed-replace; boundary=frame",
-            direct_passthrough=True,
-            headers={
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Error en stream de cámara {camera_id}: {e}")
-        return jsonify({"success": False, "error": "Error interno del servidor de streaming"}), 500

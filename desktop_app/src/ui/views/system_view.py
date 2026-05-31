@@ -117,7 +117,7 @@ class SystemHealthView(QWidget):
 
         # Header
         header = QHBoxLayout()
-        title = QLabel("📊 Estado del Sistema")
+        title = QLabel("Estado del Sistema")
         title.setStyleSheet(
             f"color: {config.THEME_TEXT}; font-size: 22px; font-weight: bold;"
         )
@@ -142,7 +142,7 @@ class SystemHealthView(QWidget):
         hw_box = GlassCard()
         hw_layout = QGridLayout(hw_box)
         hw_layout.setContentsMargins(16, 12, 16, 12)
-        title_hw = QLabel("🖥 Hardware del servidor")
+        title_hw = QLabel("Hardware del servidor")
         title_hw.setStyleSheet(
             f"color: {config.THEME_ACCENT}; font-weight: bold; font-size: 14px;"
         )
@@ -164,7 +164,7 @@ class SystemHealthView(QWidget):
         cams_box = GlassCard()
         cams_layout = QVBoxLayout(cams_box)
         cams_layout.setContentsMargins(16, 12, 16, 12)
-        title_cams = QLabel("📷 Estado por cámara")
+        title_cams = QLabel("Estado por cámara")
         title_cams.setStyleSheet(
             f"color: {config.THEME_ACCENT}; font-weight: bold; font-size: 14px;"
         )
@@ -208,7 +208,7 @@ class SystemHealthView(QWidget):
         """Polling de salud + estadísticas (cada 3s)."""
         def on_health(response):
             if not response.success:
-                self.lbl_last_update.setText("⚠ Sin conexión")
+                self.lbl_last_update.setText("Sin conexión")
                 return
             from datetime import datetime
             self.lbl_last_update.setText(
@@ -262,7 +262,7 @@ class SystemHealthView(QWidget):
 
             status = c.get("status", "?")
             it_status = QTableWidgetItem(
-                "🟢 Activa" if status == "healthy" else "🔴 Sin frames"
+                "Activa" if status == "healthy" else "Sin frames"
             )
             it_status.setForeground(QBrush(QColor(
                 "#22c55e" if status == "healthy" else "#ef4444"

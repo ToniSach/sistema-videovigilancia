@@ -13,6 +13,20 @@ from PySide6.QtCore import QObject, Signal, QThread, QTimer
 logger = logging.getLogger(__name__)
 
 
+# ── Instancia VLC ÚNICA compartida ──────────────────────────────────────────
+# Tener varias vlc.Instance() con salida de vídeo por HWND en Windows provoca
+# crashes nativos (la app "se cierra sola"). Compartimos una sola instancia
+# para todos los reproductores; las opciones específicas van por media.
+_shared_vlc_instance = None
+
+
+def _get_shared_vlc_instance():
+    global _shared_vlc_instance
+    if _shared_vlc_instance is None:
+        _shared_vlc_instance = vlc.Instance(["--quiet", "--no-video-title-show"])
+    return _shared_vlc_instance
+
+
 @dataclass
 class PlaybackState:
     """Estado del reproductor."""
@@ -35,12 +49,21 @@ class VLCPlayer(QObject):
     def __init__(self, config_options: list = None):
         super().__init__()
 
-        # Inicializar VLC
-        if config_options is None:
-            config_options = ['--quiet', '--no-video-title-show']
-
-        self.instance = vlc.Instance(config_options)
+        # UNA sola vlc.Instance COMPARTIDA por todos los reproductores
+        # (directo l1/l2, control, grabaciones). Crear varias vlc.Instance con
+        # render por HWND en Windows provoca crashes nativos al reproducir.
+        # Las opciones por-reproductor (network-caching, rtsp-tcp...) se aplican
+        # a nivel de MEDIA en play_url, no a nivel de instancia.
+        self.instance = _get_shared_vlc_instance()
         self.player = self.instance.media_player_new()
+
+        # Opciones de media derivadas de config_options (sin las de instancia).
+        self._media_opts: list[str] = []
+        for opt in (config_options or []):
+            o = opt.lstrip("-").strip()
+            if not o or o in ("quiet",) or o.startswith("no-video-title-show"):
+                continue  # ya están a nivel de instancia compartida
+            self._media_opts.append(o)  # ej: "network-caching=150", "rtsp-tcp"
 
         # Timer LAZY: se crea cuando arranca la primera reproducción,
         # NO en __init__. Motivo: VLCPlayer() puede instanciarse al
@@ -67,7 +90,12 @@ class VLCPlayer(QObject):
             self.player.stop()
 
             media = self.instance.media_new(url)
-            media.add_option("network-caching=300")
+            # Opciones a nivel de media (por reproductor). Si no se especificó
+            # network-caching, usar 300ms por defecto (VOD).
+            if not any(o.startswith("network-caching") for o in self._media_opts):
+                media.add_option(":network-caching=300")
+            for o in self._media_opts:
+                media.add_option(f":{o}")
             self.player.set_media(media)
             self._current_media = media
 
@@ -85,8 +113,25 @@ class VLCPlayer(QObject):
         if not os.path.exists(file_path):
             self.error.emit(f"Archivo no existe: {file_path}")
             return
-        
-        self.play_url(f"file://{file_path}")
+        # Path.as_uri() genera file:///C:/... correcto en Windows. Antes se usaba
+        # f"file://{path}" → file://C:\... (URI malformada) y VLC no abría el
+        # archivo (panel negro aunque el .mp4 estuviera descargado).
+        from pathlib import Path
+        self.play_url(Path(file_path).as_uri())
+
+    def get_video_size(self):
+        """(w, h) del vídeo en reproducción, o (0, 0) si no disponible aún."""
+        try:
+            return self.player.video_get_size(0)
+        except Exception:
+            return (0, 0)
+
+    def set_crop(self, geometry):
+        """Recorte de VLC ('WxH+X+Y' o None para quitarlo). Usado por lente."""
+        try:
+            self.player.video_set_crop_geometry(geometry)
+        except Exception:
+            pass
     
     def pause(self):
         """Pausa/Resume."""
