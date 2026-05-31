@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Paleta CamLink replicada de desktop_app (config.py):
+    THEME_PRIMARY     #0f172a  slate-900
+    THEME_SECONDARY   #1e293b  slate-800
+    THEME_ACCENT      #38bdf8  sky-400
+    THEME_ACCENT_SECONDARY #818cf8 indigo-400
+    THEME_TEXT        #f1f5f9  slate-100
+    THEME_TEXT_MUTED  #94a3b8  slate-400
+    THEME_DANGER      #ef4444  red-500
+    GLASS_BORDER      rgba(255,255,255,0.10) → #1affffff
+-->
+<resources>
+    <!-- Primary palette (slate oscuro) -->
+    <color name="primary">#0f172a</color>
+    <color name="primary_dark">#020617</color>
+    <color name="accent_red">#ef4444</color>
+
+    <!-- Backgrounds -->
+    <color name="background">#0f172a</color>
+    <color name="surface">#1e293b</color>
+
+    <!-- Text -->
+    <color name="text_primary">#f1f5f9</color>
+    <color name="text_secondary">#94a3b8</color>
+
+    <!-- Feed / camera overlay -->
+    <color name="camera_bg">#020617</color>
+    <color name="overlay_dark">#cc020617</color>
+
+    <!-- Tokens del tema desktop (acentos y glass) -->
+    <color name="accent_cyan">#38bdf8</color>
+    <color name="accent_indigo">#818cf8</color>
+    <color name="accent_danger">#ef4444</color>
+    <color name="glass_border">#1affffff</color>
+    <color name="glass_border_strong">#33ffffff</color>
+    <color name="card_bg">#1e293b</color>
+</resources>

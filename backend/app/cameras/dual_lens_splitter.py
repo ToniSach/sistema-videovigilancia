@@ -62,10 +62,17 @@ class DualLensSplitter:
                 # División vertical del frame (izquierda/derecha)
                 # Divide el ancho (width) por la mitad
                 mid = width // 2
-                
-                # Extraer mitades
-                left_half = frame[:, :mid, :].copy() if len(frame.shape) == 3 else frame[:, :mid].copy()
-                right_half = frame[:, mid:, :].copy() if len(frame.shape) == 3 else frame[:, mid:].copy()
+
+                # Views (sin copy): el frame entrante ya viene como una copia
+                # del distributor (needs_copy=True), así que podemos crear
+                # views de sus mitades sin copiar de nuevo. Esto ahorra ~5MB
+                # de memcpy por frame en cámaras de alta resolución.
+                if len(frame.shape) == 3:
+                    left_half = frame[:, :mid, :]
+                    right_half = frame[:, mid:, :]
+                else:
+                    left_half = frame[:, :mid]
+                    right_half = frame[:, mid:]
                 
                 # CORRECCIÓN: Por defecto intercambiamos porque las cámaras dual-lens
                 # típicamente entregan el frame espejado
@@ -89,9 +96,14 @@ class DualLensSplitter:
                 # División horizontal del frame (arriba/abajo)
                 # Divide el alto (height) por la mitad
                 mid = height // 2
-                
-                top_half = frame[:mid, :, :].copy() if len(frame.shape) == 3 else frame[:mid, :].copy()
-                bottom_half = frame[mid:, :, :].copy() if len(frame.shape) == 3 else frame[mid:, :].copy()
+
+                # Views sin copy (ver explicación en la rama horizontal)
+                if len(frame.shape) == 3:
+                    top_half = frame[:mid, :, :]
+                    bottom_half = frame[mid:, :, :]
+                else:
+                    top_half = frame[:mid, :]
+                    bottom_half = frame[mid:, :]
                 
                 if self.swap_lenses:
                     # En modo vertical, "swap" intercambia arriba/abajo

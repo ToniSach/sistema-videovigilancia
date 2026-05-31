@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Badge oval celeste con texto encima — N de no-leidas -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/accent_cyan" />
+    <corners android:radius="999dp" />
+</shape>

@@ -27,36 +27,46 @@ class ConsistencyChecker:
     
     CHECK_INTERVAL = 86400  # 24 horas
     AUTO_CLEANUP = True      # Si True, elimina registros huérfanos y archivos no indexados
-    
+    BATCH_SIZE = 200         # Procesar registros en lotes para no bloquear BD
+
     def __init__(self):
         self._recording_repo = RecordingRepository()
         self._recordings_path = Path(settings.RECORDINGS_PATH)
-        self._running = False
+        # Event en lugar de bool: shutdown despierta el thread al instante
+        # (antes había que esperar hasta 24h al próximo CHECK_INTERVAL).
+        self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
-        
+
+    @property
+    def _running(self) -> bool:
+        """Compat: algunos consumidores leen _running."""
+        return self._thread is not None and not self._stop_event.is_set()
+
     def start(self):
         """Inicia el checker en segundo plano."""
-        if self._running:
+        if self._thread and self._thread.is_alive():
             return
-        self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._check_loop, daemon=True)
         self._thread.start()
         logger.info("ConsistencyChecker iniciado")
-    
+
     def stop(self):
-        self._running = False
+        self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         logger.info("ConsistencyChecker detenido")
-    
+
     def _check_loop(self):
-        while self._running:
+        while not self._stop_event.is_set():
             try:
                 self.run_check()
             except Exception as e:
-                logger.error(f"Error en consistency check: {e}")
-            time.sleep(self.CHECK_INTERVAL)
+                logger.error(f"Error en consistency check: {e}", exc_info=True)
+            # wait() devuelve True si stop_event se setea → salida inmediata
+            if self._stop_event.wait(timeout=self.CHECK_INTERVAL):
+                break
     
     def run_check(self) -> dict:
         """
@@ -73,36 +83,60 @@ class ConsistencyChecker:
             "errors": 0
         }
         
-        # 1. Verificar registros huérfanos (BD apunta a archivo inexistente)
+        # 1. Verificar registros huérfanos (BD apunta a archivo inexistente).
+        # Procesamos en LOTES con commit cada N para no mantener una transacción
+        # abierta hora(s) sobre toda la tabla (bloqueaba writes concurrentes).
         try:
-            with db_manager.get_session() as session:
-                recordings = session.query(Recording).all()
-                for rec in recordings:
-                    if rec.file_path and not os.path.exists(rec.file_path):
-                        stats["orphan_records"] += 1
-                        logger.warning(f"Registro huérfano: Recording {rec.id} - archivo {rec.file_path} no existe")
-                        if self.AUTO_CLEANUP:
-                            try:
-                                session.delete(rec)
-                                stats["cleaned_records"] += 1
-                                logger.info(f"Registro huérfano eliminado: {rec.id}")
-                            except Exception as e:
-                                logger.error(f"Error eliminando registro {rec.id}: {e}")
-                                stats["errors"] += 1
-                session.commit()
+            offset = 0
+            while not self._stop_event.is_set():
+                with db_manager.get_session() as session:
+                    batch = (
+                        session.query(Recording)
+                        .order_by(Recording.id)
+                        .limit(self.BATCH_SIZE)
+                        .offset(offset)
+                        .all()
+                    )
+                    if not batch:
+                        break
+
+                    deleted_in_batch = 0
+                    for rec in batch:
+                        if rec.file_path and not os.path.exists(rec.file_path):
+                            stats["orphan_records"] += 1
+                            logger.warning(
+                                f"Registro huérfano: Recording {rec.id} - "
+                                f"archivo {rec.file_path} no existe"
+                            )
+                            if self.AUTO_CLEANUP:
+                                try:
+                                    session.delete(rec)
+                                    deleted_in_batch += 1
+                                    stats["cleaned_records"] += 1
+                                except Exception as e:
+                                    logger.error(f"Error eliminando registro {rec.id}: {e}")
+                                    stats["errors"] += 1
+                    # Commit por lote — libera locks BD
+                    session.commit()
+
+                # Avanzar offset compensando lo borrado en este lote
+                offset += len(batch) - deleted_in_batch
+                if len(batch) < self.BATCH_SIZE:
+                    break
         except Exception as e:
-            logger.error(f"Error verificando registros huérfanos: {e}")
+            logger.error(f"Error verificando registros huérfanos: {e}", exc_info=True)
             stats["errors"] += 1
-        
+
         # 2. Verificar archivos huérfanos (archivo en disco sin registro en BD)
         try:
-            # Obtener todos los paths de grabaciones desde BD
+            # Obtener TODOS los paths de BD una sola vez (es lectura ligera
+            # comparada con un walk del FS; si crece mucho mover a query con
+            # only(Recording.file_path) para no traer columnas grandes).
             with db_manager.get_session() as session:
-                db_paths = set()
-                recordings = session.query(Recording).all()
-                for rec in recordings:
-                    if rec.file_path:
-                        db_paths.add(os.path.abspath(rec.file_path))
+                db_paths = {
+                    os.path.abspath(p) for (p,) in
+                    session.query(Recording.file_path).all() if p
+                }
             
             # Recorrer directorio de grabaciones
             if self._recordings_path.exists():

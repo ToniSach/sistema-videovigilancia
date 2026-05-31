@@ -42,7 +42,10 @@ class Config:
     # BACKEND
     # ==============================
     API_BASE_URL: str = "http://localhost:5000/api/v1"
-    TIMEOUT: int = 30
+    # Timeout HTTP. 60s permite que GETs como /cameras/discover (que puede
+    # tardar 15-30s con subnet scan) y operaciones de DB densas sobrevivan
+    # picos de carga del backend (reinicio de FFmpeg, etc.).
+    TIMEOUT: int = 60
     
     # ==============================
     # VIDEO

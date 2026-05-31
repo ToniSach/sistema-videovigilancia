@@ -26,8 +26,37 @@ class Settings:
             # ==============================
             # SEGURIDAD
             # ==============================
-            self.SECRET_KEY: str = os.getenv("SECRET_KEY", "default-secret-key-change-in-production")
-            self.JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "default-jwt-secret-change-immediately")
+            # En dev se aceptan defaults para no romper el primer arranque;
+            # en producción exigimos secrets explícitos. El switch lo controla
+            # APP_ENV=production. ALLOW_DEFAULT_SECRETS=true es un override
+            # explícito para desarrolladores que entienden el riesgo.
+            _default_secret = "default-secret-key-change-in-production"
+            _default_jwt = "default-jwt-secret-change-immediately"
+            self.SECRET_KEY: str = os.getenv("SECRET_KEY", _default_secret)
+            self.JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", _default_jwt)
+
+            _is_prod = os.getenv("APP_ENV", "development").lower() == "production"
+            _allow_default = os.getenv("ALLOW_DEFAULT_SECRETS", "").lower() == "true"
+            if _is_prod and not _allow_default:
+                if self.SECRET_KEY == _default_secret:
+                    raise RuntimeError(
+                        "SECRET_KEY no configurada en producción. "
+                        "Define SECRET_KEY en .env con un valor único (>=32 chars). "
+                        "Para forzar default en dev: ALLOW_DEFAULT_SECRETS=true"
+                    )
+                if self.JWT_SECRET_KEY == _default_jwt:
+                    raise RuntimeError(
+                        "JWT_SECRET_KEY no configurada en producción. "
+                        "Define JWT_SECRET_KEY en .env con un valor único (>=32 chars). "
+                        "Para forzar default en dev: ALLOW_DEFAULT_SECRETS=true"
+                    )
+            elif self.SECRET_KEY == _default_secret or self.JWT_SECRET_KEY == _default_jwt:
+                # Warning visible en dev para que no se olvide al desplegar
+                logger.warning(
+                    "[SEGURIDAD] Usando secrets por defecto. Genera valores "
+                    "únicos antes de producción: "
+                    "python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+                )
             
             # ==============================
             # BASE DE DATOS (PostgreSQL)
@@ -47,7 +76,16 @@ class Settings:
             # ALMACENAMIENTO
             # ==============================
             self.RECORDINGS_PATH: str = os.getenv("RECORDINGS_PATH", "recordings")
-            self.MAX_STORAGE_GB: float = float(os.getenv("MAX_STORAGE_GB", "50.0"))
+            # Default 1GB para evitar llenar el disco en desarrollo/demo.
+            # En producción típica: 50-500GB según el cliente.
+            self.MAX_STORAGE_GB: float = float(os.getenv("MAX_STORAGE_GB", "1.0"))
+
+            # Auto-iniciar grabación continua en cuanto arranca cada cámara.
+            # Estándar en NVRs comerciales (Hikvision, Dahua, etc.).
+            # Ponlo en "false" si prefieres iniciar la grabación manualmente.
+            self.AUTO_START_RECORDING: bool = (
+                os.getenv("AUTO_START_RECORDING", "true").lower() == "true"
+            )
             
             # NUEVO: límite de tamaño de archivos de grabación (split automático)
             self.RECORDING_MAX_FILE_SIZE: int = int(
@@ -68,7 +106,30 @@ class Settings:
             # NUEVOS LÍMITES CRÍTICOS (NVR)
             self.MAX_CONCURRENT_FFMPEG: int = int(os.getenv("MAX_CONCURRENT_FFMPEG", "4"))
             self.MAX_AI_INFERENCE_QUEUE: int = int(os.getenv("MAX_AI_INFERENCE_QUEUE", "10"))
-            self.MAX_MJPEG_CLIENTS_PER_CAMERA: int = int(os.getenv("MAX_MJPEG_CLIENTS_PER_CAMERA", "5"))
+            # 25 por defecto para soportar test de carga sin tener que tocar
+            # .env. Cada conexión MJPEG ocupa un hilo del WSGI server; 25 es
+            # razonable en hardware modesto. Subir si quieres más clientes.
+            self.MAX_MJPEG_CLIENTS_PER_CAMERA: int = int(os.getenv("MAX_MJPEG_CLIENTS_PER_CAMERA", "25"))
+
+            # ==============================
+            # CALIDAD DE STREAMING MJPEG
+            # ==============================
+            # max_width: ancho máximo del JPEG enviado al cliente.
+            #    640 → super rápido y baja calidad
+            #    960 → buen equilibrio (recomendado)
+            #   1280 → alta calidad pero más CPU
+            # quality: calidad JPEG (0-100).
+            #    75 → ~40% menos bytes que 85, diferencia perceptual imperceptible
+            #          en streaming en vivo. Mejor latencia.
+            #    85 → calidad de foto, innecesario para preview de cámara
+            self.MJPEG_MAX_WIDTH: int = int(os.getenv("MJPEG_MAX_WIDTH", "960"))
+            self.MJPEG_QUALITY: int = int(os.getenv("MJPEG_QUALITY", "75"))
+            # Cap de FPS para el encoder MJPEG. El cliente pull-based consume
+            # a ~15fps; si la cámara entrega passthrough a 60fps, sin cap
+            # estaríamos quemando 4× CPU en JPEGs que el cliente descarta.
+            # Bajar a 10 si la CPU sigue cargada; subir a 25 si tu cliente
+            # tiene monitor >60Hz y notas saltos.
+            self.MJPEG_TARGET_FPS: float = float(os.getenv("MJPEG_TARGET_FPS", "15"))
             
             # ==============================
             # CONFIGURACIÓN AI/HARDWARE
@@ -77,7 +138,60 @@ class Settings:
             self.USE_GPU_AI: str = os.getenv("USE_GPU_AI", "auto")
             # ai_backend: "auto", "cuda", "cpu"
             self.AI_BACKEND: str = os.getenv("AI_BACKEND", "auto")
+
+            # Umbral de confianza YOLO (0.0-1.0). Default 0.35 — bajo a propósito
+            # porque con dual-lens los frames son 960x540, las personas a
+            # distancia salen pequeñas y 0.45 era demasiado restrictivo.
+            # Sube a 0.50+ si tienes muchos falsos positivos.
+            self.AI_CONFIDENCE: float = float(os.getenv("AI_CONFIDENCE", "0.35"))
+
+            # Intervalo de inferencia: 1 cada N frames (a 15fps).
+            # low_cpu=5 → 3 inferencias/s; suficiente para detectar a una
+            # persona caminando (cruzar el FOV típico tarda 2-4s).
+            # high_quality=3 → 5/s para escenas con movimiento rápido.
+            # Bajar a 3 fps libera CPU para que el encoder MJPEG no compita
+            # → menos contención de hilos en GlobalExecutor → menor delay
+            # percibido en live preview.
+            self.AI_INFERENCE_INTERVAL_LOW: int = int(
+                os.getenv("AI_INFERENCE_INTERVAL_LOW", "5")
+            )
+            self.AI_INFERENCE_INTERVAL_HIGH: int = int(
+                os.getenv("AI_INFERENCE_INTERVAL_HIGH", "3")
+            )
+
+            # Sensibilidad motion detector (0.0-1.0). Default 0.015 = 1.5%
+            # de pixeles cambiados → más sensible que el 0.02 anterior.
+            self.AI_MOTION_SENSITIVITY: float = float(
+                os.getenv("AI_MOTION_SENSITIVITY", "0.015")
+            )
+
+            # Cooldown entre alertas de la misma clase (segundos).
+            # 30s es el default razonable para producción: una persona que
+            # cruza el FOV genera 1 alerta, no decenas. Con cooldown=0
+            # (modo test) el flood de eventos satura GlobalExecutor con
+            # tareas de cv2.imwrite + HTTP a Telegram (~2s c/u) + splice
+            # ffmpeg, y la encoder MJPEG queda esperando en cola → la
+            # live se ve "saltada" porque los frames llegan en ráfagas.
+            self.AI_EVENT_COOLDOWN_SECONDS: int = int(
+                os.getenv("AI_EVENT_COOLDOWN_SECONDS", "30")
+            )
             
+            # ==============================
+            # RTSP TRANSPORT
+            # ==============================
+            # tcp  → fiable contra packet loss, MÁS LATENCIA (~200-500ms más)
+            # udp  → menor latencia (-100 a -300ms), pero glitches visibles
+            #         si la red WiFi es inestable. Recomendado solo en LAN
+            #         cableada o WiFi 5GHz sin saturación.
+            # Cambio el default: tcp (seguro). Para probar UDP poner en .env:
+            #   RTSP_TRANSPORT=udp
+            self.RTSP_TRANSPORT: str = os.getenv("RTSP_TRANSPORT", "tcp").lower()
+            if self.RTSP_TRANSPORT not in ("tcp", "udp"):
+                logger.warning(
+                    f"RTSP_TRANSPORT inválido '{self.RTSP_TRANSPORT}', usando 'tcp'"
+                )
+                self.RTSP_TRANSPORT = "tcp"
+
             # ==============================
             # FFMPEG OPTIMIZACIÓN (720p15 por defecto)
             # ==============================
@@ -85,10 +199,15 @@ class Settings:
             self.FFMPEG_RESOLUTION_HEIGHT: int = int(os.getenv("FFMPEG_RESOLUTION_HEIGHT", "720"))
             self.FFMPEG_FPS: int = int(os.getenv("FFMPEG_FPS", "15"))
 
-            # DUAL LENS: resolución del stream completo antes del split
-            # Si tu cámara transmite 1280x1440 (dos lentes de 720 cada uno)
-            self.FFMPEG_DUAL_LENS_WIDTH: int = int(os.getenv("FFMPEG_DUAL_LENS_WIDTH", "1280"))
-            self.FFMPEG_DUAL_LENS_HEIGHT: int = int(os.getenv("FFMPEG_DUAL_LENS_HEIGHT", "1440"))
+            # DUAL LENS: resolución del stream completo ANTES del split.
+            # Por defecto bajamos a 960x1080 (per lens 960x540) para reducir
+            # la carga del pipeline (memcpy en Python). Cada 5.5MB por frame se
+            # convierten en ~1.5MB → 4x menos work.
+            # Para mayor calidad (con CPU disponible) puedes subirlo en .env:
+            #   FFMPEG_DUAL_LENS_WIDTH=1280
+            #   FFMPEG_DUAL_LENS_HEIGHT=1440
+            self.FFMPEG_DUAL_LENS_WIDTH: int = int(os.getenv("FFMPEG_DUAL_LENS_WIDTH", "960"))
+            self.FFMPEG_DUAL_LENS_HEIGHT: int = int(os.getenv("FFMPEG_DUAL_LENS_HEIGHT", "1080"))
             
             # ==============================
             # TELEGRAM

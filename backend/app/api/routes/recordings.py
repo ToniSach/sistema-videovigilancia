@@ -2,6 +2,7 @@
 API Endpoints para grabaciones con timeline, playback streaming y descarga.
 """
 import os
+import logging
 import mimetypes
 from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify, send_file, Response
@@ -11,6 +12,7 @@ from backend.app.services.permission_service import PermissionService
 from backend.app.database.repositories.recording_repository import RecordingRepository
 from backend.app.config import settings
 
+logger = logging.getLogger(__name__)
 recordings_bp = Blueprint("recordings", __name__, url_prefix="/api/v1/recordings")
 permission_service = PermissionService()
 
@@ -97,16 +99,24 @@ def get_timeline():
         repo = get_recording_repo()
         recordings = repo.get_by_date_range(camera_id, start_dt, end_dt)
         
-        # Formatear como segmentos
+        # Formatear como segmentos. `has_clip` indica si es grabación de
+        # evento (carpeta /events/) vs continua (carpeta /continuous/);
+        # antes leía rec.clip_path que NO existe en Recording → AttributeError
+        # → 500 → la vista de Reproducción aparecía vacía.
         segments = []
         for rec in recordings:
+            file_path_lower = (rec.file_path or "").lower()
+            is_event_clip = "events" in file_path_lower.replace("\\", "/").split("/")
             segments.append({
                 "recording_id": rec.id,
-                "start": rec.start_time.isoformat(),
-                "end": rec.end_time.isoformat() if rec.end_time else rec.start_time.isoformat(),
-                "duration_seconds": rec.duration_seconds,
-                "file_size_mb": rec.file_size_bytes / (1024*1024),
-                "has_clip": rec.clip_path is not None
+                "start": rec.start_time.isoformat() if rec.start_time else None,
+                "end": rec.end_time.isoformat() if rec.end_time else (
+                    rec.start_time.isoformat() if rec.start_time else None
+                ),
+                "duration_seconds": rec.duration_seconds or 0,
+                "file_size_mb": round((rec.file_size_bytes or 0) / (1024*1024), 2),
+                "has_clip": True,  # todas las grabaciones tienen archivo
+                "type": "event" if is_event_clip else "continuous",
             })
         
         return jsonify({
@@ -120,7 +130,7 @@ def get_timeline():
         }), 200
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @recordings_bp.route("/play/<int:recording_id>", methods=["GET"])
@@ -133,22 +143,54 @@ def play_recording(recording_id):
         user_id = int(get_jwt_identity())
         repo = get_recording_repo()
         recording = repo.get_by_id(recording_id)
-        
+
         if not recording:
+            logger.warning(f"[PLAY] recording_id={recording_id} no existe en BD")
             return jsonify({"success": False, "error": "Grabación no encontrada"}), 404
-        
+
         # Verificar permisos
         if not permission_service.check_permission(user_id, recording.camera_id, 'view'):
+            logger.warning(
+                f"[PLAY] user={user_id} sin permiso 'view' en cam {recording.camera_id}"
+            )
             return jsonify({"success": False, "error": "Permiso denegado"}), 403
-        
-        if not recording.file_path or not os.path.exists(recording.file_path):
-            return jsonify({"success": False, "error": "Archivo no encontrado en disco"}), 404
-        
-        file_path = recording.file_path
+
+        # Resolver path: si es relativo, hacerlo absoluto desde el CWD del backend.
+        file_path = recording.file_path or ""
+        if file_path and not os.path.isabs(file_path):
+            file_path = os.path.abspath(file_path)
+
+        if not file_path or not os.path.exists(file_path):
+            logger.error(
+                f"[PLAY] archivo no existe en disco: recording_id={recording_id} "
+                f"file_path={recording.file_path!r} resolved={file_path!r} "
+                f"cwd={os.getcwd()!r}"
+            )
+            return jsonify({
+                "success": False,
+                "error": "Archivo no encontrado en disco",
+                "file_path_db": recording.file_path,
+            }), 404
+
         file_size = os.path.getsize(file_path)
+        if file_size < 1024:
+            logger.error(
+                f"[PLAY] archivo demasiado pequeño ({file_size}B), probablemente "
+                f"corrupto: {file_path}"
+            )
+            return jsonify({
+                "success": False,
+                "error": f"Archivo corrupto o vacío ({file_size} bytes)"
+            }), 422
+
         mime_type, _ = mimetypes.guess_type(file_path)
         if not mime_type:
             mime_type = "video/mp4"
+
+        logger.info(
+            f"[PLAY] rec={recording_id} cam={recording.camera_id} "
+            f"size={file_size} mime={mime_type} range={request.headers.get('Range', 'none')}"
+        )
         
         # Manejar Range Requests (para seek)
         range_header = request.headers.get('Range', None)
@@ -164,18 +206,23 @@ def play_recording(recording_id):
                 end = file_size - 1
             
             length = end - start + 1
-            
-            def generate():
+
+            # BUG FIX: usar variable local distinta dentro del generador.
+            # Antes `length -= len(data)` hacía a `length` local de generate()
+            # y el primer `while length > 0` lanzaba UnboundLocalError →
+            # cliente recibía 500 al intentar reproducir con Range header.
+            def generate(initial_length=length):
+                remaining = initial_length
                 with open(file_path, 'rb') as f:
                     f.seek(start)
-                    while length > 0:
-                        chunk_size = min(8192, length)
+                    while remaining > 0:
+                        chunk_size = min(8192, remaining)
                         data = f.read(chunk_size)
                         if not data:
                             break
-                        length -= len(data)
+                        remaining -= len(data)
                         yield data
-            
+
             response = Response(
                 generate(),
                 206,  # Partial Content
@@ -197,7 +244,7 @@ def play_recording(recording_id):
             )
             
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @recordings_bp.route("/download/<int:recording_id>", methods=["GET"])
@@ -227,7 +274,7 @@ def download_recording(recording_id):
         )
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @recordings_bp.route("/<int:recording_id>", methods=["DELETE"])
@@ -258,7 +305,7 @@ def delete_recording(recording_id):
         return jsonify({"success": True}), 200
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
     
 from backend.app.streaming.hls_service import hls_service
 
@@ -297,7 +344,80 @@ def get_hls_manifest(recording_id):
         )
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
+
+
+# ---------------------------------------------------------------------------
+# Control manual de grabación continua (start/stop por cámara)
+# ---------------------------------------------------------------------------
+def _get_recording_manager():
+    from backend.app.container import get_container
+    mgr = get_container().get("recording_manager")
+    if mgr is None:
+        raise RuntimeError("RecordingManager no disponible en el contenedor")
+    return mgr
+
+
+@recordings_bp.route("/manual/start/<int:camera_id>", methods=["POST"])
+@jwt_required()
+def start_manual_recording(camera_id: int):
+    """Inicia grabación continua de la cámara hasta que se detenga."""
+    try:
+        user_id = int(get_jwt_identity())
+        if not permission_service.check_permission(user_id, camera_id, 'view'):
+            return jsonify({"success": False, "error": "Permiso denegado"}), 403
+
+        mgr = _get_recording_manager()
+        ok = mgr.start_continuous_recording(camera_id)
+        if not ok:
+            return jsonify({
+                "success": False,
+                "error": "Ya hay una grabación continua activa para esta cámara"
+            }), 409
+        return jsonify({"success": True, "data": {"camera_id": camera_id, "recording": True}}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
+
+
+@recordings_bp.route("/manual/stop/<int:camera_id>", methods=["POST"])
+@jwt_required()
+def stop_manual_recording(camera_id: int):
+    """Detiene la grabación continua de la cámara."""
+    try:
+        user_id = int(get_jwt_identity())
+        if not permission_service.check_permission(user_id, camera_id, 'view'):
+            return jsonify({"success": False, "error": "Permiso denegado"}), 403
+
+        mgr = _get_recording_manager()
+        ok = mgr.stop_continuous_recording(camera_id)
+        if not ok:
+            return jsonify({
+                "success": False,
+                "error": "No había grabación activa"
+            }), 404
+        return jsonify({"success": True, "data": {"camera_id": camera_id, "recording": False}}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
+
+
+@recordings_bp.route("/manual/status/<int:camera_id>", methods=["GET"])
+@jwt_required()
+def manual_recording_status(camera_id: int):
+    try:
+        user_id = int(get_jwt_identity())
+        if not permission_service.check_permission(user_id, camera_id, 'view'):
+            return jsonify({"success": False, "error": "Permiso denegado"}), 403
+
+        mgr = _get_recording_manager()
+        return jsonify({
+            "success": True,
+            "data": {
+                "camera_id": camera_id,
+                "recording": mgr.is_recording_continuous(camera_id),
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @recordings_bp.route("/<int:recording_id>/hls/<path:filename>", methods=["GET"])
@@ -327,4 +447,4 @@ def get_hls_segment(recording_id, filename):
         )
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500

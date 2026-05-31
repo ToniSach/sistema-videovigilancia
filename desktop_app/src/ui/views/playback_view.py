@@ -41,7 +41,36 @@ class PlaybackView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
-        
+
+        # Título + botón de ayuda
+        title_row = QHBoxLayout()
+        title_lbl = QLabel("⏯  Reproducción de grabaciones")
+        title_lbl.setStyleSheet(
+            f"color: {config.THEME_TEXT}; font-size: 22px; font-weight: bold;"
+        )
+        title_row.addWidget(title_lbl)
+        try:
+            from desktop_app.src.ui.components.help_button import HelpButton
+            title_row.addWidget(HelpButton("playback_view", parent=self))
+        except Exception:
+            pass
+        title_row.addStretch()
+        layout.addLayout(title_row)
+
+        # Banner explicativo
+        info_banner = QLabel(
+            "<i>Aquí ves todas las grabaciones de cada cámara: continuas "
+            "(segmentos de 2 min sin parar) y de eventos. Elige cámara, "
+            "fecha y pulsa «Cargar Timeline».</i>"
+        )
+        info_banner.setWordWrap(True)
+        info_banner.setStyleSheet(
+            f"color: {config.THEME_TEXT_MUTED}; font-size: 11px; "
+            f"padding: 8px 12px; background-color: rgba(56, 189, 248, 0.08); "
+            f"border-left: 3px solid {config.THEME_ACCENT}; border-radius: 4px;"
+        )
+        layout.addWidget(info_banner)
+
         # Header controles
         controls = QHBoxLayout()
         
@@ -248,7 +277,7 @@ class PlaybackView(QWidget):
         self.progress_download.setValue(0)
         
         # Obtener token
-        token = api_client.tokens.access_token if api_client.tokens else ""
+        token = api_client.get_stream_token() or ""
         api_url = config.API_BASE_URL
         
         playback_service.play_recording(recording_id, api_url, token)

@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="utf-8"?>
+<navigation
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/nav_graph"
+    app:startDestination="@id/qrScanFragment">
+
+    <fragment
+        android:id="@+id/qrScanFragment"
+        android:name="com.ipn.mx.onvif.ui.QrScanFragment"
+        android:label="QR"
+        tools:layout="@layout/fragment_qr_scan">
+        <action
+            android:id="@+id/action_qr_to_liveView"
+            app:destination="@id/liveViewFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right"
+            app:popUpTo="@id/qrScanFragment"
+            app:popUpToInclusive="true" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/liveViewFragment"
+        android:name="com.ipn.mx.onvif.ui.LiveViewFragment"
+        android:label="En Vivo"
+        tools:layout="@layout/fragment_live_view">
+        <action
+            android:id="@+id/action_liveView_to_cameraList"
+            app:destination="@id/cameraListFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
+        <action
+            android:id="@+id/action_liveView_to_recordings"
+            app:destination="@id/recordingsFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
+        <action
+            android:id="@+id/action_liveView_to_eventConfig"
+            app:destination="@id/eventConfigFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
+        <argument
+            android:name="cameraId"
+            app:argType="string"
+            android:defaultValue="" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/cameraListFragment"
+        android:name="com.ipn.mx.onvif.ui.CameraListFragment"
+        android:label="Camaras"
+        tools:layout="@layout/fragment_camera_list">
+        <action
+            android:id="@+id/action_cameraList_to_liveView"
+            app:destination="@id/liveViewFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
+        <action
+            android:id="@+id/action_cameraList_to_recordings"
+            app:destination="@id/recordingsFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
+        <action
+            android:id="@+id/action_cameraList_to_eventConfig"
+            app:destination="@id/eventConfigFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/recordingsFragment"
+        android:name="com.ipn.mx.onvif.ui.RecordingsFragment"
+        android:label="Grabaciones"
+        tools:layout="@layout/fragment_recordings">
+        <action
+            android:id="@+id/action_recordings_to_playback"
+            app:destination="@id/playbackFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
+        <action
+            android:id="@+id/action_recordings_to_eventConfig"
+            app:destination="@id/eventConfigFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/playbackFragment"
+        android:name="com.ipn.mx.onvif.ui.PlaybackFragment"
+        android:label="Reproduccion"
+        tools:layout="@layout/fragment_playback">
+        <argument
+            android:name="recordingId"
+            app:argType="string"
+            android:defaultValue="" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/eventConfigFragment"
+        android:name="com.ipn.mx.onvif.ui.EventConfigFragment"
+        android:label="Notificaciones"
+        tools:layout="@layout/fragment_event_config" />
+
+    <!-- Panel in-app de historial de notificaciones (eventos recientes).
+         Es la pantalla a la que va el botón "Notificaciones" del menú. -->
+    <fragment
+        android:id="@+id/notificationsPanelFragment"
+        android:name="com.ipn.mx.onvif.ui.NotificationsPanelFragment"
+        android:label="Notificaciones"
+        tools:layout="@layout/fragment_notifications_panel" />
+
+</navigation>

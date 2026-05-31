@@ -134,9 +134,9 @@ class UserCameraPermission(Base):
     __tablename__ = "user_camera_permissions"
     
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id"), index=True)
-    
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="CASCADE"), index=True)
+
     can_view: Mapped[bool] = mapped_column(Boolean, default=True)
     can_control_ptz: Mapped[bool] = mapped_column(Boolean, default=False)
     can_control_leds: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -170,9 +170,9 @@ class Event(Base):
     Modelo de evento de seguridad.
     """
     __tablename__ = "events"
-    
+
     id: Mapped[int] = mapped_column(primary_key=True)
-    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id"), nullable=False)
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False)
     event_type: Mapped[str] = mapped_column(String(50), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     snapshot_path: Mapped[Optional[str]] = mapped_column(String(500))
@@ -207,9 +207,9 @@ class Recording(Base):
     Modelo de grabación de video.
     """
     __tablename__ = "recordings"
-    
+
     id: Mapped[int] = mapped_column(primary_key=True)
-    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id"), nullable=False)
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False)
     start_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     end_time: Mapped[Optional[datetime]] = mapped_column(DateTime)
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -282,9 +282,9 @@ class NotificationPreference(Base):
     __tablename__ = "notification_preferences"
     
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     event_type: Mapped[str] = mapped_column(String(50), index=True)
-    camera_id: Mapped[Optional[int]] = mapped_column(ForeignKey("cameras.id"), nullable=True, index=True)
+    camera_id: Mapped[Optional[int]] = mapped_column(ForeignKey("cameras.id", ondelete="SET NULL"), nullable=True, index=True)
     
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     schedule_start: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
@@ -473,3 +473,26 @@ class AuditLog(Base):
             "ip_address": self.ip_address,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
+
+
+class RevokedToken(Base):
+    """
+    JWT revocados que persisten entre reinicios del backend.
+
+    El JWTBlocklist en memoria sigue siendo la fuente primaria (rápida).
+    Esta tabla es respaldo: al arrancar, el blocklist se rehidrata con los
+    tokens revocados que aún no expiraron, evitando que un logout en t=0
+    se "olvide" si el backend se reinicia en t=5min.
+
+    Se purgan automáticamente las entradas con expires_at < now (GC en el
+    arranque y cada hora). Tabla pequeña: tokens revocados en ventana de
+    1 día (acceso) a 30 días (refresh móvil) máximo.
+    """
+    __tablename__ = "revoked_tokens"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    jti: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # logout, password_change, etc.

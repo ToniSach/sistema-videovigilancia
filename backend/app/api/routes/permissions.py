@@ -37,7 +37,7 @@ def get_camera_permissions(camera_id):
             } for p in perms]
         }), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @permissions_bp.route("/camera/<int:camera_id>/user/<int:target_user_id>", methods=["POST"])
@@ -80,7 +80,7 @@ def grant_permission(camera_id, target_user_id):
             }
         }), 201
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @permissions_bp.route("/camera/<int:camera_id>/user/<int:target_user_id>", methods=["DELETE"])
@@ -97,7 +97,7 @@ def revoke_permission(camera_id, target_user_id):
             return jsonify({"success": True, "message": "Permisos revocados"}), 200
         return jsonify({"success": False, "error": "No se encontraron permisos"}), 404
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @permissions_bp.route("/my-cameras", methods=["GET"])
@@ -112,4 +112,4 @@ def get_my_cameras():
             "data": cameras
         }), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500

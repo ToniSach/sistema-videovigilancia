@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!-- ── CAMERA FEED ── -->
+    <FrameLayout
+        android:id="@+id/cameraFeedContainer"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="12dp"
+        android:layout_marginEnd="12dp"
+        android:background="@drawable/bg_camera_feed"
+        app:layout_constraintDimensionRatio="16:9"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <!-- Quitar cámara (X) -->
+        <ImageButton
+            android:id="@+id/btnRemoveCam"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:layout_gravity="top|end"
+            android:layout_margin="6dp"
+            android:background="@android:color/transparent"
+            android:contentDescription="@string/btn_remove_cam"
+            android:src="@drawable/ic_close_red" />
+
+        <!-- Flecha izquierda — cambiar al feed anterior -->
+        <ImageButton
+            android:id="@+id/btnPrevFeed"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_gravity="center_vertical|start"
+            android:layout_marginStart="4dp"
+            android:background="@drawable/bg_icon_button"
+            android:contentDescription="@string/feed_previous"
+            android:src="@drawable/ic_arrow_left" />
+
+        <!-- Flecha derecha — cambiar al feed siguiente -->
+        <ImageButton
+            android:id="@+id/btnNextFeed"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_gravity="center_vertical|end"
+            android:layout_marginEnd="4dp"
+            android:background="@drawable/bg_icon_button"
+            android:contentDescription="@string/feed_next"
+            android:src="@drawable/ic_arrow_right" />
+
+    </FrameLayout>
+
+    <!-- ── GLASS CARD: Controles principales (Mic · Grabar · Noche) ── -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/controlsCard"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="12dp"
+        android:layout_marginEnd="12dp"
+        style="@style/Widget.CamLink.GlassCard"
+        app:contentPadding="12dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/cameraFeedContainer">
+
+        <androidx.constraintlayout.widget.ConstraintLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <ImageButton
+                android:id="@+id/btnMic"
+                style="@style/Widget.CamLink.IconButton"
+                android:contentDescription="@string/btn_mic"
+                android:src="@drawable/ic_mic"
+                app:layout_constraintEnd_toStartOf="@id/btnRecord"
+                app:layout_constraintHorizontal_chainStyle="spread"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintBottom_toBottomOf="parent" />
+
+            <ImageButton
+                android:id="@+id/btnRecord"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
+                android:background="@drawable/bg_record_button"
+                android:contentDescription="@string/btn_record"
+                android:padding="14dp"
+                android:src="@drawable/ic_record_stop"
+                app:layout_constraintEnd_toStartOf="@id/btnNight"
+                app:layout_constraintStart_toEndOf="@id/btnMic"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintBottom_toBottomOf="parent" />
+
+            <ImageButton
+                android:id="@+id/btnNight"
+                style="@style/Widget.CamLink.IconButton"
+                android:contentDescription="@string/btn_night"
+                android:src="@drawable/ic_night_mode"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toEndOf="@id/btnRecord"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintBottom_toBottomOf="parent" />
+
+        </androidx.constraintlayout.widget.ConstraintLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+    <!-- ── GLASS CARD: Joystick PTZ ── -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/joystickCard"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        style="@style/Widget.CamLink.GlassCard"
+        app:contentPadding="14dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/controlsCard">
+
+        <FrameLayout
+            android:id="@+id/joystickOuter"
+            android:layout_width="110dp"
+            android:layout_height="110dp"
+            android:background="@drawable/bg_joystick_outer">
+
+            <View
+                android:id="@+id/joystickThumb"
+                android:layout_width="50dp"
+                android:layout_height="50dp"
+                android:layout_gravity="center"
+                android:background="@drawable/bg_joystick_inner" />
+        </FrameLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+    <!-- ── FILA INFERIOR: Toggle vista · Fullscreen ── -->
+    <ImageButton
+        android:id="@+id/btnVideoList"
+        style="@style/Widget.CamLink.IconButton"
+        android:layout_marginBottom="20dp"
+        android:contentDescription="@string/btn_video_list"
+        android:src="@drawable/ic_video_library"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/btnFullscreen"
+        app:layout_constraintHorizontal_chainStyle="spread"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/joystickCard" />
+
+    <ImageButton
+        android:id="@+id/btnFullscreen"
+        style="@style/Widget.CamLink.IconButton"
+        android:layout_marginBottom="20dp"
+        android:contentDescription="@string/btn_fullscreen"
+        android:src="@drawable/ic_fullscreen"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toEndOf="@id/btnVideoList"
+        app:layout_constraintTop_toBottomOf="@id/joystickCard" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

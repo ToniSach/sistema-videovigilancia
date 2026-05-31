@@ -5,13 +5,14 @@ Vista de gestión de cámaras (agregar, editar, configurar IA).
 import logging
 from typing import Optional, List
 
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                               QPushButton, QListWidget, QListWidgetItem, 
-                               QDialog, QLineEdit, QCheckBox, QSpinBox, 
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                               QPushButton, QListWidget, QListWidgetItem,
+                               QDialog, QLineEdit, QCheckBox, QSpinBox,
                                QFormLayout, QMessageBox, QComboBox, QGroupBox,
-                               QScrollArea, QFrame, QGridLayout, QSplitter)
-from PySide6.QtCore import Qt, Signal, QThread, QTimer
-from PySide6.QtGui import QIcon, QFont
+                               QScrollArea, QFrame, QGridLayout, QSplitter,
+                               QProgressDialog, QApplication, QSizePolicy)
+from PySide6.QtCore import Qt, Signal, QThread, QTimer, Slot
+from PySide6.QtGui import QIcon, QFont, QPixmap, QImage
 
 from desktop_app.src.config import config
 from desktop_app.src.models.camera import Camera
@@ -319,36 +320,65 @@ class CameraEditDialog(QDialog):
 
 class CameraDiscoveryThread(QThread):
     """Thread para descubrir cámaras ONVIF usando el backend."""
-    
+
     cameras_found = Signal(list)
     error = Signal(str)
     finished_search = Signal()
-    
-    def __init__(self, api_token):
+
+    def __init__(self, api_token: str, timeout_s: int = 15,
+                 subnet_scan: bool = True):
+        """
+        Args:
+            api_token: JWT del usuario.
+            timeout_s: tiempo que WS-Discovery escucha en el backend.
+            subnet_scan: si True y WS-Disc encuentra 0, escanea subnet
+                         (útil cuando Windows firewall bloquea multicast).
+        """
         super().__init__()
         self.api_token = api_token
-    
+        self.timeout_s = timeout_s
+        self.subnet_scan = subnet_scan
+
     def run(self):
         try:
             import requests
-            
+
             headers = {"Authorization": f"Bearer {self.api_token}"}
+            # HTTP read timeout debe ser MAYOR que el cap interno del backend
+            # (90s) para que el cap del backend devuelva resultados parciales
+            # antes de que el cliente corte la conexión. 180s = backend cap
+            # + buffer de red + WS-Discovery setup.
+            http_timeout = max(180, self.timeout_s + 120)
+
             resp = requests.post(
-                "http://localhost:5000/api/v1/cameras/discover",
+                f"{config.API_BASE_URL}/cameras/discover",
                 headers=headers,
-                #estaba en 15
-                timeout=50
+                json={"timeout": self.timeout_s, "subnet_scan": self.subnet_scan},
+                timeout=(10, http_timeout),
             )
-            
+
             if resp.status_code == 200:
                 data = resp.json()
                 cameras = data.get("data", [])
                 self.cameras_found.emit(cameras)
             else:
-                self.error.emit(f"Error del servidor: {resp.status_code}")
-                
+                self.error.emit(f"Error del servidor: {resp.status_code} - {resp.text[:200]}")
+
+        except requests.exceptions.ConnectTimeout:
+            self.error.emit("Timeout conectando al backend. ¿Está corriendo?")
+        except requests.exceptions.ReadTimeout:
+            self.error.emit(
+                f"El descubrimiento tardó más de {http_timeout}s.\n\n"
+                "Causas habituales:\n"
+                "  • El backend está sobrecargado con probes ONVIF lentos.\n"
+                "  • Una cámara anuncia su IP por multicast pero no es alcanzable\n"
+                "    (IP estática de otra subred). Cambia su IP a DHCP desde el\n"
+                "    panel web de la cámara.\n"
+                "  • Firewall bloqueando multicast WS-Discovery (puerto 3702).\n\n"
+                "Workaround: agrega la cámara manualmente con su IP y URL RTSP."
+            )
         except requests.exceptions.ConnectionError:
-            self.error.emit("No se pudo conectar al backend. ¿Está corriendo en localhost:5000?")
+            self.error.emit(f"No se pudo conectar al backend ({config.API_BASE_URL}).")
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -363,11 +393,23 @@ class CameraManagementView(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        
+
         self.cameras: List[Camera] = []
+        self._loaded_once = False
         self._setup_ui()
-        self._load_cameras()
-    
+        # IMPORTANTE: NO cargamos cámaras en __init__ porque esto se ejecuta
+        # ANTES del login → 401 "Sesión expirada" → la lista queda vacía
+        # para siempre. Cargamos al mostrar la vista por primera vez
+        # (showEvent) o cuando MainWindow nos lo pida tras el login.
+
+    def showEvent(self, event):
+        """Carga cámaras al mostrar la vista (primera vez o al cambiar de pestaña)."""
+        super().showEvent(event)
+        # Solo intentamos cargar si hay sesión (evita el 401 spam pre-login)
+        from desktop_app.src.services.api_client import api_client
+        if api_client.tokens:
+            self._load_cameras()
+
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -383,9 +425,12 @@ class CameraManagementView(QWidget):
             font-weight: bold;
         """)
         header.addWidget(self.lbl_title)
-        
+
+        from desktop_app.src.ui.components.help_button import HelpButton
+        header.addWidget(HelpButton("camera_management_view", parent=self))
+
         header.addStretch()
-        
+
         # Botón descubrir
         self.btn_discover = QPushButton("🔍 Descubrir Cámaras")
         self.btn_discover.setMinimumHeight(40)
@@ -453,69 +498,124 @@ class CameraManagementView(QWidget):
         
         splitter.addWidget(list_widget)
         
-        # Panel de detalles
+        # Panel de detalles + preview de video
         self.details_widget = GlassCard()
         details_layout = QVBoxLayout(self.details_widget)
-        
-        self.lbl_details = QLabel("Seleccione una cámara para ver detalles")
+        details_layout.setSpacing(12)
+
+        self.lbl_details = QLabel(
+            "👈  Selecciona una cámara de la lista\n   para ver el preview y detalles"
+        )
         self.lbl_details.setAlignment(Qt.AlignCenter)
-        self.lbl_details.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 16px;")
+        self.lbl_details.setStyleSheet(
+            f"color: {config.THEME_TEXT_MUTED}; font-size: 14px; padding: 40px;"
+        )
         details_layout.addWidget(self.lbl_details)
-        
-        # Información detallada (inicialmente oculta)
+
+        # Container que se muestra al seleccionar una cámara
         self.info_widget = QWidget()
-        info_layout = QFormLayout(self.info_widget)
-        info_layout.setSpacing(12)
-        
+        info_v = QVBoxLayout(self.info_widget)
+        info_v.setContentsMargins(0, 0, 0, 0)
+        info_v.setSpacing(8)
+
+        # --- Preview de video MJPEG ---
+        # Selector de lente (solo visible para cámaras dual-lens)
+        from PySide6.QtWidgets import QComboBox
+        self.preview_lens_row = QHBoxLayout()
+        self.preview_lens_row.setContentsMargins(0, 0, 0, 0)
+        self.lbl_preview_lens = QLabel("Lente:")
+        self.lbl_preview_lens.setStyleSheet(f"color: {config.THEME_TEXT_MUTED};")
+        self.cmb_preview_lens = QComboBox()
+        self.cmb_preview_lens.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {config.THEME_SECONDARY};
+                color: {config.THEME_TEXT};
+                border: 1px solid rgba(255,255,255,0.15);
+                border-radius: 4px; padding: 4px 8px;
+            }}
+        """)
+        self.cmb_preview_lens.currentIndexChanged.connect(self._on_preview_lens_change)
+        self.preview_lens_row.addWidget(self.lbl_preview_lens)
+        self.preview_lens_row.addWidget(self.cmb_preview_lens)
+        self.preview_lens_row.addStretch()
+        self.preview_lens_widget = QWidget()
+        self.preview_lens_widget.setLayout(self.preview_lens_row)
+        self.preview_lens_widget.hide()  # solo se muestra para dual-lens
+        info_v.addWidget(self.preview_lens_widget)
+
+        self.preview_label = QLabel("📷  Conectando al stream…")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumSize(400, 240)
+        self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_label.setStyleSheet(
+            "background-color: #000000; color: #94a3b8; "
+            "border-radius: 6px; font-size: 12px;"
+        )
+        info_v.addWidget(self.preview_label, 1)
+
+        # --- Info textual ---
+        info_form = QFormLayout()
+        info_form.setSpacing(8)
+        info_form.setContentsMargins(8, 0, 8, 0)
+
         self.lbl_info_name = QLabel()
-        self.lbl_info_name.setStyleSheet(f"color: {config.THEME_ACCENT}; font-weight: bold; font-size: 18px;")
-        info_layout.addRow(self.lbl_info_name)
-        
+        self.lbl_info_name.setStyleSheet(
+            f"color: {config.THEME_ACCENT}; font-weight: bold; font-size: 16px;"
+        )
+        info_form.addRow(self.lbl_info_name)
+
         self.lbl_info_ip = QLabel()
         self.lbl_info_ip.setStyleSheet(f"color: {config.THEME_TEXT};")
-        info_layout.addRow("IP:", self.lbl_info_ip)
-        
+        info_form.addRow("IP:", self.lbl_info_ip)
+
         self.lbl_info_status = QLabel()
-        info_layout.addRow("Estado:", self.lbl_info_status)
-        
+        info_form.addRow("Estado:", self.lbl_info_status)
+
         self.lbl_info_capabilities = QLabel()
         self.lbl_info_capabilities.setWordWrap(True)
-        info_layout.addRow("Capacidades:", self.lbl_info_capabilities)
-        
+        info_form.addRow("Capacidades:", self.lbl_info_capabilities)
+
         self.lbl_info_ai = QLabel()
-        info_layout.addRow("IA:", self.lbl_info_ai)
-        
+        info_form.addRow("IA:", self.lbl_info_ai)
+
+        info_v.addLayout(info_form)
         self.info_widget.hide()
         details_layout.addWidget(self.info_widget)
-        details_layout.addStretch()
-        
+
         splitter.addWidget(self.details_widget)
-        splitter.setSizes([350, 650])
-        
+        splitter.setSizes([320, 680])
+
         layout.addWidget(splitter)
+
+        # Preview pull-based (consistente con LiveView/CameraControlView).
+        # Sin signals → sin acumulación de frames en queue de Qt si el GUI
+        # se queda detrás. Un QTimer cada 67ms (15fps) pide el último frame.
+        self._preview_camera_id: Optional[int] = None
+        self._preview_stream_type: str = "main"
+        self._preview_last_seq: int = -1
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setInterval(67)
+        self._preview_timer.timeout.connect(self._pull_preview_frame)
+        self._preview_timer.start()
     
     def _load_cameras(self):
         """Carga lista de cámaras desde API."""
         def on_response(response):
-            if response.success:
-                self.cameras = []
-                self.list_cameras.clear()
-                
-                for cam_data in response.data:
-                    camera = Camera(
-                        id=cam_data.get("id"),
-                        name=cam_data.get("name"),
-                        ip_address=cam_data.get("ip_address"),
-                        **{k: v for k, v in cam_data.items() if k not in ["id", "name", "ip_address"]}
-                    )
-                    self.cameras.append(camera)
-                    
-                    item = QListWidgetItem(f"{camera.name}\n{camera.ip_address}")
-                    item.setData(Qt.UserRole, camera.id)
-                    if not cam_data.get("is_active", True):
-                        item.setForeground(Qt.gray)
-                    self.list_cameras.addItem(item)
-        
+            if not response.success:
+                logger.warning(f"No se pudieron cargar cámaras: {response.error}")
+                return
+            self.cameras = []
+            self.list_cameras.clear()
+            for cam_data in (response.data or []):
+                # from_dict tolera campos extra del backend (connection_type, etc.)
+                camera = Camera.from_dict(cam_data)
+                self.cameras.append(camera)
+                item = QListWidgetItem(f"{camera.name}\n{camera.ip_address}")
+                item.setData(Qt.UserRole, camera.id)
+                if not camera.is_active:
+                    item.setForeground(Qt.gray)
+                self.list_cameras.addItem(item)
+
         api_client.get("cameras/", on_response)
     
     def _on_camera_selected(self, current, previous):
@@ -525,15 +625,19 @@ class CameraManagementView(QWidget):
             self.btn_toggle.setEnabled(False)
             self.lbl_details.show()
             self.info_widget.hide()
+            self._stop_preview()
             return
-        
+
         camera_id = current.data(Qt.UserRole)
         camera = next((c for c in self.cameras if c.id == camera_id), None)
-        
+
         if camera:
             self.btn_edit.setEnabled(True)
             self.btn_delete.setEnabled(True)
             self.btn_toggle.setEnabled(True)
+
+            # Iniciar preview de la cámara
+            self._start_preview(camera)
             
             self.lbl_details.hide()
             self.info_widget.show()
@@ -555,11 +659,154 @@ class CameraManagementView(QWidget):
                 caps.append("Dual Lens")
             self.lbl_info_capabilities.setText(", ".join(caps) if caps else "Ninguna")
             
-            ai_status = "Habilitada" if getattr(camera, 'has_ai', False) else "Deshabilitada"
+            # IA: distinguir "habilitada y corriendo" de "configurada pero en
+            # pausa porque la cámara está inactiva" — sin esta diferenciación,
+            # una cámara auto-desactivada por MAX_RETRIES seguía mostrándose
+            # como "IA: Habilitada" aunque en runtime ya esté apagada.
+            has_ai_cfg = getattr(camera, 'has_ai', False)
+            cam_active = getattr(camera, 'is_active', True)
+            if has_ai_cfg and not cam_active:
+                ai_status = "Configurada (pausada · cámara inactiva)"
+            elif has_ai_cfg:
+                ai_status = "Habilitada"
+            else:
+                ai_status = "Deshabilitada"
             self.lbl_info_ai.setText(ai_status)
             
             self.camera_selected.emit(camera_id)
     
+    # ------------------------------------------------------------------
+    # Preview MJPEG en panel de detalles
+    # ------------------------------------------------------------------
+    def _start_preview(self, camera: Camera):
+        """Inicia el stream MJPEG de la cámara seleccionada."""
+        from desktop_app.src.services.video_streamer import video_streamer
+        from desktop_app.src.services.api_client import api_client
+
+        token = api_client.get_stream_token() or ""
+        if not token:
+            self.preview_label.setText("⚠ No hay sesión activa")
+            return
+
+        # Detener preview previo si existe
+        self._stop_preview()
+
+        # Configurar selector de lente
+        self.cmb_preview_lens.blockSignals(True)
+        self.cmb_preview_lens.clear()
+        if camera.is_dual_lens:
+            self.cmb_preview_lens.addItem("Lente 1 (L1)", "l1")
+            self.cmb_preview_lens.addItem("Lente 2 (L2)", "l2")
+            self.preview_lens_widget.show()
+            stream_type = "l1"  # default
+        else:
+            self.preview_lens_widget.hide()
+            stream_type = "main"
+        self.cmb_preview_lens.blockSignals(False)
+
+        self._preview_camera_id = camera.id
+        self._preview_stream_type = stream_type
+        self._preview_last_seq = -1  # reset para nueva cámara
+
+        video_streamer.set_base_url(config.API_BASE_URL)
+        self.preview_label.setText(
+            f"📷  Conectando a {camera.name}\n   ({stream_type})…"
+        )
+        video_streamer.start_stream(camera.id, token, stream_type=stream_type)
+
+    def _on_preview_lens_change(self, idx: int):
+        """Cambia el lente que se muestra en la previsualización."""
+        if self._preview_camera_id is None:
+            return
+        new_lens = self.cmb_preview_lens.itemData(idx)
+        if not new_lens or new_lens == self._preview_stream_type:
+            return
+
+        from desktop_app.src.services.video_streamer import video_streamer
+        from desktop_app.src.services.api_client import api_client
+
+        token = api_client.get_stream_token() or ""
+        if not token:
+            return
+
+        cam_id = self._preview_camera_id
+        # Detener el lente anterior
+        try:
+            video_streamer.stop_stream(cam_id, self._preview_stream_type)
+        except Exception:
+            pass
+
+        self._preview_stream_type = new_lens
+        self._preview_last_seq = -1
+        self.preview_label.setText(f"📷  Cambiando a lente {new_lens}…")
+        video_streamer.start_stream(cam_id, token, stream_type=new_lens)
+
+    def _stop_preview(self):
+        """Detiene el preview actual si está activo."""
+        from desktop_app.src.services.video_streamer import video_streamer
+        if self._preview_camera_id is not None:
+            try:
+                video_streamer.stop_stream(
+                    self._preview_camera_id, self._preview_stream_type
+                )
+            except Exception as e:
+                logger.debug(f"Error parando preview: {e}")
+        self._preview_camera_id = None
+        self._preview_stream_type = "main"
+        self._preview_last_seq = -1
+        self.preview_lens_widget.hide()
+        self.preview_label.setPixmap(QPixmap())
+        self.preview_label.setText("📷  Preview detenido")
+
+    def _pull_preview_frame(self):
+        """
+        Polling pull-based del frame de preview (consistente con LiveView).
+        Si no hay frame nuevo del lente seleccionado, no hace nada.
+        """
+        if self._preview_camera_id is None:
+            return
+        from desktop_app.src.services.video_streamer import video_streamer
+        try:
+            pixmap, seq, _ = video_streamer.pop_latest_pixmap(
+                self._preview_camera_id,
+                self._preview_stream_type,
+                self._preview_last_seq,
+            )
+            if pixmap is None or seq == self._preview_last_seq:
+                return
+            self._preview_last_seq = seq
+            scaled = pixmap.scaled(
+                self.preview_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation,
+            )
+            self.preview_label.setPixmap(scaled)
+        except Exception as e:
+            logger.debug(f"Error pull preview: {e}")
+
+    @Slot(object)
+    def _on_preview_frame(self, frame):
+        """[LEGACY] ya no se conecta a signal. Usamos _pull_preview_frame."""
+        if self._preview_camera_id is None:
+            return
+        if frame.camera_id != self._preview_camera_id:
+            return
+        if getattr(frame, "stream_type", "main") != self._preview_stream_type:
+            return
+        try:
+            scaled = frame.pixmap.scaled(
+                self.preview_label.size(),
+                Qt.KeepAspectRatio, Qt.FastTransformation,
+            )
+            self.preview_label.setPixmap(scaled)
+        except Exception as e:
+            logger.debug(f"Error pintando preview: {e}")
+
+    def hideEvent(self, event):
+        """Detener preview al salir de la pestaña (ahorra red y CPU)."""
+        self._stop_preview()
+        super().hideEvent(event)
+
     def _add_camera(self):
         dialog = CameraEditDialog(parent=self)
         if dialog.exec() == QDialog.Accepted:
@@ -642,42 +889,164 @@ class CameraManagementView(QWidget):
             api_client.patch(f"cameras/{camera_id}/toggle", on_toggled, data={"active": new_state})
     
     def _discover_cameras(self):
-        self.btn_discover.setEnabled(False)
-        self.btn_discover.setText("🔍 Buscando...")
-        
-        # Obtener token actual
         from desktop_app.src.services.api_client import api_client
-        token = api_client.tokens.access_token if api_client.tokens else ""
-        
+        token = api_client.get_stream_token() or ""
+
         if not token:
             QMessageBox.warning(self, "Error", "No hay sesión activa")
-            self.btn_discover.setEnabled(True)
             return
-        
-        self.discovery_thread = CameraDiscoveryThread(token)
+
+        # Diálogo modal de progreso (con animación indeterminada)
+        self._progress_dialog = QProgressDialog(
+            "🔍  Buscando cámaras ONVIF en la red…\n\n"
+            "Esto puede tardar 15-30 segundos:\n"
+            "  • WS-Discovery (multicast)\n"
+            "  • Escaneo del subnet local\n"
+            "  • Sondeo ONVIF + autenticación",
+            "Cancelar",
+            0, 0,  # min=max=0 → barra indeterminada (animada)
+            self,
+        )
+        self._progress_dialog.setWindowTitle("Descubrimiento de cámaras")
+        self._progress_dialog.setWindowModality(Qt.WindowModal)
+        self._progress_dialog.setMinimumWidth(420)
+        self._progress_dialog.setMinimumDuration(0)  # mostrar inmediatamente
+        self._progress_dialog.setAutoClose(False)
+        self._progress_dialog.setAutoReset(False)
+        self._progress_dialog.canceled.connect(self._on_discovery_canceled)
+        self._progress_dialog.show()
+        QApplication.processEvents()
+
+        # Timeout corto + subnet_scan automático (cubre el caso de firewall
+        # bloqueando multicast WS-Discovery, común en Windows).
+        self.discovery_thread = CameraDiscoveryThread(
+            token, timeout_s=15, subnet_scan=True
+        )
         self.discovery_thread.cameras_found.connect(self._on_discovered_cameras)
-        self.discovery_thread.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
-        self.discovery_thread.finished_search.connect(lambda: self.btn_discover.setEnabled(True))
-        self.discovery_thread.finished_search.connect(lambda: self.btn_discover.setText("🔍 Descubrir Cámaras"))
+        self.discovery_thread.error.connect(self._on_discovery_error)
+        self.discovery_thread.finished_search.connect(self._reset_discover_button)
         self.discovery_thread.start()
-    
+
+    def _reset_discover_button(self):
+        if hasattr(self, "_progress_dialog") and self._progress_dialog:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+
+    def _on_discovery_canceled(self):
+        """El usuario clicó Cancelar — solo cerramos el dialog,
+        el thread sigue en background hasta que termine (no podemos matar
+        el WS-Discovery sin riesgo de corruption)."""
+        logger.info("Usuario canceló descubrimiento (continúa en background)")
+        if hasattr(self, "_progress_dialog") and self._progress_dialog:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+        # Desconectamos el callback para que no muestre el mensaje al usuario
+        try:
+            self.discovery_thread.cameras_found.disconnect(self._on_discovered_cameras)
+        except (TypeError, RuntimeError):
+            pass
+
+    def _on_discovery_error(self, error: str):
+        if hasattr(self, "_progress_dialog") and self._progress_dialog:
+            self._progress_dialog.close()
+            self._progress_dialog = None
+        QMessageBox.critical(self, "Error en descubrimiento", error)
+
     def _on_discovered_cameras(self, cameras):
         if not cameras:
-            QMessageBox.information(self, "Descubrimiento", "No se encontraron cámaras en la red.")
+            QMessageBox.information(
+                self, "Descubrimiento",
+                "No se encontraron cámaras en la red.\n"
+                "Verifica que la cámara esté en la misma red y que su "
+                "servicio ONVIF esté habilitado."
+            )
             return
-        
-        msg = f"Se encontraron {len(cameras)} cámaras:\n\n"
-        for cam in cameras:
-            msg += f"• {cam['name']} ({cam['ip_address']})\n"
-        
+
+        # Separar cámaras alcanzables de las que el backend reportó como
+        # no alcanzables (IP estática de otra subred, etc.).
+        unreachable = [c for c in cameras if c.get("connection_type") == "unreachable"]
+        reachable = [c for c in cameras if c.get("connection_type") != "unreachable"]
+
+        # Filtrar duplicadas con cámaras ya existentes (por IP)
+        existing_ips = {c.ip_address for c in self.cameras}
+        new_cameras = [c for c in reachable if c.get("ip_address") not in existing_ips]
+        already_in = len(reachable) - len(new_cameras)
+
+        # Si hay cámaras detectadas pero no alcanzables, avisar primero — no
+        # tiene sentido intentar agregarlas porque el backend tampoco podrá
+        # arrancar su worker.
+        if unreachable:
+            warn = "⚠️ Cámaras detectadas pero NO alcanzables desde este PC:\n\n"
+            for cam in unreachable:
+                ip = cam.get("ip_address", "?")
+                warn += f"  • {ip}\n"
+            warn += (
+                "\nProbablemente tienen IP estática de otra subred (por ejemplo,\n"
+                "192.168.1.X cuando este PC está en 10.99.130.X).\n\n"
+                "Cómo arreglarlo:\n"
+                "  1. Conecta un PC con cable directo a la cámara (o ponle al PC\n"
+                "     una IP estática en el mismo rango que la cámara).\n"
+                "  2. Entra a su panel web y cámbiale la IP a DHCP o a una IP\n"
+                "     del rango actual de tu router.\n"
+                "  3. Vuelve a buscar cámaras."
+            )
+            QMessageBox.warning(self, "Cámaras no alcanzables", warn)
+
+        if not new_cameras:
+            if not unreachable:
+                QMessageBox.information(
+                    self, "Descubrimiento",
+                    f"Se encontraron {len(reachable)} cámaras pero todas ya están agregadas."
+                    if already_in else "No se encontraron cámaras nuevas."
+                )
+            return
+
+        msg = f"Se encontraron {len(new_cameras)} cámaras nuevas alcanzables:\n\n"
+        for cam in new_cameras:
+            man = cam.get("manufacturer", "")
+            mod = cam.get("model", "")
+            msg += f"• {cam['ip_address']}  {man}/{mod}\n"
+        if already_in:
+            msg += f"\n(Se omitieron {already_in} ya existentes)\n"
         msg += "\n¿Desea agregarlas automáticamente?"
-        
+
         reply = QMessageBox.question(self, "Cámaras Encontradas", msg)
         if reply == QMessageBox.Yes:
-            # Agregar cámaras encontradas
-            for cam_data in cameras:
-                def on_added(response):
+            for cam_data in new_cameras:
+                # Preguntar por cada cámara si es DUAL-LENS. El backend no puede
+                # adivinarlo de forma fiable (la resolución que devuelve ONVIF
+                # ya es la combinada de los dos sensores y no hay un flag
+                # estándar). Default: No, porque la mayoría son monolente.
+                ip   = cam_data.get("ip_address", "?")
+                name = cam_data.get("name", "Cámara")
+                w    = cam_data.get("resolution_width", "?")
+                h    = cam_data.get("resolution_height", "?")
+                dual_reply = QMessageBox.question(
+                    self,
+                    "¿Cámara dual-lens?",
+                    f"¿La cámara «{name}» ({ip}) es de tipo DUAL-LENS\n"
+                    f"(dos objetivos físicos, un solo stream side-by-side)?\n\n"
+                    f"Resolución detectada: {w}×{h}\n"
+                    f"  • Mono típico: 1920×1080, 1280×720, 2560×1440\n"
+                    f"  • Dual típico: 2560×720, 3840×1080, 1280×1440\n\n"
+                    f"Si no estás seguro, elige «No» — siempre puedes editarla después.",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                is_dual = (dual_reply == QMessageBox.Yes)
+
+                # skip_probe=True: el discovery YA probó la cámara con éxito,
+                # no hace falta que el backend vuelva a probarla (lento).
+                payload = dict(cam_data)
+                payload["skip_probe"] = True
+                payload["is_active"] = True
+                payload["is_dual_lens"] = is_dual
+
+                def on_added(response, ip=cam_data.get("ip_address")):
                     if response.success:
                         self._load_cameras()
-                
-                api_client.post("cameras/", on_added, data=cam_data)
+                        self.camera_updated.emit()
+                    else:
+                        logger.warning(f"No se pudo agregar {ip}: {response.error}")
+
+                api_client.post("cameras/", on_added, data=payload)

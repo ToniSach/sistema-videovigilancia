@@ -48,14 +48,23 @@ class YLOModelPool:
     def __init__(self):
         if hasattr(self, '_initialized'):
             return
-        
+
         self._initialized = True
         self._model = None
         self._model_lock = threading.Lock()
         self._ref_count = 0
         self._model_path = "yolov8n.pt"
-        self._confidence = 0.45
+        # Tomar confianza de settings (configurable vía AI_CONFIDENCE en .env)
+        try:
+            from backend.app.config import settings
+            self._confidence = float(getattr(settings, "AI_CONFIDENCE", 0.35))
+        except Exception:
+            self._confidence = 0.35
         self._device = self._select_device()
+        logger.info(
+            f"YLOModelPool inicializado: device={self._device}, "
+            f"confidence={self._confidence}"
+        )
 
     def _select_device(self) -> str:
         """Selecciona automáticamente GPU si está disponible."""
@@ -87,21 +96,90 @@ class YLOModelPool:
         logger.info("YOLO usará CPU")
         return "cpu"
 
+    @staticmethod
+    def check_dependencies() -> tuple[bool, str]:
+        """
+        Verifica que torch, torchvision y ultralytics estén instalados Y
+        que su import no falle por incompatibilidades (p.ej. torchvision
+        ausente hace que ultralytics levante AttributeError al importar,
+        no ImportError).
+        Devuelve (ok, mensaje). Si falta algo, mensaje incluye el comando pip.
+        """
+        # Pre-test individual: torch y torchvision tienen que importarse limpiamente.
+        missing: list[str] = []
+        for mod in ("torch", "torchvision"):
+            try:
+                __import__(mod)
+            except Exception:
+                missing.append(mod)
+
+        # Ultralytics: si torchvision falta, su import revienta con
+        # AttributeError dentro de utils/checks.py — atrapamos cualquier
+        # excepción para diagnosticar.
+        ultralytics_err: str | None = None
+        try:
+            __import__("ultralytics")
+        except ImportError:
+            missing.append("ultralytics")
+        except Exception as e:
+            ultralytics_err = f"{type(e).__name__}: {e}"
+
+        if not missing and ultralytics_err is None:
+            return True, "ok"
+
+        cmd = (
+            "pip install torch==2.6.0+cpu torchvision==0.21.0+cpu "
+            "--index-url https://download.pytorch.org/whl/cpu && "
+            "pip install ultralytics"
+        )
+        parts = []
+        if missing:
+            parts.append(f"Faltan dependencias de IA: {', '.join(missing)}.")
+        if ultralytics_err:
+            parts.append(
+                f"ultralytics no se pudo importar ({ultralytics_err}); "
+                "típicamente significa que torchvision no está instalado o "
+                "es incompatible con la versión de torch."
+            )
+        parts.append(f"Instala con: {cmd}")
+        return False, " ".join(parts)
+
     def _load_model(self) -> None:
         """Carga lazy del modelo."""
         with self._model_lock:
             if self._model is not None:
                 return
-            
+
+            ok, msg = self.check_dependencies()
+            if not ok:
+                logger.error(f"[YOLO] {msg}")
+                raise RuntimeError(msg)
+
             try:
+                # MODO OFFLINE: desactivar telemetría y check de versión de
+                # Ultralytics → no hace peticiones a internet. El modelo ya
+                # se descargó la primera vez y queda en local.
+                import os as _os
+                _os.environ.setdefault("YOLO_OFFLINE", "True")
+                _os.environ.setdefault("YOLO_VERBOSE", "False")
+                # Desactivar wandb/clearml/comet/etc por si están instalados
+                _os.environ.setdefault("WANDB_DISABLED", "true")
+
+                try:
+                    # API moderna de Ultralytics: desactivar telemetría/checks
+                    from ultralytics import settings as _ul_settings
+                    _ul_settings.update({"sync": False})  # no envía analytics
+                except Exception:
+                    pass
+
                 from ultralytics import YOLO
                 self._model = YOLO(self._model_path)
-                
+
                 if self._device == "cuda":
                     self._model.to("cuda")
-                
+
                 logger.info(f"Modelo YOLO cargado: {self._model_path} en {self._device}")
-                
+
             except Exception as e:
                 logger.error(f"Error cargando YOLO: {e}")
                 raise
@@ -125,13 +203,16 @@ class YLOModelPool:
             self._load_model()
         
         confidence = conf or self._confidence
-        
+
         # Inferencia (thread-safe con lock)
+        h, w = frame.shape[:2]
         with self._model_lock:
             try:
                 results = self._model(frame, conf=confidence, verbose=False)
             except Exception as e:
-                logger.error(f"Error en inferencia YOLO: {e}")
+                logger.error(
+                    f"Error en inferencia YOLO (frame {w}x{h}, conf={confidence}): {e}"
+                )
                 return []
         
         # Convertir a formato Detection (filtrando solo clases de interés)

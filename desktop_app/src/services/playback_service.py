@@ -25,41 +25,52 @@ class PlaybackState:
 
 class VLCPlayer(QObject):
     """Wrapper de VLC para Qt."""
-    
+
     state_changed = Signal(PlaybackState)
     position_changed = Signal(float)  # 0.0 - 1.0
     time_changed = Signal(int)  # segundos
     ended = Signal()
     error = Signal(str)
-    
+
     def __init__(self, config_options: list = None):
         super().__init__()
-        
+
         # Inicializar VLC
         if config_options is None:
             config_options = ['--quiet', '--no-video-title-show']
-        
+
         self.instance = vlc.Instance(config_options)
         self.player = self.instance.media_player_new()
-        
-        # Timer para actualizar posición
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._update_position)
-        self._timer.start(100)  # 100ms
-        
+
+        # Timer LAZY: se crea cuando arranca la primera reproducción,
+        # NO en __init__. Motivo: VLCPlayer() puede instanciarse al
+        # importar este módulo (cuando se hace `playback_service = ...`
+        # a nivel de archivo), lo cual ocurre ANTES de QApplication.
+        # Crear un QTimer sin QApplication viva ya causó crashes y el
+        # warning "QObject::startTimer: Timers can only be used with
+        # threads started with QThread".
+        self._timer: Optional[QTimer] = None
         self._current_media = None
         self._is_seeking = False
+
+    def _ensure_timer(self):
+        """Crea el QTimer en el primer uso (con QApplication ya viva)."""
+        if self._timer is None:
+            self._timer = QTimer(self)
+            self._timer.timeout.connect(self._update_position)
+            self._timer.start(100)  # 100ms
     
     def play_url(self, url: str):
         """Reproduce URL (http o file)."""
         try:
+            self._ensure_timer()  # crear QTimer ahora que QApplication existe
             self.player.stop()
-            
+
             media = self.instance.media_new(url)
             media.add_option("network-caching=300")
             self.player.set_media(media)
             self._current_media = media
-            
+
             result = self.player.play()
             if result == -1:
                 self.error.emit("No se pudo iniciar reproducción")

@@ -38,7 +38,7 @@ def get_preferences():
         
         return jsonify({"success": True, "data": result}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @notifications_bp.route("/preferences", methods=["POST"])
@@ -75,7 +75,7 @@ def create_preference():
         
         return jsonify({"success": True, "data": {"id": pref.id}}), 201
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @notifications_bp.route("/preferences/<int:pref_id>", methods=["PUT"])
@@ -97,7 +97,7 @@ def update_preference(pref_id):
         
         return jsonify({"success": True, "data": {"id": pref.id}}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @notifications_bp.route("/preferences/<int:pref_id>", methods=["DELETE"])
@@ -114,4 +114,4 @@ def delete_preference(pref_id):
             return jsonify({"success": True}), 200
         return jsonify({"success": False, "error": "No encontrado"}), 404
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500

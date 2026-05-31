@@ -35,4 +35,4 @@ def generate_qr():
         return response
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500

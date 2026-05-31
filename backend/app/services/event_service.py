@@ -22,38 +22,28 @@ class EventService:
         logging.info("EventService inicializado y suscrito a eventos")
 
     def _on_event(self, event_data: EventData) -> None:
+        # El snapshot AHORA se guarda en AIService._handle_detection ANTES
+        # de emitir el evento (para que TelegramNotifier lo encuentre en
+        # event_data.metadata sin race condition). Aquí solo leemos el
+        # path y, como fallback, lo guardamos si todavía no existía.
         snapshot_path = None
+        if event_data.metadata:
+            snapshot_path = event_data.metadata.get("snapshot_path")
 
-        # Guardar snapshot si hay frame
-        if event_data.frame is not None:
+        if snapshot_path is None and event_data.frame is not None:
+            # Fallback: si nadie guardó el snapshot antes, lo hacemos aquí
             try:
                 cam_snap_dir = os.path.join(self._snapshots_dir, str(event_data.camera_id))
                 os.makedirs(cam_snap_dir, exist_ok=True)
-
                 ts = int(event_data.timestamp)
                 safe_event_type = event_data.event_type.replace(" ", "_")
                 snapshot_filename = f"{ts}_{safe_event_type}.jpg"
                 snapshot_path = os.path.join(cam_snap_dir, snapshot_filename)
-
-                # Guardar imagen
-                success = cv2.imwrite(snapshot_path, event_data.frame)
-                if not success:
+                if not cv2.imwrite(snapshot_path, event_data.frame):
                     logging.error(f"No se pudo guardar snapshot en {snapshot_path}")
                     snapshot_path = None
-                else:
-                    logging.debug(f"Snapshot guardado: {snapshot_path}")
-                    
-                    # ============================
-                    # AÑADIR: metadata con snapshot_path
-                    # ============================
-                    metadata = {
-                        "count": 1,
-                        "object_count": 1,
-                        "snapshot_path": snapshot_path   # ← AÑADIR ESTA LÍNEA
-                    }
-                    
             except Exception as e:
-                logging.error(f"Error guardando snapshot: {e}")
+                logging.error(f"Error guardando snapshot (fallback): {e}")
                 snapshot_path = None
 
         # Crear evento en BD + NOTIFICACIONES

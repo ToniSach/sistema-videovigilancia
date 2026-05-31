@@ -25,7 +25,7 @@ def get_users():
             "data": [u.to_dict() for u in users if u.is_active]
         }), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @users_bp.route("/", methods=["POST"])
@@ -50,7 +50,7 @@ def create_user():
     except ValueError as e:
         return jsonify({"success": False, "error": str(e)}), 400
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @users_bp.route("/<int:user_id>", methods=["PUT"])
@@ -65,7 +65,7 @@ def update_user(user_id):
             return jsonify({"success": False, "error": "Usuario no encontrado"}), 404
         return jsonify({"success": True, "data": user.to_dict()}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @users_bp.route("/<int:user_id>", methods=["DELETE"])
@@ -78,7 +78,7 @@ def delete_user(user_id):
             return jsonify({"success": True, "message": "Usuario eliminado"}), 200
         return jsonify({"success": False, "error": "Usuario no encontrado"}), 404
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @users_bp.route("/me", methods=["GET"])
@@ -102,4 +102,4 @@ def get_current_user():
             }
         }), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500

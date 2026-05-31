@@ -28,11 +28,13 @@ def create_limiter(app):
     """
     Factory para crear Limiter configurado.
     """
-    # ✅ CORREGIDO: la función lambda ahora acepta el argumento 'limit'
+    # Defaults pensados para uso interactivo LAN (NVR con polling de UI).
+    # 50/hora era irreal: el frontend hace polling de eventos cada 3-10s y
+    # cada usuario fácilmente genera 500+ req/h sólo viendo el panel.
     limiter = Limiter(
         app=app,
         key_func=get_key_func,
-        default_limits=["200 per day", "50 per hour"],
+        default_limits=["10000 per day", "1000 per hour"],
         storage_uri="memory://",
         strategy="fixed-window",
         on_breach=lambda limit: jsonify({

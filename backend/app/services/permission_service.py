@@ -93,12 +93,29 @@ class PermissionService:
             raise
     
     def get_camera_permissions(self, camera_id: int) -> List[UserCameraPermission]:
-        """Obtiene todos los permisos sobre una cámara."""
+        """
+        Obtiene todos los permisos sobre una cámara.
+
+        IMPORTANTE: usa joinedload sobre `user` para que el endpoint pueda
+        acceder a `p.user.username` después de cerrar la sesión sin disparar
+        un lazy-load que produce DetachedInstanceError → HTTP 500.
+        """
         try:
+            from sqlalchemy.orm import joinedload
             with db_manager.get_session() as session:
-                perms = session.query(UserCameraPermission).filter_by(camera_id=camera_id).all()
+                perms = (
+                    session.query(UserCameraPermission)
+                    .options(joinedload(UserCameraPermission.user))
+                    .filter_by(camera_id=camera_id)
+                    .all()
+                )
+                # Forzar acceso al user dentro de la sesión (rellena el cache)
+                # y expungar todo el grafo para uso post-sesión.
                 for p in perms:
+                    _ = p.user.username if p.user else None
                     session.expunge(p)
+                    if p.user:
+                        session.expunge(p.user)
                 return perms
         except Exception as e:
             self.logger.error(f"Error obteniendo permisos de cámara: {e}")

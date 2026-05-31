@@ -53,7 +53,9 @@ class LiveHLSService:
         
         self._active_streams: Dict[int, Dict] = {}  # camera_id -> {process, profiles, last_access}
         self._lock = threading.RLock()
-        self._running = True
+        # Event en vez de bool: shutdown() despierta el cleanup_loop al
+        # instante en lugar de esperar hasta el próximo sleep(60).
+        self._shutdown_event = threading.Event()
         
         self._ffmpeg_path = shutil.which("ffmpeg")
         if not self._ffmpeg_path:
@@ -180,7 +182,10 @@ class LiveHLSService:
             return process
             
         except Exception as e:
-            logger.error(f"Error iniciando FFmpeg para perfil {profile.name}: {e}")
+            logger.error(
+                f"Error iniciando FFmpeg para perfil {profile.name}: {e}",
+                exc_info=True,
+            )
             return None
     
     def _generate_master_playlist(self, camera_id: int):
@@ -257,60 +262,84 @@ class LiveHLSService:
     def stop_stream(self, camera_id: int) -> bool:
         """
         Detiene streaming HLS para una cámara y limpia recursos.
+
+        El borrado de archivos sucede DESPUÉS de confirmar que todos los
+        procesos FFmpeg murieron (con kill como fallback). Antes se hacía
+        rmtree mientras FFmpeg todavía estaba escribiendo segmentos, lo
+        que dejaba archivos corruptos o errores intermitentes en el log.
         """
         with self._lock:
             if camera_id not in self._active_streams:
                 return False
-            
+
             logger.info(f"Deteniendo HLS live para cámara {camera_id}")
-            stream_info = self._active_streams[camera_id]
-            
-            # Terminar procesos FFmpeg
-            for profile_name, profile_info in stream_info['profiles'].items():
-                process = profile_info.get('process')
-                if process and process.poll() is None:
+            stream_info = self._active_streams.pop(camera_id)
+            processes = [
+                p.get('process') for p in stream_info['profiles'].values()
+                if p.get('process')
+            ]
+
+        # Fuera del lock: terminar procesos (puede tardar segundos)
+        for process in processes:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"FFmpeg HLS cam {camera_id} no respondió a terminate, kill")
                     try:
-                        process.terminate()
-                        process.wait(timeout=3)
-                        if process.poll() is None:
-                            process.kill()
+                        process.kill()
+                        process.wait(timeout=2)
                     except Exception as e:
-                        logger.error(f"Error deteniendo FFmpeg para {profile_name}: {e}")
-            
-            # Limpiar archivos
-            try:
-                camera_path = self._get_camera_path(camera_id)
-                if camera_path.exists():
-                    shutil.rmtree(camera_path)
-            except Exception as e:
-                logger.error(f"Error limpiando archivos HLS: {e}")
-            
-            del self._active_streams[camera_id]
-            return True
+                        logger.error(f"Error matando FFmpeg HLS cam {camera_id}: {e}")
+                except Exception as e:
+                    logger.error(f"Error deteniendo FFmpeg HLS cam {camera_id}: {e}")
+
+        # Confirmar que ninguno sigue vivo antes de borrar archivos
+        for process in processes:
+            if process.poll() is None:
+                logger.error(
+                    f"FFmpeg HLS cam {camera_id} sigue vivo tras kill; "
+                    f"NO se borra carpeta para no corromper segmentos en uso"
+                )
+                return True
+
+        # Ahora sí, borrar archivos
+        try:
+            camera_path = self._get_camera_path(camera_id)
+            if camera_path.exists():
+                shutil.rmtree(camera_path, ignore_errors=True)
+        except Exception as e:
+            logger.error(f"Error limpiando archivos HLS cam {camera_id}: {e}")
+
+        return True
     
     def _cleanup_loop(self):
         """
         Limpia streams que no han sido accedidos en los últimos 60 segundos.
         """
-        while self._running:
-            time.sleep(self.CLEANUP_INTERVAL)
-            
+        while not self._shutdown_event.is_set():
+            # wait() vuelve True si shutdown_event se setea → salimos al instante.
+            if self._shutdown_event.wait(timeout=self.CLEANUP_INTERVAL):
+                break
+
             try:
+                # Recolectar ids bajo lock; stop_stream se ejecuta fuera del
+                # lock (adentro de stop_stream se vuelve a adquirir) para no
+                # bloquear start_stream/get_segment durante terminate() de FFmpeg.
                 with self._lock:
                     now = time.time()
-                    to_remove = []
-                    
-                    for camera_id, stream_info in self._active_streams.items():
-                        idle_time = now - stream_info['last_access']
-                        if idle_time > 60:  # 60 segundos sin viewers
-                            to_remove.append(camera_id)
-                    
-                    for camera_id in to_remove:
-                        logger.info(f"Stream HLS cámara {camera_id} inactivo, limpiando...")
-                        self.stop_stream(camera_id)
-                        
+                    to_remove = [
+                        cam_id for cam_id, info in self._active_streams.items()
+                        if now - info['last_access'] > 60
+                    ]
+
+                for camera_id in to_remove:
+                    logger.info(f"Stream HLS cámara {camera_id} inactivo, limpiando...")
+                    self.stop_stream(camera_id)
+
             except Exception as e:
-                logger.error(f"Error en cleanup loop HLS: {e}")
+                logger.error(f"Error en cleanup loop HLS: {e}", exc_info=True)
     
     def get_stats(self) -> dict:
         """Estadísticas del servicio HLS."""
@@ -323,13 +352,19 @@ class LiveHLSService:
     
     def shutdown(self):
         """Detiene todos los streams activos."""
-        self._running = False
-        
+        self._shutdown_event.set()
+
+        # Recolectar IDs bajo lock, pero llamar stop_stream fuera (ya gestiona
+        # su propio lock y FFmpeg terminate puede tardar segundos).
         with self._lock:
             camera_ids = list(self._active_streams.keys())
-            for camera_id in camera_ids:
-                self.stop_stream(camera_id)
-        
+        for camera_id in camera_ids:
+            self.stop_stream(camera_id)
+
+        # Esperar a que el cleanup_thread salga limpiamente
+        if self._cleanup_thread and self._cleanup_thread.is_alive():
+            self._cleanup_thread.join(timeout=2)
+
         logger.info("LiveHLSService detenido")
 
 

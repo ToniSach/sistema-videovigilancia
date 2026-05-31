@@ -92,3 +92,79 @@ backend/tests/img3.jpg
 backend/tests/img4.jpg
 backend/tests/img5.jpg
 .env.example
+
+
+
+# Virtual envs
+env/
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Tests basura
+tests/
+test/
+*_test.py
+
+# ONVIF wsdl
+wsdl/
+*.wsdl
+
+# Logs
+logs/
+*.log
+
+# Build
+build/
+dist/
+
+# VSCode
+.vscode/
+
+# Node
+node_modules/
+
+# Cache
+.cache/
+pytest_cache/
+
+# Database temporales
+*.sqlite
+*.db
+
+# Videos temporales
+recordings/
+tmp/
+temp/
+
+# Entornos virtuales
+**/env/
+**/venv/
+**/.venv/
+
+# Cache
+**/__pycache__/
+**/*.pyc
+
+# Tests
+**/tests/
+**/test/
+
+# ONVIF WSDL
+**/wsdl/
+**/*.wsdl
+
+# Logs
+**/*.log
+**/logs/
+
+# Node
+**/node_modules/
+
+# Temp
+**/tmp/
+**/temp/

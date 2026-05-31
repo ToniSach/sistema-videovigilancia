@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Tema oscuro tipo desktop_app (slate + acento celeste).
+         MaterialComponents.NoActionBar porque la app usa Toolbar custom o
+         toolbar nativo con tinte; activeBar la sobreescribimos en colors. -->
+    <style name="Theme.MyApplication" parent="Theme.MaterialComponents.NoActionBar">
+        <item name="colorPrimary">@color/accent_cyan</item>
+        <item name="colorPrimaryVariant">@color/accent_indigo</item>
+        <item name="colorOnPrimary">@color/primary_dark</item>
+
+        <item name="colorSecondary">@color/accent_indigo</item>
+        <item name="colorSecondaryVariant">@color/accent_cyan</item>
+        <item name="colorOnSecondary">@color/primary_dark</item>
+
+        <item name="android:colorBackground">@color/background</item>
+        <item name="colorSurface">@color/surface</item>
+        <item name="colorOnSurface">@color/text_primary</item>
+        <item name="colorError">@color/accent_danger</item>
+
+        <item name="android:windowBackground">@color/background</item>
+        <item name="android:statusBarColor">@color/primary_dark</item>
+        <item name="android:navigationBarColor">@color/primary_dark</item>
+
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="android:textColorHint">@color/text_secondary</item>
+
+        <!-- Para que los iconos del status bar sean claros sobre fondo oscuro -->
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

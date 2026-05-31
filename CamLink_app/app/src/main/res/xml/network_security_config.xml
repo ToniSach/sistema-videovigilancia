@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    El backend NVR corre en LAN local sobre HTTP (no HTTPS) porque es un
+    sistema doméstico/empresarial cerrado: no expone certificados públicos,
+    no hay CA confiable, y forzar HTTPS exigiría auto-firmados que el usuario
+    tendría que aceptar manualmente. Aceptamos el riesgo de cleartext SOLO
+    porque el tráfico nunca sale de la red local.
+
+    Si en el futuro el backend se publica en Internet o detrás de un reverse
+    proxy con TLS, eliminar `cleartextTrafficPermitted="true"` y restringir
+    por domain-config.
+-->
+<network-security-config xmlns:tools="http://schemas.android.com/tools"
+    tools:ignore="InsecureBaseConfiguration">
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

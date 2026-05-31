@@ -1,12 +1,18 @@
 """
-Control PTZ tipo joystick/virtual pad.
+Control PTZ tipo joystick con layout 3×3 + zoom + control de velocidad.
+
+Patrón estándar NVR (Hikvision, Dahua, Milestone): press → start continuous
+move; release → stop. NO usa auto-repeat — el ONVIF `ContinuousMove` ya
+mueve la cámara continuamente hasta recibir `Stop`. El auto-repeat causaba
+spam de requests y rate-limit.
 """
 import logging
-from typing import Callable
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton,
+    QLabel, QSlider, QFrame,
+)
+from PySide6.QtCore import Qt, Signal
 
 from desktop_app.src.config import config
 
@@ -14,134 +20,225 @@ logger = logging.getLogger(__name__)
 
 
 class PTZJoystick(QWidget):
-    """Control direccional PTZ con soporte para presionar y mantener."""
-    
-    # Señales
-    move = Signal(str, float)  # dirección, velocidad
+    """
+    Joystick PTZ visual con 8 direcciones + stop + zoom + velocidad.
+
+    Emite:
+      - move(direction: str, speed: float) cuando se presiona un botón direccional
+      - stop()                              cuando se suelta
+    """
+
+    move = Signal(str, float)
     stop = Signal()
-    
+
+    # Mapeo botón → dirección (compatible con backend ptz_controller)
+    _DIRECTIONS = [
+        ("↖", "up_left",   0, 0),
+        ("↑", "up",        0, 1),
+        ("↗", "up_right",  0, 2),
+        ("←", "left",      1, 0),
+        ("●", "stop",      1, 1),  # botón central = stop manual
+        ("→", "right",     1, 2),
+        ("↙", "down_left", 2, 0),
+        ("↓", "down",      2, 1),
+        ("↘", "down_right",2, 2),
+    ]
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        
-        self._setup_ui()
-        self._pressed_button: str = None
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._on_repeat)
-        self._repeat_interval = 100  # ms
         self._speed = 0.5
-    
+        self._setup_ui()
+
     def _setup_ui(self):
-        """Construye interfaz de joystick."""
         layout = QVBoxLayout(self)
-        layout.setSpacing(4)
-        layout.setContentsMargins(8, 8, 8, 8)
-        
-        # Estilo glass
+        layout.setSpacing(12)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        # Estilo de la tarjeta
         self.setStyleSheet(f"""
             PTZJoystick {{
                 background-color: {config.GLASS_BG};
                 border: 1px solid {config.GLASS_BORDER};
                 border-radius: {config.BORDER_RADIUS}px;
             }}
+        """)
+
+        # Título
+        title = QLabel("🎮  Control PTZ")
+        title.setStyleSheet(
+            f"color: {config.THEME_ACCENT}; font-weight: bold; font-size: 14px;"
+        )
+        layout.addWidget(title)
+
+        # === Grid de dirección 3×3 ===
+        grid_wrapper = QHBoxLayout()
+        grid_wrapper.addStretch()
+
+        grid = QGridLayout()
+        grid.setSpacing(6)
+
+        for label, direction, row, col in self._DIRECTIONS:
+            btn = QPushButton(label)
+            btn.setFixedSize(56, 56)
+            btn.setCursor(Qt.PointingHandCursor)
+            if direction == "stop":
+                btn.setStyleSheet(self._stop_button_style())
+                btn.clicked.connect(self._on_stop_click)
+            else:
+                btn.setStyleSheet(self._direction_button_style())
+                btn.setAutoRepeat(False)  # CLAVE: sin auto-repeat
+                btn.pressed.connect(lambda d=direction: self._on_press(d))
+                btn.released.connect(self._on_release)
+            grid.addWidget(btn, row, col)
+
+        grid_wrapper.addLayout(grid)
+        grid_wrapper.addStretch()
+        layout.addLayout(grid_wrapper)
+
+        # Separador
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"background-color: {config.GLASS_BORDER};")
+        sep.setFixedHeight(1)
+        layout.addWidget(sep)
+
+        # === Zoom in/out ===
+        zoom_label = QLabel("🔍 Zoom")
+        zoom_label.setStyleSheet(
+            f"color: {config.THEME_TEXT_MUTED}; font-size: 11px; font-weight: bold;"
+        )
+        layout.addWidget(zoom_label)
+
+        zoom_row = QHBoxLayout()
+        zoom_row.addStretch()
+        btn_zin = QPushButton("➕ Acercar")
+        btn_zin.setFixedHeight(40)
+        btn_zin.setMinimumWidth(110)
+        btn_zin.setCursor(Qt.PointingHandCursor)
+        btn_zin.setStyleSheet(self._zoom_button_style())
+        btn_zin.pressed.connect(lambda: self._on_press("zoom_in"))
+        btn_zin.released.connect(self._on_release)
+        zoom_row.addWidget(btn_zin)
+
+        btn_zout = QPushButton("➖ Alejar")
+        btn_zout.setFixedHeight(40)
+        btn_zout.setMinimumWidth(110)
+        btn_zout.setCursor(Qt.PointingHandCursor)
+        btn_zout.setStyleSheet(self._zoom_button_style())
+        btn_zout.pressed.connect(lambda: self._on_press("zoom_out"))
+        btn_zout.released.connect(self._on_release)
+        zoom_row.addWidget(btn_zout)
+        zoom_row.addStretch()
+        layout.addLayout(zoom_row)
+
+        # === Slider de velocidad ===
+        speed_row = QHBoxLayout()
+        speed_lbl = QLabel("Velocidad:")
+        speed_lbl.setStyleSheet(f"color: {config.THEME_TEXT}; font-size: 11px;")
+        speed_row.addWidget(speed_lbl)
+
+        self.slider_speed = QSlider(Qt.Horizontal)
+        self.slider_speed.setRange(10, 100)
+        self.slider_speed.setValue(50)
+        self.slider_speed.valueChanged.connect(self._on_speed_change)
+        self.slider_speed.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                background-color: {config.THEME_SECONDARY};
+                height: 4px;
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background-color: {config.THEME_ACCENT};
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }}
+        """)
+        speed_row.addWidget(self.slider_speed, 1)
+
+        self.lbl_speed_val = QLabel("50%")
+        self.lbl_speed_val.setStyleSheet(
+            f"color: {config.THEME_ACCENT}; font-weight: bold; min-width: 35px;"
+        )
+        speed_row.addWidget(self.lbl_speed_val)
+        layout.addLayout(speed_row)
+
+    # ------------------------------------------------------------------
+    # Estilos de botones
+    # ------------------------------------------------------------------
+    def _direction_button_style(self) -> str:
+        return f"""
             QPushButton {{
                 background-color: {config.THEME_SECONDARY};
                 color: {config.THEME_TEXT};
-                border: none;
-                border-radius: 6px;
-                padding: 8px;
-                min-width: 30px;
-                min-height: 30px;
+                border: 1px solid {config.GLASS_BORDER};
+                border-radius: 8px;
+                font-size: 20px;
+                font-weight: bold;
             }}
             QPushButton:hover {{
                 background-color: {config.THEME_ACCENT};
+                color: {config.THEME_PRIMARY};
             }}
             QPushButton:pressed {{
-                background-color: {config.THEME_ACCENT}.darker(120);
+                background-color: #0ea5e9;
             }}
-        """)
-        
-        # Grid direccional
-        grid = QHBoxLayout()
-        
-        # Botón Up
-        self.btn_up = QPushButton("▲")
-        self.btn_up.setAutoRepeat(True)
-        self.btn_up.setAutoRepeatInterval(self._repeat_interval)
-        self.btn_up.pressed.connect(lambda: self._start_move("up"))
-        self.btn_up.released.connect(self._stop_move)
-        
-        # Botón Down
-        self.btn_down = QPushButton("▼")
-        self.btn_down.setAutoRepeat(True)
-        self.btn_down.setAutoRepeatInterval(self._repeat_interval)
-        self.btn_down.pressed.connect(lambda: self._start_move("down"))
-        self.btn_down.released.connect(self._stop_move)
-        
-        # Botón Left
-        self.btn_left = QPushButton("◀")
-        self.btn_left.setAutoRepeat(True)
-        self.btn_left.setAutoRepeatInterval(self._repeat_interval)
-        self.btn_left.pressed.connect(lambda: self._start_move("left"))
-        self.btn_left.released.connect(self._stop_move)
-        
-        # Botón Right
-        self.btn_right = QPushButton("▶")
-        self.btn_right.setAutoRepeat(True)
-        self.btn_right.setAutoRepeatInterval(self._repeat_interval)
-        self.btn_right.pressed.connect(lambda: self._start_move("right"))
-        self.btn_right.released.connect(self._stop_move)
-        
-        # Layout cruz
-        v_layout = QVBoxLayout()
-        v_layout.addWidget(self.btn_up, alignment=Qt.AlignCenter)
-        
-        h_layout = QHBoxLayout()
-        h_layout.addWidget(self.btn_left)
-        h_layout.addWidget(self.btn_right)
-        v_layout.addLayout(h_layout)
-        
-        v_layout.addWidget(self.btn_down, alignment=Qt.AlignCenter)
-        
-        layout.addLayout(v_layout)
-        
-        # Zoom buttons
-        zoom_layout = QHBoxLayout()
-        self.btn_zoom_in = QPushButton("+")
-        self.btn_zoom_out = QPushButton("-")
-        
-        for btn, direction in [(self.btn_zoom_in, "zoom_in"), (self.btn_zoom_out, "zoom_out")]:
-            btn.setAutoRepeat(True)
-            btn.setAutoRepeatInterval(self._repeat_interval)
-            btn.pressed.connect(lambda d=direction: self._start_move(d))
-            btn.released.connect(self._stop_move)
-            zoom_layout.addWidget(btn)
-        
-        layout.addLayout(zoom_layout)
-        
-        # Label
-        self.lbl_status = QLabel("PTZ Ready")
-        self.lbl_status.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 10px;")
-        self.lbl_status.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.lbl_status)
-    
-    def _start_move(self, direction: str):
-        """Inicia movimiento continuo."""
-        self._pressed_button = direction
+        """
+
+    def _stop_button_style(self) -> str:
+        return f"""
+            QPushButton {{
+                background-color: {config.THEME_DANGER};
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-size: 18px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: #dc2626;
+            }}
+        """
+
+    def _zoom_button_style(self) -> str:
+        return f"""
+            QPushButton {{
+                background-color: {config.THEME_SECONDARY};
+                color: {config.THEME_TEXT};
+                border: 1px solid {config.GLASS_BORDER};
+                border-radius: 6px;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{
+                background-color: {config.THEME_ACCENT};
+                color: {config.THEME_PRIMARY};
+            }}
+            QPushButton:pressed {{
+                background-color: #0ea5e9;
+            }}
+        """
+
+    # ------------------------------------------------------------------
+    # Handlers
+    # ------------------------------------------------------------------
+    def _on_press(self, direction: str):
+        """
+        Envía UN solo comando ContinuousMove cuando se presiona el botón.
+        La cámara seguirá moviéndose hasta recibir Stop (al release).
+        """
+        logger.debug(f"PTZ press: {direction} @ speed={self._speed:.2f}")
         self.move.emit(direction, self._speed)
-        self.lbl_status.setText(f"Moving {direction}...")
-    
-    def _stop_move(self):
-        """Detiene movimiento."""
-        if self._pressed_button:
-            self.stop.emit()
-            self._pressed_button = None
-            self.lbl_status.setText("PTZ Ready")
-    
-    def _on_repeat(self):
-        """Repetición mientras se mantiene presionado."""
-        if self._pressed_button:
-            self.move.emit(self._pressed_button, self._speed)
-    
-    def set_speed(self, speed: float):
-        """Cambia velocidad (0.1 - 1.0)."""
-        self._speed = max(0.1, min(1.0, speed))
+
+    def _on_release(self):
+        """Envía Stop cuando se suelta el botón."""
+        logger.debug("PTZ release → stop")
+        self.stop.emit()
+
+    def _on_stop_click(self):
+        """Botón central rojo: stop explícito (por si quedó moviéndose)."""
+        logger.debug("PTZ stop (manual)")
+        self.stop.emit()
+
+    def _on_speed_change(self, value: int):
+        self._speed = value / 100.0
+        self.lbl_speed_val.setText(f"{value}%")

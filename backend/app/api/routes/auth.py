@@ -7,11 +7,12 @@ import socket
 from datetime import timedelta
 
 from flask import Blueprint, request, jsonify, make_response
-from flask_jwt_extended import jwt_required, get_jwt_identity, create_access_token
+from flask_jwt_extended import jwt_required, get_jwt_identity, create_access_token, get_jwt
 
 from backend.app.services.auth_service import AuthService
 from backend.app.core.security import get_current_user_id
 from backend.app.core.qr_generator import QRGenerator
+from backend.app.core.jwt_blocklist import jwt_blocklist
 from backend.app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -103,16 +104,18 @@ def refresh():
 @jwt_required()
 def logout():
     """
-    Endpoint para cerrar sesión (revocación de token).
-    En implementación stateless, el cliente debe eliminar los tokens.
-    El servidor puede mantener una blacklist opcional (no implementada aquí).
-    
-    Returns:
-        200: Confirmación de cierre de sesión
+    Cierra sesión revocando el token actual.
+
+    El jti del token se añade al blocklist en memoria hasta su exp natural.
+    Tokens revocados devuelven 401 en cualquier request posterior.
     """
-    # En implementación JWT stateless, el logout es manejado por cliente
-    # Aquí podríamos agregar token a una blacklist en Redis/database
-    return jsonify({"message": "Sesión cerrada. Elimine los tokens del cliente."}), 200
+    claims = get_jwt()
+    jti = claims.get("jti")
+    exp = claims.get("exp")
+    if jti and exp:
+        jwt_blocklist.revoke(jti, exp)
+        logger.info(f"Token jti={jti[:8]}... revocado (blocklist size={jwt_blocklist.size()})")
+    return jsonify({"message": "Sesión cerrada correctamente"}), 200
 
 
 @auth_bp.route("/me", methods=["GET"])

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <!-- ── VIDEO ── -->
+    <FrameLayout
+        android:id="@+id/videoContainer"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="@drawable/bg_camera_feed" />
+
+    <!-- ── CONTROLES (glass card) ── -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/controlsCard"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_margin="12dp"
+        style="@style/Widget.CamLink.GlassCard"
+        app:contentPadding="12dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <SeekBar
+                android:id="@+id/seekBar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:progressTint="@color/accent_cyan"
+                android:thumbTint="@color/accent_cyan"
+                android:progressBackgroundTint="@color/glass_border_strong" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center"
+                android:orientation="horizontal">
+
+                <ImageButton
+                    android:id="@+id/btnPrevious"
+                    style="@style/Widget.CamLink.IconButton"
+                    android:layout_marginEnd="24dp"
+                    android:contentDescription="@string/track_previous"
+                    android:src="@drawable/ic_skip_previous" />
+
+                <ImageButton
+                    android:id="@+id/btnPlayPause"
+                    style="@style/Widget.CamLink.IconButton"
+                    android:contentDescription="@string/btn_play"
+                    android:src="@drawable/ic_play" />
+
+                <ImageButton
+                    android:id="@+id/btnNext"
+                    style="@style/Widget.CamLink.IconButton"
+                    android:layout_marginStart="24dp"
+                    android:contentDescription="@string/track_next"
+                    android:src="@drawable/ic_skip_next" />
+
+            </LinearLayout>
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+</LinearLayout>

@@ -94,8 +94,14 @@ class MetricsCollector:
         """Registra una nueva cámara para monitoreo."""
         with self._lock:
             if camera_id not in self._camera_metrics:
-                self._camera_metrics[camera_id] = CameraMetrics()
-                logger.info(f"Cámara {camera_id} registrada en métricas")
+                # IMPORTANTE: inicializar last_frame_time = ahora.
+                # Si se queda en 0.0, el stalled monitor ve "1779565812s sin
+                # frames" y reinicia la cámara antes de que llegue el primer frame.
+                m = CameraMetrics()
+                m.last_frame_time = time.time()
+                self._camera_metrics[camera_id] = m
+                logger.info(f"Cámara {camera_id} registrada en métricas "
+                            f"(last_frame_time inicializado a now)")
     
     def unregister_camera(self, camera_id: int) -> None:
         """Elimina una cámara del monitoreo."""
@@ -188,7 +194,73 @@ class MetricsCollector:
         
         for cam_id, metrics in metrics_copy.items():
             time_since_last = now - metrics.last_frame_time
+            # Sanity check: si last_frame_time es 0 o un timestamp absurdo
+            # (pre-1990), no reiniciar — la cámara aún no ha entregado frames.
+            if metrics.last_frame_time < 631152000:  # 1990-01-01
+                logger.debug(f"Cámara {cam_id}: last_frame_time inválido, skip check")
+                continue
             if time_since_last > stalled_threshold:
+                # Si el CameraManager la auto-desactivó por fallo permanente,
+                # NO reiniciar. Antes esto producía un bucle infinito: la cámara
+                # agotaba 10 reintentos (~3 min), el stalled monitor la reanimaba
+                # 15 s después y volvíamos a empezar.
+                try:
+                    if hasattr(camera_manager, "is_auto_disabled") and camera_manager.is_auto_disabled(cam_id):
+                        logger.debug(
+                            f"Cámara {cam_id} auto-desactivada por fallo permanente; "
+                            f"no se reinicia (edita la cámara y reactívala manualmente)"
+                        )
+                        continue
+                except Exception:
+                    pass
+
+                # No interferir si el worker ya está reconectándose por su cuenta.
+                # Si el FFmpeg cayó hace 5s, el worker está en RECONNECTING y
+                # un restart externo aquí duplica el trabajo (doble kill,
+                # doble re-spawn, más tiempo sin frames).
+                try:
+                    worker = camera_manager.get_worker(cam_id)
+                    if worker is None:
+                        # No hay worker: la cámara fue parada/borrada. Limpiar
+                        # métricas huérfanas para no seguir alertando.
+                        logger.debug(
+                            f"Cámara {cam_id} sin worker activo; desregistrando métricas"
+                        )
+                        try:
+                            self.unregister_camera(cam_id)
+                        except Exception:
+                            pass
+                        continue
+                    status = getattr(worker, "status", None)
+                    status_val = getattr(status, "value", str(status))
+                    if status_val in ("reconnecting", "starting"):
+                        logger.debug(
+                            f"Cámara {cam_id} sin frames {time_since_last:.1f}s "
+                            f"pero worker ya está {status_val}; no reinicio"
+                        )
+                        continue
+                    if status_val == "error":
+                        # Worker en ERROR: probablemente está en proceso de auto-
+                        # desactivación pero aún no se ha aplicado el flag.
+                        # No reiniciar; deja que el callback termine.
+                        logger.debug(
+                            f"Cámara {cam_id} en ERROR; esperando auto-desactivación"
+                        )
+                        continue
+                    # Grace period: si el worker está RUNNING pero acaba de
+                    # arrancar (<30s), no reiniciar. Le damos margen para que
+                    # llegue el primer keyframe de la cámara (GOP largo).
+                    running_since = getattr(worker, "_running_since", 0) or 0
+                    if running_since > 0 and (now - running_since) < 30:
+                        logger.debug(
+                            f"Cámara {cam_id} sin frames {time_since_last:.1f}s "
+                            f"pero worker recién arrancado ({now - running_since:.0f}s); "
+                            f"esperando primer keyframe"
+                        )
+                        continue
+                except Exception:
+                    pass
+
                 logger.warning(f"Cámara {cam_id} congelada ({time_since_last:.1f}s sin frames). Reiniciando...")
                 try:
                     camera_manager.restart_camera(cam_id)

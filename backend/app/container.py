@@ -88,13 +88,41 @@ class DependencyContainer:
             # ===============================
             try:
                 from backend.app.services.event_service import EventService
-                
+
                 # Crear EventService singleton (ya registra su callback en EventManager)
                 event_service = EventService(self.event_repository)
                 self._services["event_service"] = event_service
                 logger.info("EventService registrado correctamente")
             except Exception as e:
                 logger.error(f"Error registrando EventService: {e}", exc_info=True)
+
+            # ===============================
+            # 🤖 AI SERVICE SINGLETON
+            # ===============================
+            try:
+                from backend.app.services.ai_service import AIService
+                from backend.app.cameras.camera_manager import CameraManager
+
+                ai_service = AIService(CameraManager())
+                self._services["ai_service"] = ai_service
+                logger.info("AIService registrado correctamente")
+            except Exception as e:
+                logger.error(f"Error registrando AIService: {e}", exc_info=True)
+
+            # ===============================
+            # 🎬 RECORDING MANAGER SINGLETON
+            # ===============================
+            try:
+                from backend.app.recording.recording_manager import RecordingManager
+
+                recording_manager = RecordingManager(
+                    recording_repo=self.recording_repository,
+                    event_repo=self.event_repository,
+                )
+                self._services["recording_manager"] = recording_manager
+                logger.info("RecordingManager registrado correctamente")
+            except Exception as e:
+                logger.error(f"Error registrando RecordingManager: {e}", exc_info=True)
             
             DependencyContainer._initialized = True
             logger.info("DependencyContainer inicializado correctamente")

@@ -53,6 +53,63 @@ except ImportError as e:
 from backend.app.api.middleware.rate_limiter import create_limiter
 
 # ============================================================================
+# BOOTSTRAP TELEGRAM
+# ============================================================================
+
+def _bootstrap_telegram_from_env():
+    """
+    Si el .env trae TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID, los materializa en
+    SystemConfig (clave-valor en BD) y activa el notificador. Esto evita tener
+    que configurar Telegram manualmente para entornos de prueba/desarrollo.
+
+    Si SystemConfig ya tiene esos valores, no los sobreescribe.
+    """
+    bot_token = settings.TELEGRAM_BOT_TOKEN
+    chat_id = settings.TELEGRAM_CHAT_ID
+    if not bot_token or not chat_id:
+        logger.info("Bootstrap Telegram omitido: .env sin token/chat_id")
+        return
+
+    from backend.app.database.models import SystemConfig
+
+    defaults = {
+        "telegram_bot_token": bot_token,
+        "telegram_chat_id": chat_id,
+        "telegram_chat_ids": chat_id,
+        "telegram_enabled": "true",
+        # Filtros: notificar todos los tipos comunes
+        "notify_person": "true",
+        "notify_vehicle": "true",
+        "notify_motion": "true",
+        "notify_camera_offline": "true",
+        "notify_tampering": "true",
+    }
+
+    inserted = 0
+    with db_manager.get_session() as session:
+        existing = {c.key: c for c in session.query(SystemConfig).all()}
+        for key, value in defaults.items():
+            if key not in existing:
+                session.add(SystemConfig(key=key, value=value))
+                inserted += 1
+        session.commit()
+
+    if inserted:
+        logger.info(f"Bootstrap Telegram: {inserted} claves insertadas en SystemConfig")
+
+    # Recargar config del notificador y suscribirlo a EventManager para que
+    # los eventos generados por AI lleguen como notificaciones.
+    try:
+        from backend.app.notifications.telegram_notifier import telegram_notifier
+        from backend.app.events.event_manager import event_manager
+        telegram_notifier.reload_config()
+        event_manager.subscribe_all(telegram_notifier._on_event)
+        logger.info("TelegramNotifier suscrito a EventManager (modo activo)")
+    except Exception as e:
+        logger.error(f"Error suscribiendo TelegramNotifier: {e}")
+
+
+# ============================================================================
 # BLUEPRINTS
 # ============================================================================
 
@@ -90,11 +147,44 @@ def register_blueprints(app):
     # Otros
     safe_register("backend.app.api.routes.qr", "qr_bp")
     safe_register("backend.app.api.routes.storage", "storage_bp")
-    
+
+    # IA (activación por cámara y por lente)
+    safe_register("backend.app.api.routes.ai", "ai_bp")
+
     # FASE 2: Móvil
     safe_register("backend.app.api.routes.mobile", "mobile_bp")
 
+    # WebSocket notificaciones push LAN (cliente Android CamLink)
+    # ws_bp solo registra el blueprint; el Sock se enlaza por separado
+    # en create_app() porque necesita el objeto Flask.
+    safe_register("backend.app.api.routes.ws", "ws_bp")
+
     return blueprints
+
+
+def _exempt_polling_endpoints(app):
+    """Marca endpoints de polling de UI como exentos del rate limiter."""
+    limiter = getattr(app, "limiter", None)
+    if limiter is None:
+        return
+
+    polling_endpoints = (
+        "events.get_events",
+        "ai.get_camera_status",
+        "ai.get_status",
+        "system.get_stats",
+        "system.health_check",
+        "system.get_hardware_info",
+        "storage.get_storage_info",
+        "cameras.get_cameras",
+    )
+    for ep in polling_endpoints:
+        view = app.view_functions.get(ep)
+        if view is not None:
+            try:
+                limiter.exempt(view)
+            except Exception as e:
+                logger.warning(f"No se pudo eximir {ep} del rate limiter: {e}")
 
 # ============================================================================
 # FACTORY
@@ -124,18 +214,49 @@ def create_app(config_name='default'):
     def missing_token_callback(error):
         return jsonify({"success": False, "error": "Autorización requerida"}), 401
 
+    # Blocklist en memoria: token revocados en logout vuelven 401.
+    # Se pierde al reiniciar el backend (los tokens válidos por exp natural
+    # vuelven a aceptarse). Aceptable en LAN; ver core/jwt_blocklist.py.
+    from backend.app.core.jwt_blocklist import jwt_blocklist
+
+    @jwt.token_in_blocklist_loader
+    def check_token_revoked(_jwt_header, jwt_payload):
+        return jwt_blocklist.is_revoked(jwt_payload.get("jti", ""))
+
+    @jwt.revoked_token_loader
+    def revoked_token_callback(_jwt_header, _jwt_payload):
+        return jsonify({"success": False, "error": "Sesión cerrada"}), 401
+
     # Rate Limiter
     limiter = create_limiter(app)
     app.limiter = limiter
 
-    # CORS
+    # CORS — whitelist explícita por defecto.
+    # En LAN normalmente queremos: localhost (desktop_app local) + IPs del
+    # rango privado. NUNCA "*" en respuesta a credentials, eso permite CSRF
+    # desde cualquier sitio que se cargue en el navegador del usuario.
+    # Configurable vía CORS_ORIGINS="http://192.168.1.5,http://10.0.0.7"
+    import os as _os
+    _cors_env = _os.getenv("CORS_ORIGINS", "").strip()
+    if _cors_env:
+        cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+    else:
+        cors_origins = [
+            "http://localhost",
+            "http://127.0.0.1",
+            # Rango LAN privada típico (regex de Flask-CORS)
+            r"http://192\.168\.\d+\.\d+(:\d+)?",
+            r"http://10\.\d+\.\d+\.\d+(:\d+)?",
+            r"http://172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+(:\d+)?",
+        ]
     CORS(app, resources={
         r"/api/*": {
-            "origins": ["http://localhost", "http://127.0.0.1", "*"],
+            "origins": cors_origins,
             "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-            "allow_headers": ["Authorization", "Content-Type"]
+            "allow_headers": ["Authorization", "Content-Type"],
         }
     })
+    logger.info(f"CORS configurado con {len(cors_origins)} origen(es) permitido(s)")
 
     # ============================================================================
     # BASE DE DATOS
@@ -147,6 +268,32 @@ def create_app(config_name='default'):
     except Exception as e:
         logger.critical(f"Error inicializando DB: {e}")
         raise
+
+    # Rehidratar JWT blocklist desde BD (si la tabla existe). Si no existe,
+    # se ignora silenciosamente y la blocklist queda sólo en memoria.
+    try:
+        from backend.app.core.jwt_blocklist import jwt_blocklist
+        jwt_blocklist.rehydrate_from_db()
+    except Exception as e:
+        logger.warning(f"No se pudo rehidratar blocklist JWT: {e}")
+
+    # ============================================================================
+    # BOOTSTRAP TELEGRAM (lee .env y materializa en SystemConfig si falta)
+    # ============================================================================
+    try:
+        _bootstrap_telegram_from_env()
+    except Exception as e:
+        logger.warning(f"No se pudo bootstrap Telegram desde .env: {e}")
+
+    # Iniciar el poller del bot (lee mensajes que llegan al bot para
+    # detectar comandos /vincular). Si no hay bot_token configurado en
+    # SystemConfig el poller no arranca (es OK, sólo significa que aún
+    # no se han añadido las credenciales).
+    try:
+        from backend.app.notifications.telegram_bot_poller import telegram_bot_poller
+        telegram_bot_poller.start()
+    except Exception as e:
+        logger.warning(f"No se pudo iniciar TelegramBotPoller: {e}")
 
     # ============================================================================
     # CONTENEDOR + CÁMARAS + STORAGE MANAGER + METRICS + HLS + CONSISTENCY + STALLED MONITOR
@@ -202,8 +349,17 @@ def create_app(config_name='default'):
         # ================== NUEVO: Stalled camera monitor ==================
         try:
             from backend.app.cameras.camera_manager import CameraManager
-            metrics_collector.start_stalled_monitor(CameraManager())
-            logger.info("Stalled camera monitor iniciado")
+            # Threshold 25s: balance entre detectar cuelgues reales y NO
+            # interferir con el reconnect normal del worker. Antes era 12s,
+            # pero el reconnect de XiongMai tarda ~9s (1s backoff + 5s
+            # arranque FFmpeg + 3-5s GOP), justo en el borde. A 12s el
+            # monitor disparaba en mitad del reconnect y duplicaba el restart.
+            # 25s da margen sobrado: el worker ya tiene su propio watchdog
+            # interno (WATCHDOG_TIMEOUT=30s) que es la primera línea de defensa.
+            metrics_collector.start_stalled_monitor(
+                CameraManager(), interval=10, stalled_threshold=25
+            )
+            logger.info("Stalled camera monitor iniciado (threshold=25s)")
         except Exception as e:
             logger.error(f"Error iniciando monitor de cámaras congeladas: {e}")
 
@@ -218,6 +374,23 @@ def create_app(config_name='default'):
     # ============================================================================
 
     registered = register_blueprints(app)
+
+    # Enlazar el WebSocket de notificaciones (flask-sock). Se hace después
+    # de register_blueprints porque sock.route() escanea las rutas declaradas
+    # en backend/app/api/routes/ws.py. El blueprint ws_bp es solo placeholder
+    # — las rutas WebSocket reales viven en el `sock` global.
+    try:
+        from backend.app.api.routes.ws import sock as _ws_sock
+        _ws_sock.init_app(app)
+        logger.info("WebSocket /ws/notifications enlazado al Flask app")
+    except Exception as e:
+        logger.error(f"No pude enlazar el WebSocket: {e}")
+
+    # Eximir endpoints de polling continuo del rate limiter.
+    # El frontend hace polling cada 3-20s sobre estos endpoints; con el
+    # default global (1000/h) varios usuarios + varias pestañas se pasan.
+    # Estos endpoints son de sólo lectura para UI, así que es seguro.
+    _exempt_polling_endpoints(app)
 
     # ============================================================================
     # HEALTH CHECK
@@ -246,16 +419,37 @@ def create_app(config_name='default'):
 
     @app.errorhandler(500)
     def internal_error(error):
-        logger.error(f"Error 500: {error}")
+        # Detalle completo al log con exc_info; al cliente sólo mensaje genérico
+        # para no filtrar trazas (paths, nombres de columnas, schemas).
+        logger.error(f"Error 500: {error}", exc_info=True)
         return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
     @app.errorhandler(429)
     def ratelimit_handler(e):
         return jsonify({
-            "success": False, 
+            "success": False,
             "error": "Demasiadas solicitudes. Intente más tarde.",
             "retry_after": e.description
         }), 429
+
+    # Handler genérico para cualquier Exception no atrapada en endpoints que
+    # devuelven str(e) o que olvidan try/except. Solo se aplica a errores
+    # NO-HTTPException (las HTTPException tienen handlers propios arriba).
+    from werkzeug.exceptions import HTTPException
+
+    @app.errorhandler(Exception)
+    def handle_unexpected_exception(e):
+        if isinstance(e, HTTPException):
+            # Dejar que Flask maneje 404/405/etc con sus handlers
+            return e
+        logger.error(
+            f"Excepción no manejada en {request.method} {request.path}: {e}",
+            exc_info=True
+        )
+        return jsonify({
+            "success": False,
+            "error": "Error interno del servidor"
+        }), 500
 
     return app
 
@@ -284,12 +478,49 @@ if __name__ == "__main__":
 
         logger.info(f"Iniciando servidor en {settings.SERVER_HOST}:{settings.SERVER_PORT}")
 
+        # ===== Patch crítico para baja latencia en streaming MJPEG =====
+        # Por defecto los sockets TCP usan el algoritmo Nagle: agrupan chunks
+        # pequeños hasta llenar un paquete o esperar 40ms. En MJPEG cada
+        # boundary frame es relativamente pequeño y la espera de Nagle
+        # añadía ~40ms de latencia por frame. Desactivando Nagle (TCP_NODELAY)
+        # cada chunk se envía inmediatamente.
+        #
+        # Sin esto, ningún otro fix de baja latencia sirve completamente.
+        import socket as _socket
+        from werkzeug.serving import WSGIRequestHandler
+
+        class _LowLatencyHandler(WSGIRequestHandler):
+            """WSGIRequestHandler optimizado para streaming MJPEG.
+
+            Aplica dos opciones críticas en cada conexión:
+              - TCP_NODELAY: desactiva Nagle → cada chunk va al instante.
+              - SO_SNDBUF=64 KB: limita el send buffer del kernel para que
+                la backpressure por TCP window se active rápido cuando el
+                cliente lee lento. Sin esto, Windows auto-tunea SO_SNDBUF
+                hasta varios MB y la pila acumula 5-10 s de JPEGs antes
+                de que la app sienta presión (cola maxsize=1 con
+                drop-oldest no protege porque el JPEG ya está en el socket).
+            """
+            def setup(self):
+                try:
+                    self.connection = self.request
+                    self.connection.setsockopt(
+                        _socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1
+                    )
+                    self.connection.setsockopt(
+                        _socket.SOL_SOCKET, _socket.SO_SNDBUF, 64 * 1024
+                    )
+                except Exception:
+                    pass
+                super().setup()
+
         app.run(
             host=settings.SERVER_HOST,
             port=settings.SERVER_PORT,
             debug=False,
             threaded=True,
-            use_reloader=False
+            use_reloader=False,
+            request_handler=_LowLatencyHandler,
         )
 
     except Exception as e:

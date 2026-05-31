@@ -47,10 +47,14 @@ class GlobalExecutor:
         """
         Submit con manejo de rechazo si el sistema está saturado o shutdown.
         """
-        if self._shutdown:
-            logger.warning("Task rechazado: executor está detenido")
-            return None
-            
+        # _shutdown se lee aquí y se escribe en shutdown(): sin lock había
+        # TOCTOU que podía intentar submit() sobre un executor ya cerrado y
+        # dejar contadores inconsistentes.
+        with self._lock:
+            if self._shutdown:
+                logger.warning("Task rechazado: executor está detenido")
+                return None
+
         try:
             future = self._executor.submit(self._wrap_task, fn, *args, **kwargs)
             with self._lock:
@@ -92,7 +96,8 @@ class GlobalExecutor:
 
     def shutdown(self):
         """Detiene el executor gracefulmente."""
-        self._shutdown = True
+        with self._lock:
+            self._shutdown = True
         self._executor.shutdown(wait=False)
         logger.info("GlobalExecutor detenido")
 

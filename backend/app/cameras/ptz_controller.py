@@ -1,171 +1,380 @@
-"""Control PTZ (Pan-Tilt-Zoom) via ONVIF con autenticación UsernameToken (método compatible)."""
-from onvif import ONVIFCamera
-from zeep import Client
-from zeep.wsse import UsernameToken
-from zeep.transports import Transport
-import requests
+"""
+Control PTZ (Pan-Tilt-Zoom) vía ONVIF.
+
+Reescrito para:
+- Usar onvif-zeep de forma consistente (no mezclar zeep.Client manuales).
+- No cargar WSDL desde la cámara por HTTP (muchas no lo exponen): usa el bundle local.
+- Probar Basic Auth primero y caer a UsernameToken (WS-Security) como fallback.
+- Reutilizar la conexión: una instancia por cámara, cacheada en el manager.
+"""
 import logging
-from urllib.parse import urlparse
+import os
+import threading
 from typing import Optional
+from urllib.parse import urlparse
+
+from onvif import ONVIFCamera
+from zeep.exceptions import Fault
+
 from ..database.models import Camera
-import logging
-logging.basicConfig(level=logging.DEBUG)
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_wsdl_dir() -> Optional[str]:
+    """Localiza el directorio WSDL del paquete onvif-zeep instalado."""
+    try:
+        import onvif
+        pkg_dir = os.path.dirname(onvif.__file__)
+        site_packages = os.path.dirname(pkg_dir)
+        for cand in (os.path.join(site_packages, "wsdl"), os.path.join(pkg_dir, "wsdl")):
+            if os.path.isdir(cand):
+                return cand
+    except Exception:
+        pass
+    return None
+
+
+_WSDL_DIR = _resolve_wsdl_dir()
+if _WSDL_DIR:
+    logger.info(f"[PTZ] WSDL local detectado en: {_WSDL_DIR}")
+else:
+    logger.warning("[PTZ] WSDL local NO encontrado, onvif-zeep intentará cargar desde la cámara")
+
+# Mismos puertos que ONVIFDiscovery: muchas cámaras (XiongMai, TP-Link, etc.)
+# no exponen ONVIF en :80 sino en :8000 o :8899.
+_ONVIF_PORTS = [80, 8000, 8080, 8899]
+
+_VALID_DIRECTIONS = {"up", "down", "left", "right",
+                     "up_left", "up_right", "down_left", "down_right",
+                     "zoom_in", "zoom_out"}
 
 
 class PTZController:
+    """
+    Una instancia gestiona la conexión PTZ a una cámara.
+    Pensada para vivir mientras la cámara esté activa (cacheada por PTZManager).
+    """
+
     def __init__(self, camera: Camera):
         self._camera = camera
-        self._ptz = None
+        self._cam: Optional[ONVIFCamera] = None
         self._media = None
-        self._profile_token = camera.profile_token
+        self._ptz = None
+        self._profile_token: Optional[str] = camera.profile_token or None
         self._connected = False
-        self._onvif_cam = None
+        self._lock = threading.Lock()
         self._connect()
 
-    def _get_onvif_base_url(self):
-        if self._camera.onvif_url:
-            parsed = urlparse(self._camera.onvif_url)
-            return f"{parsed.scheme}://{parsed.netloc}"
-        return f"http://{self._camera.ip_address}:80"
+    # ------------------------------------------------------------------
+    # Conexión
+    # ------------------------------------------------------------------
+    def _persist_onvif_port(self, port: int) -> None:
+        """
+        Guarda onvif_url=http://ip:port/onvif/device_service en BD para que la
+        próxima conexión vaya directa al puerto correcto (sin iterar 4 puertos).
+        """
+        expected = f"http://{self._camera.ip_address}:{port}/onvif/device_service"
+        if self._camera.onvif_url == expected:
+            return  # ya está
+        try:
+            from ..database.connection import db_manager
+            from ..database.models import Camera as CameraModel
+            with db_manager.get_session() as session:
+                cam = session.query(CameraModel).filter_by(id=self._camera.id).first()
+                if cam is not None:
+                    cam.onvif_url = expected
+                    session.commit()
+                    self._camera.onvif_url = expected
+                    logger.info(f"[PTZ] cam={self._camera.id} onvif_url guardado: {expected}")
+        except Exception as e:
+            logger.warning(f"[PTZ] cam={self._camera.id} no pude guardar onvif_url: {e}")
 
-    def _create_zeep_client(self, wsdl_url):
-        """Crea un cliente zeep con autenticación UsernameToken."""
-        session = requests.Session()
-        transport = Transport(session=session, timeout=10)
-        client = Client(wsdl_url, transport=transport, wsse=UsernameToken(self._camera.username, self._camera.password))
-        return client
+    def _candidate_ports(self) -> list[int]:
+        """
+        Devuelve la lista de puertos ONVIF a probar.
+        Si la cámara trae onvif_url con puerto, ese va primero.
+        El resto se prueba después por si el guardado es incorrecto.
+        """
+        if self._camera.onvif_url:
+            try:
+                p = urlparse(self._camera.onvif_url).port
+                if p:
+                    ordered = [p] + [x for x in _ONVIF_PORTS if x != p]
+                    return ordered
+            except Exception:
+                pass
+        return list(_ONVIF_PORTS)
+
+    def _build_cam(self, port: int) -> Optional[ONVIFCamera]:
+        """
+        Construye un cliente onvif-zeep contra ip:port.
+        La autenticación va con username/password (PasswordText por defecto en zeep).
+        El kwarg `wsse` no existe en esta versión del paquete, así que NO lo pasamos.
+        """
+        kwargs = {"encrypt": False, "no_cache": True}
+        if _WSDL_DIR:
+            kwargs["wsdl_dir"] = _WSDL_DIR
+        try:
+            logger.debug(
+                f"[PTZ] cam={self._camera.id} probando {self._camera.ip_address}:{port} "
+                f"user={self._camera.username!r}"
+            )
+            cam = ONVIFCamera(
+                self._camera.ip_address, port,
+                self._camera.username or "", self._camera.password or "",
+                **kwargs
+            )
+            cam.devicemgmt.GetCapabilities({"Category": "All"})
+            logger.info(
+                f"[PTZ] cam={self._camera.id} ONVIF OK en {self._camera.ip_address}:{port}"
+            )
+            return cam
+        except Fault as e:
+            logger.debug(f"[PTZ] cam={self._camera.id} Fault :{port} → {e}")
+            return None
+        except Exception as e:
+            logger.debug(f"[PTZ] cam={self._camera.id} :{port} → {type(e).__name__}: {e}")
+            return None
 
     def _connect(self) -> None:
-        try:
-            base_url = self._get_onvif_base_url()
-            # URLs WSDL
-            device_wsdl = f"{base_url}/onvif/device_service?wsdl"
-            media_wsdl = f"{base_url}/onvif/media_service?wsdl"
-            ptz_wsdl = f"{base_url}/onvif/ptz_service?wsdl"
+        ports = self._candidate_ports()
+        logger.info(f"[PTZ] cam={self._camera.id} puertos candidatos: {ports}")
+        cam = None
+        working_port = None
+        for port in ports:
+            cam = self._build_cam(port)
+            if cam is not None:
+                working_port = port
+                break
 
-            # Crear cliente ONVIF sin wsse (no lo soporta)
-            self._onvif_cam = ONVIFCamera(
-                self._camera.ip_address,
-                urlparse(base_url).port or 80,
-                self._camera.username,
-                self._camera.password,
-                no_cache=True
+        if cam is None:
+            logger.warning(
+                f"[PTZ] cam={self._camera.id} ({self._camera.ip_address}): "
+                f"no se pudo conectar en ninguno de los puertos {ports}"
             )
-            
-            # Reemplazar el transporte de los servicios con uno que tenga wsse
-            # Método: crear servicios manualmente
-            from onvif import ONVIFService
-            
-            # Servicio Media
-            media_client = self._create_zeep_client(media_wsdl)
-            self._media = ONVIFService(media_client, 'Media', 'http://www.onvif.org/ver10/media/wsdl')
-            
-            # Obtener perfiles
+            return
+
+        # Persistir el puerto que funcionó para la próxima vez
+        self._persist_onvif_port(working_port)
+
+        try:
+            self._media = cam.create_media_service()
             profiles = self._media.GetProfiles()
             if not profiles:
-                self._connected = False
+                logger.warning(f"PTZ: cámara {self._camera.id} sin perfiles ONVIF")
                 return
-            
-            profile = profiles[0]
-            if not hasattr(profile, 'PTZConfiguration') or profile.PTZConfiguration is None:
-                logging.warning(f"Cámara {self._camera.id} no tiene configuración PTZ")
-                self._connected = False
+
+            # 1) si la cámara ya trae un profile_token guardado y tiene PTZ, usarlo
+            chosen = None
+            if self._profile_token:
+                for p in profiles:
+                    if p.token == self._profile_token and getattr(p, "PTZConfiguration", None):
+                        chosen = p
+                        break
+
+            # 2) si no, buscar el primer perfil con PTZConfiguration
+            if chosen is None:
+                for p in profiles:
+                    if getattr(p, "PTZConfiguration", None) is not None:
+                        chosen = p
+                        break
+
+            if chosen is None:
+                logger.info(f"Cámara {self._camera.id} no tiene perfiles con PTZ")
                 return
-            
-            # Servicio PTZ
-            ptz_client = self._create_zeep_client(ptz_wsdl)
-            self._ptz = ONVIFService(ptz_client, 'PTZ', 'http://www.onvif.org/ver20/ptz/wsdl')
-            
-            # Probar conexión
-            self._ptz.GetStatus({"ProfileToken": profile.token})
-            self._profile_token = profile.token
+
+            self._ptz = cam.create_ptz_service()
+            # GetStatus valida que el endpoint PTZ responde con este perfil
+            self._ptz.GetStatus({"ProfileToken": chosen.token})
+
+            self._profile_token = chosen.token
+            self._cam = cam
             self._connected = True
-            logging.info(f"PTZ conectado para cámara {self._camera.id} (puerto {urlparse(base_url).port})")
-            
+            logger.info(f"PTZ conectado para cámara {self._camera.id} "
+                        f"(perfil={chosen.token})")
         except Exception as e:
-            logging.warning(f"ONVIF no disponible: {e}")
+            logger.warning(f"PTZ no disponible en cámara {self._camera.id}: {e}")
             self._connected = False
+
+    # ------------------------------------------------------------------
+    # API pública
+    # ------------------------------------------------------------------
+    def is_supported(self) -> bool:
+        return self._connected
 
     def move(self, direction: str, speed: float = 0.5) -> bool:
         if not self._connected:
             return False
-        try:
-            velocity = self._ptz.create_type("PTZVector")
-            if direction == "up":
-                velocity.PanTilt = {"x": 0.0, "y": speed}
-            elif direction == "down":
-                velocity.PanTilt = {"x": 0.0, "y": -speed}
-            elif direction == "left":
-                velocity.PanTilt = {"x": -speed, "y": 0.0}
-            elif direction == "right":
-                velocity.PanTilt = {"x": speed, "y": 0.0}
-            elif direction == "zoom_in":
-                velocity.Zoom = {"x": speed}
-            elif direction == "zoom_out":
-                velocity.Zoom = {"x": -speed}
-            else:
-                return False
-            request = self._ptz.create_type("ContinuousMove")
-            request.ProfileToken = self._profile_token
-            request.Velocity = velocity
-            self._ptz.ContinuousMove(request)
-            return True
-        except Exception as e:
-            logging.error(f"Error moviendo PTZ: {e}")
+        if direction not in _VALID_DIRECTIONS:
+            logger.warning(f"Dirección PTZ inválida: {direction}")
             return False
+
+        speed = max(-1.0, min(1.0, float(speed)))
+
+        with self._lock:
+            try:
+                req = self._ptz.create_type("ContinuousMove")
+                req.ProfileToken = self._profile_token
+                req.Velocity = self._velocity_for(direction, speed)
+                self._ptz.ContinuousMove(req)
+                return True
+            except Exception as e:
+                logger.error(f"Error PTZ ContinuousMove({direction}) cam {self._camera.id}: {e}")
+                return False
+
+    def _velocity_for(self, direction: str, speed: float) -> dict:
+        """Construye el PTZVector según la dirección."""
+        pan_tilt = {"x": 0.0, "y": 0.0}
+        zoom = {"x": 0.0}
+
+        if direction == "up":
+            pan_tilt["y"] = speed
+        elif direction == "down":
+            pan_tilt["y"] = -speed
+        elif direction == "left":
+            pan_tilt["x"] = -speed
+        elif direction == "right":
+            pan_tilt["x"] = speed
+        elif direction == "up_left":
+            pan_tilt["x"], pan_tilt["y"] = -speed, speed
+        elif direction == "up_right":
+            pan_tilt["x"], pan_tilt["y"] = speed, speed
+        elif direction == "down_left":
+            pan_tilt["x"], pan_tilt["y"] = -speed, -speed
+        elif direction == "down_right":
+            pan_tilt["x"], pan_tilt["y"] = speed, -speed
+        elif direction == "zoom_in":
+            zoom["x"] = speed
+        elif direction == "zoom_out":
+            zoom["x"] = -speed
+
+        return {"PanTilt": pan_tilt, "Zoom": zoom}
 
     def stop(self) -> bool:
         if not self._connected:
             return False
+        with self._lock:
+            try:
+                req = self._ptz.create_type("Stop")
+                req.ProfileToken = self._profile_token
+                req.PanTilt = True
+                req.Zoom = True
+                self._ptz.Stop(req)
+                return True
+            except Exception as e:
+                logger.error(f"Error PTZ Stop cam {self._camera.id}: {e}")
+                return False
+
+    def get_status(self) -> Optional[dict]:
+        if not self._connected:
+            return None
         try:
-            request = self._ptz.create_type("Stop")
-            request.ProfileToken = self._profile_token
-            request.PanTilt = True
-            request.Zoom = True
-            self._ptz.Stop(request)
-            return True
+            status = self._ptz.GetStatus({"ProfileToken": self._profile_token})
+            pos = getattr(status, "Position", None)
+            return {
+                "pan_tilt": {
+                    "x": float(pos.PanTilt.x) if pos and pos.PanTilt else None,
+                    "y": float(pos.PanTilt.y) if pos and pos.PanTilt else None,
+                } if pos else None,
+                "zoom": float(pos.Zoom.x) if pos and pos.Zoom else None,
+                "moving": str(getattr(status, "MoveStatus", "")),
+            }
         except Exception as e:
-            logging.error(f"Error deteniendo PTZ: {e}")
-            return False
+            logger.error(f"Error PTZ GetStatus cam {self._camera.id}: {e}")
+            return None
 
     def get_presets(self) -> list[dict]:
         if not self._connected:
             return []
         try:
-            request = self._ptz.create_type("GetPresets")
-            request.ProfileToken = self._profile_token
-            presets = self._ptz.GetPresets(request)
-            return [{"token": preset.token, "name": preset.Name} for preset in presets]
+            req = self._ptz.create_type("GetPresets")
+            req.ProfileToken = self._profile_token
+            presets = self._ptz.GetPresets(req) or []
+            return [{"token": p.token, "name": getattr(p, "Name", "")} for p in presets]
         except Exception as e:
-            logging.error(f"Error obteniendo presets: {e}")
+            logger.error(f"Error obteniendo presets cam {self._camera.id}: {e}")
             return []
 
-    def go_to_preset(self, preset_token: str) -> bool:
+    def goto_preset(self, preset_token: str, speed: float = 0.5) -> bool:
         if not self._connected:
             return False
+        speed = max(0.0, min(1.0, float(speed)))
         try:
-            request = self._ptz.create_type("GotoPreset")
-            request.ProfileToken = self._profile_token
-            request.PresetToken = preset_token
-            request.Speed = {"PanTilt": {"x": 0.5, "y": 0.5}, "Zoom": {"x": 0.5}}
-            self._ptz.GotoPreset(request)
+            req = self._ptz.create_type("GotoPreset")
+            req.ProfileToken = self._profile_token
+            req.PresetToken = preset_token
+            req.Speed = {"PanTilt": {"x": speed, "y": speed}, "Zoom": {"x": speed}}
+            self._ptz.GotoPreset(req)
             return True
         except Exception as e:
-            logging.error(f"Error yendo a preset: {e}")
+            logger.error(f"Error yendo a preset {preset_token} cam {self._camera.id}: {e}")
             return False
+
+    # Alias por compatibilidad con código previo
+    go_to_preset = goto_preset
 
     def set_preset(self, name: str) -> Optional[str]:
         if not self._connected:
             return None
         try:
-            request = self._ptz.create_type("SetPreset")
-            request.ProfileToken = self._profile_token
-            request.PresetName = name
-            response = self._ptz.SetPreset(request)
-            return response.PresetToken
+            req = self._ptz.create_type("SetPreset")
+            req.ProfileToken = self._profile_token
+            req.PresetName = name
+            resp = self._ptz.SetPreset(req)
+            return resp.PresetToken
         except Exception as e:
-            logging.error(f"Error guardando preset: {e}")
+            logger.error(f"Error guardando preset cam {self._camera.id}: {e}")
             return None
 
-    def is_supported(self) -> bool:
-        return self._connected
+    def remove_preset(self, preset_token: str) -> bool:
+        if not self._connected:
+            return False
+        try:
+            req = self._ptz.create_type("RemovePreset")
+            req.ProfileToken = self._profile_token
+            req.PresetToken = preset_token
+            self._ptz.RemovePreset(req)
+            return True
+        except Exception as e:
+            logger.error(f"Error removiendo preset {preset_token} cam {self._camera.id}: {e}")
+            return False
+
+
+class PTZManager:
+    """
+    Cachea PTZControllers por camera_id para evitar reconectar en cada comando.
+    Thread-safe.
+    """
+    _instance: "Optional[PTZManager]" = None
+    _instance_lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if hasattr(self, "_initialized"):
+            return
+        self._initialized = True
+        self._controllers: dict[int, PTZController] = {}
+        self._lock = threading.Lock()
+
+    def get(self, camera: Camera) -> PTZController:
+        with self._lock:
+            ctrl = self._controllers.get(camera.id)
+            if ctrl is not None and ctrl.is_supported():
+                return ctrl
+            ctrl = PTZController(camera)
+            self._controllers[camera.id] = ctrl
+            return ctrl
+
+    def drop(self, camera_id: int) -> None:
+        with self._lock:
+            self._controllers.pop(camera_id, None)
+
+
+ptz_manager = PTZManager()

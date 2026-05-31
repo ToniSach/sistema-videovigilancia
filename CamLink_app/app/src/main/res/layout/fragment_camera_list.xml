@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!-- ── CARD CAMARA 1 (envuelve un ConstraintLayout porque dimensionRatio
+         sólo funciona dentro de ConstraintLayout, no en MaterialCardView). ── -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/cardCam1"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="12dp"
+        android:layout_marginEnd="12dp"
+        style="@style/Widget.CamLink.GlassCard"
+        app:contentPadding="0dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <androidx.constraintlayout.widget.ConstraintLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <FrameLayout
+                android:id="@+id/feedCam1"
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:background="@drawable/bg_camera_feed"
+                android:clickable="true"
+                android:focusable="true"
+                app:layout_constraintDimensionRatio="16:9"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toTopOf="parent">
+
+                <TextView
+                    android:id="@+id/tvCamName1"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="bottom"
+                    android:background="@color/overlay_dark"
+                    android:paddingHorizontal="10dp"
+                    android:paddingVertical="6dp"
+                    android:textColor="@color/text_primary"
+                    android:textSize="12sp"
+                    android:textStyle="bold"
+                    tools:text="Cámara 1" />
+
+                <ImageButton
+                    android:id="@+id/btnRemoveCam1"
+                    android:layout_width="32dp"
+                    android:layout_height="32dp"
+                    android:layout_gravity="top|end"
+                    android:layout_margin="6dp"
+                    android:background="@android:color/transparent"
+                    android:contentDescription="@string/btn_remove_cam"
+                    android:src="@drawable/ic_close_red" />
+            </FrameLayout>
+        </androidx.constraintlayout.widget.ConstraintLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+    <!-- ── CARD CAMARA 2 ── -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/cardCam2"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="10dp"
+        android:layout_marginEnd="12dp"
+        style="@style/Widget.CamLink.GlassCard"
+        app:contentPadding="0dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/cardCam1">
+
+        <androidx.constraintlayout.widget.ConstraintLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <FrameLayout
+                android:id="@+id/feedCam2"
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:background="@drawable/bg_camera_feed"
+                android:clickable="true"
+                android:focusable="true"
+                app:layout_constraintDimensionRatio="16:9"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toTopOf="parent">
+
+                <TextView
+                    android:id="@+id/tvCamName2"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="bottom"
+                    android:background="@color/overlay_dark"
+                    android:paddingHorizontal="10dp"
+                    android:paddingVertical="6dp"
+                    android:textColor="@color/text_primary"
+                    android:textSize="12sp"
+                    android:textStyle="bold"
+                    tools:text="Cámara 2" />
+
+                <ImageButton
+                    android:id="@+id/btnRemoveCam2"
+                    android:layout_width="32dp"
+                    android:layout_height="32dp"
+                    android:layout_gravity="top|end"
+                    android:layout_margin="6dp"
+                    android:background="@android:color/transparent"
+                    android:contentDescription="@string/btn_remove_cam"
+                    android:src="@drawable/ic_close_red" />
+            </FrameLayout>
+        </androidx.constraintlayout.widget.ConstraintLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+    <!-- ── PAGINACIÓN ── -->
+    <ImageButton
+        android:id="@+id/btnPrevPage"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:layout_marginTop="10dp"
+        android:background="@android:color/transparent"
+        android:src="@drawable/ic_arrow_left"
+        android:contentDescription="@string/page_previous"
+        app:layout_constraintTop_toBottomOf="@id/cardCam2"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/tvPageInfo" />
+
+    <TextView
+        android:id="@+id/tvPageInfo"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:textColor="@color/text_primary"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        tools:text="1 / 1"
+        app:layout_constraintTop_toBottomOf="@id/cardCam2"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <ImageButton
+        android:id="@+id/btnNextPage"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:layout_marginTop="10dp"
+        android:background="@android:color/transparent"
+        android:src="@drawable/ic_arrow_right"
+        android:contentDescription="@string/page_next"
+        app:layout_constraintTop_toBottomOf="@id/cardCam2"
+        app:layout_constraintStart_toEndOf="@id/tvPageInfo"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- ── BARRA INFERIOR: Toggle · Fullscreen ── -->
+    <ImageButton
+        android:id="@+id/btnVideoList"
+        style="@style/Widget.CamLink.IconButton"
+        android:layout_marginBottom="20dp"
+        android:contentDescription="@string/btn_video_list"
+        android:src="@drawable/ic_video_library"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/btnFullscreen"
+        app:layout_constraintHorizontal_chainStyle="spread"
+        app:layout_constraintStart_toStartOf="parent" />
+
+    <ImageButton
+        android:id="@+id/btnFullscreen"
+        style="@style/Widget.CamLink.IconButton"
+        android:layout_marginBottom="20dp"
+        android:contentDescription="@string/btn_fullscreen"
+        android:src="@drawable/ic_fullscreen"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toEndOf="@id/btnVideoList" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

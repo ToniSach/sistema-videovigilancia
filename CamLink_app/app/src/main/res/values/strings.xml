@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CamLink</string>
+
+    <!-- QR -->
+    <string name="qr_title">Escanea el QR para enlazar tus camaras</string>
+    <string name="qr_status_waiting">Apunta al codigo QR generado en la app de escritorio</string>
+    <string name="qr_status_invalid">QR no reconocido o invalido</string>
+    <string name="qr_status_expired">QR expirado o ya usado, genera uno nuevo</string>
+    <string name="qr_status_registering">Vinculando dispositivo…</string>
+    <string name="qr_status_no_network">No hay conexion al servidor del QR</string>
+    <string name="qr_camera_disabled">Camara desactivada. Concede el permiso para escanear.</string>
+    <string name="qr_btn_grant_camera">Conceder acceso a la camara</string>
+    <string name="btn_manual_connect">Conectar manualmente</string>
+
+    <!-- Live View -->
+    <string name="btn_mic">Microfono</string>
+    <string name="btn_record">Grabar</string>
+    <string name="btn_night">Modo noche</string>
+    <string name="btn_video_list">Lista camaras</string>
+    <string name="btn_fullscreen">Pantalla completa</string>
+    <string name="btn_remove_cam">Quitar camara</string>
+    <string name="feed_previous">Feed anterior</string>
+    <string name="feed_next">Feed siguiente</string>
+    <string name="page_previous">Pagina anterior</string>
+    <string name="page_next">Pagina siguiente</string>
+    <string name="page_format">%1$d / %2$d</string>
+    <string name="track_previous">Anterior</string>
+    <string name="track_next">Siguiente</string>
+
+    <!-- Popup menu -->
+    <string name="menu_grabaciones">Grabaciones</string>
+    <string name="menu_notificaciones">Notificaciones</string>
+    <string name="menu_cerrar_sesion">Cerrar sesion</string>
+
+    <!-- Recordings -->
+    <string name="recordings_title">Grabaciones</string>
+    <string name="btn_play">Reproducir</string>
+    <string name="btn_favorite">Favorito</string>
+    <string name="label_alert">Alerta</string>
+
+    <!-- Event config -->
+    <string name="event_config_title">Configuracion de Eventos</string>
+
+    <!-- Notifications panel -->
+    <string name="notifications_title">Notificaciones</string>
+    <string name="notifications_btn_config">Configurar</string>
+    <string name="notifications_event_icon">Icono del evento</string>
+    <string name="notifications_empty_title">Sin notificaciones recientes</string>
+    <string name="notifications_empty_subtitle">Cuando una camara detecte algo aparecera aqui</string>
+    <string name="notifications_load_error">No se pudieron cargar las notificaciones</string>
+
+    <!-- Preferences (CRUD real) -->
+    <string name="pref_section_global">Eventos para todas las camaras</string>
+    <string name="pref_channel_push">Push</string>
+    <string name="pref_channel_telegram">Telegram</string>
+    <string name="pref_event_person">Persona detectada</string>
+    <string name="pref_event_vehicle">Vehiculo detectado</string>
+    <string name="pref_event_motion">Movimiento</string>
+    <string name="pref_event_camera_offline">Camara offline</string>
+    <string name="pref_event_camera_reconnected">Camara reconectada</string>
+    <string name="pref_event_tampering">Manipulacion</string>
+    <string name="pref_save_ok">Preferencia guardada</string>
+    <string name="pref_save_failed">No se pudo guardar la preferencia</string>
+    <string name="pref_load_failed">No se pudieron cargar las preferencias</string>
+
+    <!-- Dialog conexion manual -->
+    <string name="dialog_title_manual">Conexion manual</string>
+    <string name="label_ip">Direccion IP</string>
+    <string name="hint_ip">192.168.1.100</string>
+    <string name="label_port">Puerto</string>
+    <string name="hint_port">8080</string>
+    <string name="label_user">Usuario</string>
+    <string name="hint_user">admin</string>
+    <string name="label_password">Contrasena</string>
+    <string name="hint_password">********</string>
+    <string name="btn_connect">Conectar</string>
+    <string name="btn_cancel">Cancelar</string>
+    <string name="error_ip_port_required">IP y puerto son obligatorios</string>
+</resources>

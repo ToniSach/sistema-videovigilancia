@@ -14,6 +14,7 @@ import logging
 import threading
 import time
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional, Dict, List
 
@@ -53,10 +54,29 @@ class TelegramNotifier:
         self._notify_types = set()
         self._lock = threading.Lock()
 
-        # Seguridad snapshots
-        self._allowed_base_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "recordings")
+        # POOL DEDICADO para HTTP a Telegram. Aislado de GlobalExecutor.
+        # Motivo: cada send_event_notification hace 1-2 requests HTTP con
+        # timeout 10-30s. Si compartiéramos GlobalExecutor con MJPEG, la
+        # encoder de la live se quedaría en cola detrás de Telegrams.
+        # 2 workers = máx 2 envíos simultáneos por proceso → suficiente
+        # para alertas (con cooldown=30s) y no satura red de salida.
+        # Cualquier exceso se encola en el pool (no en global_executor).
+        self._http_pool = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="TelegramHTTP"
         )
+
+        # Seguridad snapshots: el path real es settings.RECORDINGS_PATH
+        # (típicamente "recordings/" relativo al CWD). Antes calculábamos
+        # "<backend>/../../recordings" que daba "<root>/backend/recordings/"
+        # — directorio inexistente. Como los snapshots se guardan en
+        # "<root>/recordings/snapshots/...", la validación SIEMPRE fallaba
+        # y TelegramNotifier mandaba sólo texto sin foto.
+        try:
+            from backend.app.config import settings as _settings
+            self._allowed_base_path = os.path.abspath(_settings.RECORDINGS_PATH)
+        except Exception:
+            self._allowed_base_path = os.path.abspath("recordings")
 
         self._load_config()
 
@@ -110,15 +130,39 @@ class TelegramNotifier:
     def _on_event(self, event_data: EventData):
         with self._lock:
             if not self._enabled:
+                logger.warning(
+                    f"[TELEGRAM] Evento '{event_data.event_type}' IGNORADO: "
+                    f"Telegram no está activo (revisa SystemConfig.telegram_enabled)"
+                )
+                return
+            if not self._chat_ids:
+                logger.warning(
+                    f"[TELEGRAM] Evento '{event_data.event_type}' IGNORADO: "
+                    f"no hay chat_ids configurados"
+                )
                 return
             if self._notify_types and event_data.event_type not in self._notify_types:
+                logger.info(
+                    f"[TELEGRAM] Evento '{event_data.event_type}' filtrado "
+                    f"(activos: {self._notify_types})"
+                )
                 return
 
-        threading.Thread(
-            target=self.send_event_notification,
-            args=(event_data,),
-            daemon=True
-        ).start()
+        logger.info(
+            f"[TELEGRAM] 📤 Enviando evento '{event_data.event_type}' "
+            f"de cam {event_data.camera_id} a {len(self._chat_ids)} chat(s)"
+        )
+        # Pool DEDICADO de Telegram (no global_executor) → los HTTP lentos
+        # NO bloquean al encoder MJPEG ni al frame distributor. Si los 2
+        # workers están ocupados, la tarea se encola en el pool de Telegram,
+        # NO en el del resto del sistema.
+        try:
+            self._http_pool.submit(self.send_event_notification, event_data)
+        except RuntimeError:
+            logger.warning(
+                f"[TELEGRAM] HTTP pool cerrado, evento '{event_data.event_type}' "
+                f"cam {event_data.camera_id} descartado"
+            )
 
     # =========================================================================
     # API PRINCIPAL (PASIVA - USAR ESTA)
@@ -153,6 +197,18 @@ class TelegramNotifier:
                 ok = self._send_message(chat_id, message)
 
             success = success and ok
+
+        if success:
+            logger.info(
+                f"[TELEGRAM] ✓ Notificación '{event_data.event_type}' "
+                f"enviada a {len(self._chat_ids)} chat(s)"
+                + (" (con foto)" if validated else " (solo texto)")
+            )
+        else:
+            logger.error(
+                f"[TELEGRAM] ✗ FALLÓ envío de '{event_data.event_type}'. "
+                f"Revisa bot_token y conectividad a api.telegram.org"
+            )
 
         return success
 
@@ -196,22 +252,34 @@ class TelegramNotifier:
 
     def _validate_snapshot_path(self, path: Optional[str]) -> Optional[str]:
         if not path:
+            logger.debug("[TELEGRAM] snapshot_path es None/vacío — no envío foto")
             return None
 
         try:
             base = os.path.realpath(self._allowed_base_path)
+            # Si path ya es absoluto, os.path.join(base, abs_path) = abs_path
+            # Si path es relativo (p.ej. 'snapshots/5/123.jpg' SIN 'recordings/'),
+            # se concatena correctamente.
             real = os.path.realpath(os.path.join(base, path))
 
             if not real.startswith(base):
-                logger.warning("Path traversal bloqueado")
+                logger.warning(
+                    f"[TELEGRAM] Path traversal bloqueado o fuera de base. "
+                    f"base={base} real={real}"
+                )
                 return None
 
             if not os.path.isfile(real):
+                logger.warning(
+                    f"[TELEGRAM] snapshot NO existe en disco: {real} "
+                    f"(path original={path})"
+                )
                 return None
 
             return real
 
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[TELEGRAM] _validate_snapshot_path error: {e}")
             return None
 
     # =========================================================================

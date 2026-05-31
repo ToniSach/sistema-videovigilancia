@@ -204,7 +204,7 @@ def get_notifications_history():
         
     except Exception as e:
         logger.error(f"Error en historial de notificaciones: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @mobile_bp.route("/cameras/<int:camera_id>/thumbnail", methods=["GET"])
@@ -268,7 +268,7 @@ def get_camera_thumbnail(camera_id: int):
             
     except Exception as e:
         logger.error(f"Error generando thumbnail: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @mobile_bp.route("/streaming/hls/<int:camera_id>/master.m3u8", methods=["GET"])
@@ -319,7 +319,7 @@ def get_hls_manifest(camera_id: int):
         
     except Exception as e:
         logger.error(f"Error en HLS manifest: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @mobile_bp.route("/streaming/hls/<int:camera_id>/<string:profile>/<string:filename>", methods=["GET"])
@@ -327,26 +327,176 @@ def get_hls_manifest(camera_id: int):
 def get_hls_segment(camera_id: int, profile: str, filename: str):
     """
     Endpoint para segmentos TS individuales (HLS).
+
+    Path traversal cerrado: profile y filename solo pueden ser nombres
+    alfanuméricos cortos; el path real se resuelve y se verifica que
+    siga dentro de la carpeta HLS_LIVE de la cámara.
+    """
+    try:
+        import re
+        from pathlib import Path
+        from flask import send_file
+
+        # Validación de inputs — antes podía pasar "../../etc/passwd"
+        if not re.match(r"^[A-Za-z0-9_\-]{1,32}$", profile):
+            return jsonify({"success": False, "error": "profile inválido"}), 400
+        if not re.match(r"^[A-Za-z0-9_\-]{1,64}\.(ts|m3u8)$", filename):
+            return jsonify({"success": False, "error": "filename inválido"}), 400
+
+        user_id = int(get_jwt_identity())
+        permission_service = PermissionService()
+        if not permission_service.check_permission(user_id, camera_id, 'view'):
+            return jsonify({"success": False, "error": "Permiso denegado"}), 403
+
+        segment_path = live_hls_service.get_segment(camera_id, profile, filename)
+        if not segment_path:
+            return jsonify({"success": False, "error": "Segmento no encontrado"}), 404
+
+        # Defensa en profundidad: el path debe estar dentro del directorio
+        # HLS de la cámara (por si el servicio devolvió algo raro).
+        resolved = Path(segment_path).resolve(strict=True)
+        expected_root = (
+            live_hls_service._base_path / str(camera_id)
+        ).resolve()
+        try:
+            resolved.relative_to(expected_root)
+        except ValueError:
+            logger.error(
+                f"Intento de path traversal HLS: cam={camera_id} path={resolved}"
+            )
+            return jsonify({"success": False, "error": "Acceso denegado"}), 403
+
+        return send_file(
+            str(resolved),
+            mimetype="video/MP2T" if filename.endswith(".ts") else "application/vnd.apple.mpegurl",
+            as_attachment=False,
+        )
+
+    except FileNotFoundError:
+        return jsonify({"success": False, "error": "Segmento no encontrado"}), 404
+    except Exception as e:
+        logger.error(f"Error sirviendo segmento HLS: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "Error interno"}), 500
+
+
+# ============================================================================
+# RECORDINGS — endpoints específicos para móvil
+# ============================================================================
+
+@mobile_bp.route("/cameras/<int:camera_id>/recordings", methods=["GET"])
+@jwt_required()
+def list_camera_recordings(camera_id: int):
+    """
+    Lista grabaciones de una cámara con filtros por rango.
+
+    Query params:
+      from   ISO datetime (ej: 2026-05-23T00:00:00)
+      to     ISO datetime
+      limit  máximo de resultados (default 50, max 200)
+      offset paginación
     """
     try:
         user_id = int(get_jwt_identity())
         permission_service = PermissionService()
-        
         if not permission_service.check_permission(user_id, camera_id, 'view'):
             return jsonify({"success": False, "error": "Permiso denegado"}), 403
-        
-        segment_path = live_hls_service.get_segment(camera_id, profile, filename)
-        
-        if not segment_path:
-            return jsonify({"success": False, "error": "Segmento no encontrado"}), 404
-        
-        from flask import send_file
-        return send_file(
-            segment_path,
-            mimetype="video/MP2T",
-            as_attachment=False
-        )
-        
+
+        # Parseo de filtros
+        from_str = request.args.get("from")
+        to_str = request.args.get("to")
+        try:
+            from_dt = datetime.fromisoformat(from_str) if from_str else None
+            to_dt = datetime.fromisoformat(to_str) if to_str else None
+        except ValueError:
+            return jsonify({
+                "success": False,
+                "error": "from/to inválido (usar ISO 8601)"
+            }), 400
+
+        limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+        offset = max(int(request.args.get("offset", 0)), 0)
+
+        repo = RecordingRepository()
+        if from_dt and to_dt:
+            recordings = repo.get_by_date_range(camera_id, from_dt, to_dt)
+            # Aplicar paginación manualmente (el repo no la soporta)
+            recordings = recordings[offset:offset + limit]
+        else:
+            # Sin rango → últimos N por cámara
+            recordings = repo.get_by_camera(camera_id, limit=limit + offset)
+            recordings = recordings[offset:offset + limit]
+
+        # Serializar como dicts ligeros (sin path absoluto)
+        data = []
+        for r in recordings:
+            data.append({
+                "id": r.id,
+                "camera_id": r.camera_id,
+                "start_time": r.start_time.isoformat() if r.start_time else None,
+                "end_time": r.end_time.isoformat() if r.end_time else None,
+                "duration_seconds": r.duration_seconds,
+                "file_size_bytes": r.file_size_bytes,
+            })
+
+        return jsonify({
+            "success": True,
+            "data": data,
+            "count": len(data),
+            "limit": limit,
+            "offset": offset,
+        }), 200
+
     except Exception as e:
-        logger.error(f"Error sirviendo segmento HLS: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.error(f"Error listando grabaciones móvil: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "Error interno"}), 500
+
+
+@mobile_bp.route("/recordings/<int:recording_id>/download", methods=["GET"])
+@jwt_required()
+def download_recording(recording_id: int):
+    """
+    Descarga una grabación. Valida que el usuario tenga permiso 'view' o
+    'download' sobre la cámara correspondiente.
+
+    Path traversal cerrado: el file_path se resuelve y se verifica que esté
+    bajo RECORDINGS_PATH.
+    """
+    try:
+        from pathlib import Path
+        from flask import send_file
+        from backend.app.config import settings
+
+        user_id = int(get_jwt_identity())
+        repo = RecordingRepository()
+        recording = repo.get_by_id(recording_id) if hasattr(repo, "get_by_id") else None
+        if not recording:
+            return jsonify({"success": False, "error": "Grabación no encontrada"}), 404
+
+        permission_service = PermissionService()
+        if not (
+            permission_service.check_permission(user_id, recording.camera_id, 'download')
+            or permission_service.check_permission(user_id, recording.camera_id, 'view')
+        ):
+            return jsonify({"success": False, "error": "Permiso denegado"}), 403
+
+        recordings_root = Path(settings.RECORDINGS_PATH).resolve()
+        try:
+            file_path = Path(recording.file_path).resolve(strict=True)
+            file_path.relative_to(recordings_root)
+        except (ValueError, FileNotFoundError):
+            logger.error(
+                f"Path traversal o archivo no existe: rec={recording_id} "
+                f"path={recording.file_path}"
+            )
+            return jsonify({"success": False, "error": "Archivo no disponible"}), 404
+
+        return send_file(
+            str(file_path),
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=f"recording_{recording_id}.mp4",
+        )
+
+    except Exception as e:
+        logger.error(f"Error descargando grabación móvil: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "Error interno"}), 500

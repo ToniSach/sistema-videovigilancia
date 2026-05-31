@@ -45,7 +45,7 @@ def get_storage_info():
         }), 200
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @storage_bp.route("/config", methods=["POST"])
@@ -93,7 +93,7 @@ def update_storage_config():
         }), 200
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
 @storage_bp.route("/cleanup", methods=["POST"])
@@ -121,4 +121,4 @@ def cleanup_storage():
         }), 200
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500

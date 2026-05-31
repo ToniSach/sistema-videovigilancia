@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/label_ip"
+        android:textColor="@color/text_secondary"
+        android:textSize="12sp"
+        android:layout_marginBottom="4dp" />
+
+    <EditText
+        android:id="@+id/etIp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        style="@style/Widget.CamLink.EditText"
+        android:hint="@string/hint_ip"
+        android:inputType="text"
+        android:singleLine="true"
+        android:autofillHints="no"
+        android:layout_marginBottom="14dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/label_port"
+        android:textColor="@color/text_secondary"
+        android:textSize="12sp"
+        android:layout_marginBottom="4dp" />
+
+    <EditText
+        android:id="@+id/etPort"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        style="@style/Widget.CamLink.EditText"
+        android:hint="@string/hint_port"
+        android:inputType="number"
+        android:singleLine="true"
+        android:autofillHints="no"
+        android:layout_marginBottom="14dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/label_user"
+        android:textColor="@color/text_secondary"
+        android:textSize="12sp"
+        android:layout_marginBottom="4dp" />
+
+    <EditText
+        android:id="@+id/etUser"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        style="@style/Widget.CamLink.EditText"
+        android:hint="@string/hint_user"
+        android:inputType="text"
+        android:singleLine="true"
+        android:autofillHints="username"
+        android:layout_marginBottom="14dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/label_password"
+        android:textColor="@color/text_secondary"
+        android:textSize="12sp"
+        android:layout_marginBottom="4dp" />
+
+    <EditText
+        android:id="@+id/etPassword"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        style="@style/Widget.CamLink.EditText"
+        android:hint="@string/hint_password"
+        android:inputType="textPassword"
+        android:singleLine="true"
+        android:autofillHints="password" />
+
+</LinearLayout>

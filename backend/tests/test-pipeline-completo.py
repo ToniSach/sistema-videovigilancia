@@ -34,8 +34,8 @@ logging.basicConfig(
 logger = logging.getLogger("IntegrationTest")
 
 TELEGRAM_CONFIG = {
-    "telegram_bot_token": "secreto",
-    "telegram_chat_id": "secreto",
+    "telegram_bot_token": "8520537600:AAG2LQoESqyRZJsNr_WY3Y1fGCvvHFlFzvE",
+    "telegram_chat_id": "1383506337",
     "telegram_enabled": "true",
     "notify_person": "true",
     "notify_vehicle": "true",
