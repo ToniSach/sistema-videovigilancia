@@ -262,6 +262,9 @@ class NotificationPreferencesView(QWidget):
         # ============ SECCIÓN TELEGRAM ============
         self._setup_telegram_section(layout)
 
+        # ============ TABLA ADMIN: Usuarios ↔ Telegram ↔ preferencias ========
+        self._setup_admin_overview(layout)
+
         # ============ SECCIÓN PREFERENCIAS ============
         prefs_header = QHBoxLayout()
         prefs_title = QLabel("Mis preferencias")
@@ -310,9 +313,13 @@ class NotificationPreferencesView(QWidget):
 
     def set_current_user(self, _user_id: int, _role: str = ""):
         self._role = (_role or "").lower()
+        is_admin = self._role == "admin"
         # El botón de configurar el token del bot solo tiene sentido para admin.
         if hasattr(self, "btn_telegram_config"):
-            self.btn_telegram_config.setVisible(self._role == "admin")
+            self.btn_telegram_config.setVisible(is_admin)
+        # La tabla "Usuarios y Telegram" es solo para admin.
+        if hasattr(self, "admin_card"):
+            self.admin_card.setVisible(is_admin)
         self.refresh()
 
     def refresh(self):
@@ -330,6 +337,10 @@ class NotificationPreferencesView(QWidget):
 
         # Recargar también la sección Telegram
         self._refresh_telegram_chats()
+
+        # Tabla admin (solo si es admin y la tarjeta existe)
+        if self._role == "admin" and hasattr(self, "admin_table"):
+            self._refresh_admin_overview()
 
     def _populate(self):
         self.table.setRowCount(0)
@@ -435,6 +446,80 @@ class NotificationPreferencesView(QWidget):
         api_client.delete(f"notifications/preferences/{p['id']}", on_del)
 
     # ==================================================================
+    # TABLA ADMIN: Usuarios ↔ Telegram ↔ preferencias
+    # ==================================================================
+    def _setup_admin_overview(self, parent_layout: QVBoxLayout):
+        """Tarjeta (solo admin) que resume cada usuario: Telegram + nº prefs."""
+        from PySide6.QtWidgets import QFrame
+
+        self.admin_card = QFrame()
+        self.admin_card.setStyleSheet(
+            "QFrame { background-color: #1e293b; border-radius: 10px; padding: 12px; }"
+        )
+        v = QVBoxLayout(self.admin_card)
+        v.setSpacing(8)
+
+        title = QLabel("Usuarios y Telegram")
+        title.setStyleSheet(
+            f"color: {config.THEME_TEXT}; font-size: 15px; font-weight: bold;"
+        )
+        v.addWidget(title)
+
+        sub = QLabel(
+            "<i>Resumen de cada usuario: si tiene Telegram vinculado y cuántas "
+            "reglas de notificación activas. Cada usuario gestiona sus propias "
+            "preferencias; aquí solo las consultas.</i>"
+        )
+        sub.setWordWrap(True)
+        sub.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 11px;")
+        v.addWidget(sub)
+
+        self.admin_table = QTableWidget(0, 4)
+        self.admin_table.setHorizontalHeaderLabels(
+            ["Usuario", "Rol", "Telegram", "Reglas activas"]
+        )
+        self.admin_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.admin_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.admin_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.admin_table.setMaximumHeight(200)
+        try:
+            from desktop_app.src.ui.views.users_view import _TABLE_STYLE
+            self.admin_table.setStyleSheet(_TABLE_STYLE)
+        except Exception:
+            pass
+        v.addWidget(self.admin_table)
+
+        self.admin_card.setVisible(False)  # set_current_user lo muestra si admin
+        parent_layout.addWidget(self.admin_card)
+
+    def _refresh_admin_overview(self):
+        def on_overview(response):
+            if not response.success:
+                return
+            rows = response.data or []
+            self.admin_table.setRowCount(0)
+            for u in rows:
+                r = self.admin_table.rowCount()
+                self.admin_table.insertRow(r)
+                self.admin_table.setItem(r, 0, QTableWidgetItem(u.get("username", "")))
+                self.admin_table.setItem(r, 1, QTableWidgetItem(u.get("role", "user")))
+
+                tg = u.get("telegram") or []
+                if tg:
+                    names = ", ".join("@" + (c.get("username") or "?") for c in tg)
+                    tg_item = QTableWidgetItem(names)
+                    tg_item.setIcon(icon("ok", "#22c55e"))
+                else:
+                    tg_item = QTableWidgetItem("No vinculado")
+                    tg_item.setForeground(Qt.gray)
+                self.admin_table.setItem(r, 2, tg_item)
+
+                self.admin_table.setItem(
+                    r, 3, QTableWidgetItem(str(u.get("active_preferences", 0)))
+                )
+        api_client.get("telegram/admin/overview", on_overview)
+
+    # ==================================================================
     # SECCIÓN TELEGRAM
     # ==================================================================
     def _setup_telegram_section(self, parent_layout: QVBoxLayout):
@@ -480,6 +565,22 @@ class NotificationPreferencesView(QWidget):
         self.btn_telegram_config.setVisible(False)
         self.btn_telegram_config.clicked.connect(self._configure_telegram_bot)
         h.addWidget(self.btn_telegram_config)
+
+        self.btn_telegram_test = QPushButton("  Enviar prueba")
+        self.btn_telegram_test.setIcon(icon("telegram"))
+        self.btn_telegram_test.setToolTip(
+            "Envía un mensaje de prueba a tus chats vinculados"
+        )
+        self.btn_telegram_test.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b; color: #f1f5f9;
+                border: 1px solid rgba(255,255,255,0.15);
+                border-radius: 6px; padding: 7px 12px;
+            }
+            QPushButton:hover { background-color: #334155; }
+        """)
+        self.btn_telegram_test.clicked.connect(self._test_my_telegram)
+        h.addWidget(self.btn_telegram_test)
 
         self.btn_telegram_link = QPushButton("  Vincular nuevo chat")
         self.btn_telegram_link.setIcon(icon("link"))
@@ -581,6 +682,23 @@ class NotificationPreferencesView(QWidget):
                 item.setData(Qt.UserRole, c.get("id"))
                 self.list_telegram_chats.addItem(item)
         api_client.get("telegram/chats", on_chats)
+
+    def _test_my_telegram(self):
+        """Envía un mensaje de prueba a los chats vinculados del usuario."""
+        def on_test(response):
+            if response.success:
+                n = (response.data or {}).get("sent", 0)
+                self._toast(f"Mensaje de prueba enviado a {n} chat(s).", "success")
+            else:
+                self._toast(response.error or "No se pudo enviar la prueba.", "error")
+        api_client.post("telegram/test", on_test, data={})
+
+    def _toast(self, message: str, level: str = "info"):
+        try:
+            from desktop_app.src.ui.components.toast import show_toast
+            show_toast(self, message, level=level)
+        except Exception:
+            QMessageBox.information(self, "Telegram", message)
 
     def _open_telegram_dialog(self):
         from desktop_app.src.ui.dialogs.telegram_link_dialog import TelegramLinkDialog

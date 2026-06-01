@@ -5,16 +5,17 @@ Vista de configuración del sistema.
 import logging
 from typing import Optional
 
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QCheckBox, QSpinBox,
                                QFormLayout, QGroupBox, QTabWidget, QComboBox,
-                               QMessageBox, QFileDialog)
-from PySide6.QtCore import Qt
+                               QMessageBox, QFileDialog, QFrame)
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 
 from desktop_app.src.config import config
 from desktop_app.src.services.api_client import api_client
 from desktop_app.src.ui.components.glass_card import GlassCard
+from desktop_app.src.ui.icons import icon
 
 logger = logging.getLogger(__name__)
 
@@ -93,16 +94,27 @@ class SettingsView(QWidget):
         # Tab Almacenamiento
         self._setup_storage_tab()
         
-        layout.addWidget(self.tabs)
-        
-        # Botones de acción
-        btn_layout = QHBoxLayout()
+        layout.addWidget(self.tabs, 1)
+
+        # ── Barra de acción PEGAJOSA (siempre abajo, siempre visible) ──────
+        bar = QFrame()
+        bar.setStyleSheet(
+            "QFrame { background-color: #111c30; border-top: 1px solid "
+            "rgba(255,255,255,0.08); border-radius: 0; }"
+        )
+        btn_layout = QHBoxLayout(bar)
+        btn_layout.setContentsMargins(12, 8, 12, 8)
+
+        # Indicador de cambios sin guardar (oculto hasta que algo cambie).
+        self.lbl_dirty = QLabel("")
+        self.lbl_dirty.setStyleSheet("color: #f59e0b; font-size: 12px; font-weight: bold;")
+        btn_layout.addWidget(self.lbl_dirty)
         btn_layout.addStretch()
-        
-        self.btn_reset = QPushButton("Restaurar Defaults")
-        self.btn_reset.clicked.connect(self._load_settings)
+
+        self.btn_reset = QPushButton("Descartar cambios")
+        self.btn_reset.clicked.connect(self._discard_changes)
         btn_layout.addWidget(self.btn_reset)
-        
+
         self.btn_save = QPushButton("Guardar Cambios")
         self.btn_save.setMinimumHeight(40)
         self.btn_save.setStyleSheet(f"""
@@ -114,12 +126,18 @@ class SettingsView(QWidget):
                 font-weight: bold;
                 padding: 0 30px;
             }}
+            QPushButton:disabled {{ background-color: #334155; color: #64748b; }}
         """)
         self.btn_save.clicked.connect(self._save_settings)
         btn_layout.addWidget(self.btn_save)
-        
-        layout.addLayout(btn_layout)
-        layout.addStretch()
+
+        layout.addWidget(bar)
+
+        # Estado de "cambios sin guardar".
+        self._dirty = False
+        self.btn_save.setEnabled(False)
+        # Conectar señales de cambio de TODOS los controles editables tras cargar.
+        QTimer.singleShot(600, self._wire_dirty_tracking)
     
     def _setup_general_tab(self):
         widget = QWidget()
@@ -148,9 +166,15 @@ class SettingsView(QWidget):
         ai_group = QGroupBox("Inteligencia Artificial")
         ai_layout = QFormLayout(ai_group)
         
+        # Perfiles comerciales (sin exponer "YOLO"). El índice se mapea al
+        # modelo real en el backend (0=nano, 1=small, 2=medium).
         self.cmb_ai_model = QComboBox()
-        self.cmb_ai_model.addItems(["YOLOv8n (Nano)", "YOLOv8s (Small)", "YOLOv8m (Medium)"])
-        ai_layout.addRow("Modelo:", self.cmb_ai_model)
+        self.cmb_ai_model.addItems([
+            "Bajo consumo (rápido)",
+            "Equilibrado",
+            "Alta precisión",
+        ])
+        ai_layout.addRow("Detección de objetos:", self.cmb_ai_model)
         
         self.spin_confidence = QSpinBox()
         self.spin_confidence.setRange(30, 90)
@@ -172,62 +196,38 @@ class SettingsView(QWidget):
         layout = QVBoxLayout(widget)
         layout.setSpacing(16)
         
-        # Telegram
-        telegram_group = QGroupBox("Notificaciones Telegram")
-        telegram_layout = QFormLayout(telegram_group)
+        # Telegram — SIN credenciales manuales (token/chat_id). La vinculación
+        # se hace desde "Notificaciones" con el flujo por código (el usuario
+        # escribe al bot y queda vinculado solo). Aquí solo el estado + atajo.
+        telegram_group = QGroupBox("Telegram")
+        telegram_layout = QVBoxLayout(telegram_group)
 
-        # Banner de estado
         self.lbl_telegram_status = QLabel("Cargando configuración…")
         self.lbl_telegram_status.setStyleSheet(
             f"background:#1e293b; color:{config.THEME_TEXT_MUTED}; "
             f"padding:8px; border-radius:4px; font-size:11px;"
         )
         self.lbl_telegram_status.setWordWrap(True)
-        telegram_layout.addRow(self.lbl_telegram_status)
-
-        self.txt_bot_token = QLineEdit()
-        self.txt_bot_token.setPlaceholderText("123456789:AABBccDDeeFFggHHiiJJkkLL...")
-        self.txt_bot_token.setEchoMode(QLineEdit.Password)
-        # Botón "" para mostrar/ocultar el token
-        telegram_layout.addRow("Bot Token:", self.txt_bot_token)
-
-        self.chk_show_token = QCheckBox("Mostrar token")
-        self.chk_show_token.toggled.connect(
-            lambda on: self.txt_bot_token.setEchoMode(
-                QLineEdit.Normal if on else QLineEdit.Password
-            )
-        )
-        telegram_layout.addRow(self.chk_show_token)
-
-        self.txt_chat_id = QLineEdit()
-        self.txt_chat_id.setPlaceholderText("123456789  (puedes poner varios separados por coma)")
-        telegram_layout.addRow("Chat ID(s):", self.txt_chat_id)
+        telegram_layout.addWidget(self.lbl_telegram_status)
 
         help_telegram = QLabel(
-            "<i>Las credenciales se leen del archivo <code>.env</code> al primer "
-            "arranque. Aquí puedes verlas y editarlas — se guardarán en la BD "
-            "y sobreescribirán las del .env.</i>"
+            "<i>La vinculación de Telegram se gestiona en la pestaña "
+            "<b>Notificaciones</b>: cada usuario vincula su propio chat con un "
+            "código seguro (no hace falta copiar tokens ni IDs).</i>"
         )
         help_telegram.setWordWrap(True)
         help_telegram.setStyleSheet(
-            f"color: {config.THEME_TEXT_MUTED}; font-size: 10px;"
+            f"color: {config.THEME_TEXT_MUTED}; font-size: 11px;"
         )
-        telegram_layout.addRow(help_telegram)
+        telegram_layout.addWidget(help_telegram)
 
-        self.btn_test_telegram = QPushButton("Probar conexión Telegram")
-        self.btn_test_telegram.clicked.connect(self._test_telegram)
-        telegram_layout.addRow(self.btn_test_telegram)
-        
-        self.chk_notify_person = QCheckBox("Personas detectadas")
-        self.chk_notify_person.setChecked(True)
-        telegram_layout.addRow(self.chk_notify_person)
-        
-        self.chk_notify_vehicle = QCheckBox("Vehículos detectados")
-        self.chk_notify_vehicle.setChecked(True)
-        telegram_layout.addRow(self.chk_notify_vehicle)
-        
-        self.chk_notify_motion = QCheckBox("Movimiento (solo sin IA)")
-        telegram_layout.addRow(self.chk_notify_motion)
+        self.btn_goto_notifications = QPushButton("  Ir a Notificaciones")
+        try:
+            self.btn_goto_notifications.setIcon(icon("telegram"))
+        except Exception:
+            pass
+        self.btn_goto_notifications.clicked.connect(self._goto_notifications)
+        telegram_layout.addWidget(self.btn_goto_notifications)
 
         layout.addWidget(telegram_group)
 
@@ -332,6 +332,18 @@ class SettingsView(QWidget):
     def _load_settings(self):
         """Carga configuración desde el backend (system_config + storage info)."""
         def on_config(response):
+            self._loading = True
+            try:
+                self._apply_config(response)
+            finally:
+                self._loading = False
+                self._clear_dirty()
+
+        api_client.get("system/config", on_config)
+        self._reload_test_cameras()
+
+    def _apply_config(self, response):
+        if True:
             if not response.success:
                 logger.warning(f"No se pudo cargar config: {response.error}")
                 return
@@ -350,54 +362,9 @@ class SettingsView(QWidget):
             except (TypeError, ValueError):
                 self.spin_max_storage.setValue(100)
 
-            # Telegram
-            token = str(data.get("telegram_bot_token") or "")
-            self.txt_bot_token.setText(token)
-            # chat_ids puede ser lista separada por coma
-            chat_ids = data.get("telegram_chat_ids") or data.get("telegram_chat_id") or ""
-            self.txt_chat_id.setText(str(chat_ids))
-            enabled = str(data.get("telegram_enabled", "false")).lower() == "true"
-
-            # Banner de estado
-            if token and chat_ids and enabled:
-                self.lbl_telegram_status.setText(
-                    f"Telegram configurado y activo. "
-                    f"Chat(s): {chat_ids}. "
-                    f"Token: {'•' * 10}{token[-4:] if len(token) >= 4 else ''}"
-                )
-                self.lbl_telegram_status.setStyleSheet(
-                    f"background:#0a3622; color:#22c55e; padding:8px; "
-                    f"border-radius:4px; font-size:11px; font-weight:bold;"
-                )
-            elif token and chat_ids:
-                self.lbl_telegram_status.setText(
-                    "Telegram configurado pero DESACTIVADO. "
-                    "Guarda los cambios para activarlo."
-                )
-                self.lbl_telegram_status.setStyleSheet(
-                    f"background:#3a2a0a; color:#fbbf24; padding:8px; "
-                    f"border-radius:4px; font-size:11px;"
-                )
-            else:
-                self.lbl_telegram_status.setText(
-                    "Telegram NO configurado. "
-                    "Añade el bot token y chat ID, luego guarda los cambios."
-                )
-                self.lbl_telegram_status.setStyleSheet(
-                    f"background:#3a0a0a; color:#ef4444; padding:8px; "
-                    f"border-radius:4px; font-size:11px;"
-                )
-
-            # Notification toggles
-            self.chk_notify_person.setChecked(
-                str(data.get("notify_person", "true")).lower() == "true"
-            )
-            self.chk_notify_vehicle.setChecked(
-                str(data.get("notify_vehicle", "true")).lower() == "true"
-            )
-            self.chk_notify_motion.setChecked(
-                str(data.get("notify_motion", "false")).lower() == "true"
-            )
+            # Telegram: solo estado (el bot lo configura el servidor; la
+            # vinculación es por código desde Notificaciones).
+            self._update_telegram_status_banner()
 
             # AI
             try:
@@ -416,10 +383,6 @@ class SettingsView(QWidget):
 
             self._load_storage_info()
 
-        api_client.get("system/config", on_config)
-        # Cargar cámaras para el selector del test event
-        self._reload_test_cameras()
-    
     def _load_storage_info(self):
         def on_storage(response):
             if response.success:
@@ -433,6 +396,35 @@ class SettingsView(QWidget):
         
         api_client.get("storage/info", on_storage)
     
+    def _wire_dirty_tracking(self):
+        """Conecta las señales de cambio de todos los controles editables."""
+        for w in self.findChildren(QSpinBox):
+            w.valueChanged.connect(self._mark_dirty)
+        for w in self.findChildren(QCheckBox):
+            w.toggled.connect(self._mark_dirty)
+        for w in self.findChildren(QComboBox):
+            w.currentIndexChanged.connect(self._mark_dirty)
+        for w in self.findChildren(QLineEdit):
+            w.textEdited.connect(self._mark_dirty)
+
+    def _mark_dirty(self, *args):
+        # Ignorar cambios provocados por la propia carga de settings.
+        if getattr(self, "_loading", False):
+            return
+        self._dirty = True
+        self.lbl_dirty.setText("● Cambios sin guardar")
+        self.btn_save.setEnabled(True)
+
+    def _clear_dirty(self):
+        self._dirty = False
+        self.lbl_dirty.setText("")
+        self.btn_save.setEnabled(False)
+
+    def _discard_changes(self):
+        """Recarga la configuración desde el servidor (descarta cambios locales)."""
+        self._load_settings()
+        self._clear_dirty()
+
     def _save_settings(self):
         """
         Guarda configuración en backend.
@@ -448,37 +440,27 @@ class SettingsView(QWidget):
             api_client.post("storage/config", on_storage_resp, data={"path": new_path})
 
         # 2) Resto de settings → SystemConfig (clave→valor, strings)
+        # NOTA: las credenciales de Telegram (token/chat_id) ya NO se editan
+        # aquí — la vinculación es por código desde Notificaciones.
         settings = {
             # Storage limits
             "max_storage_gb": str(self.spin_max_storage.value()),
             "cleanup_threshold": str(self.spin_cleanup.value()),
-            # Telegram
-            "telegram_bot_token": self.txt_bot_token.text(),
-            "telegram_chat_id": self.txt_chat_id.text(),
-            "telegram_chat_ids": self.txt_chat_id.text(),
-            # Reactivar Telegram si tiene token+chat
-            "telegram_enabled": ("true" if (
-                self.txt_bot_token.text().strip() and self.txt_chat_id.text().strip()
-            ) else "false"),
             # AI
             "ai_confidence": str(self.spin_confidence.value()),
             "ai_model": str(self.cmb_ai_model.currentIndex()),
             "pre_buffer_seconds": str(self.spin_pre_buffer.value()),
             "save_snapshots": "true" if self.chk_save_snapshots.isChecked() else "false",
-            # Notification toggles (formato esperado por TelegramNotifier)
-            "notify_person": "true" if self.chk_notify_person.isChecked() else "false",
-            "notify_vehicle": "true" if self.chk_notify_vehicle.isChecked() else "false",
-            "notify_motion": "true" if self.chk_notify_motion.isChecked() else "false",
         }
 
         def on_save(response):
             if response.success:
-                QMessageBox.information(
-                    self, "Éxito",
-                    "Configuración guardada correctamente.\n\n"
-                    "Si cambiaste el path de almacenamiento, "
-                    "reinicia el backend para aplicar."
-                )
+                self._clear_dirty()
+                try:
+                    from desktop_app.src.ui.components.toast import show_toast
+                    show_toast(self, "Configuración guardada ✓", level="success")
+                except Exception:
+                    QMessageBox.information(self, "Éxito", "Configuración guardada.")
                 self._load_storage_info()
             else:
                 QMessageBox.critical(
@@ -488,10 +470,44 @@ class SettingsView(QWidget):
 
         api_client.put("system/config", on_save, data=settings)
     
-    def _test_telegram(self):
-        """Prueba la conexión con Telegram."""
-        # Aquí iría una llamada al backend para probar el bot
-        QMessageBox.information(self, "Prueba", "Mensaje de prueba enviado. Revise su Telegram.")
+    def _update_telegram_status_banner(self):
+        """Consulta el estado del bot (sin exponer token) y pinta el banner."""
+        def on_info(response):
+            ok = response.success and (response.data or {}).get("configured")
+            uname = (response.data or {}).get("username") if response.success else None
+            if ok and uname:
+                self.lbl_telegram_status.setText(f"Bot conectado: @{uname}")
+                color_bg, color_fg = "#0a3622", "#22c55e"
+            elif ok:
+                self.lbl_telegram_status.setText("Bot configurado en el servidor.")
+                color_bg, color_fg = "#0a3622", "#22c55e"
+            else:
+                self.lbl_telegram_status.setText(
+                    "Telegram aún no está configurado en el servidor. "
+                    "Configúralo desde Notificaciones (solo administrador)."
+                )
+                color_bg, color_fg = "#3a2a0a", "#fbbf24"
+            self.lbl_telegram_status.setStyleSheet(
+                f"background:{color_bg}; color:{color_fg}; padding:8px; "
+                f"border-radius:4px; font-size:11px;"
+            )
+        try:
+            api_client.get("telegram/bot-info", on_info)
+        except Exception:
+            pass
+
+    def _goto_notifications(self):
+        """Pide a la ventana principal que cambie a la pestaña Notificaciones."""
+        w = self.window()
+        for attr in ("show_notifications", "open_notifications", "go_to_notifications"):
+            fn = getattr(w, attr, None)
+            if callable(fn):
+                fn()
+                return
+        QMessageBox.information(
+            self, "Notificaciones",
+            "Abre la pestaña «Notificaciones» en el menú lateral para vincular Telegram."
+        )
     
     def _browse_storage_path(self):
         """Abre diálogo para seleccionar carpeta."""

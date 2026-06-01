@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QComboBox, QDateEdit, QSlider,
                                QFileDialog, QMessageBox, QProgressBar)
 from PySide6.QtCore import Qt, Signal, QDate
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QShortcut, QKeySequence
 
 from desktop_app.src.config import config
 from desktop_app.src.models.recording import RecordingSegment, TimelineDay
@@ -42,7 +42,29 @@ class PlaybackView(QWidget):
 
         self._setup_ui()
         self._connect_signals()
-    
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self):
+        """Atajos: Espacio = play/pausa, ←/→ = ±10s."""
+        QShortcut(QKeySequence(Qt.Key_Space), self, activated=self._toggle_play)
+        QShortcut(QKeySequence(Qt.Key_Left), self, activated=lambda: self._skip(-10))
+        QShortcut(QKeySequence(Qt.Key_Right), self, activated=lambda: self._skip(10))
+
+    def _toggle_play(self):
+        try:
+            playback_service.player.player.pause()  # VLC pause() alterna play/pausa
+        except Exception:
+            pass
+
+    def _skip(self, seconds: int):
+        try:
+            p = playback_service.player.player
+            cur = p.get_time()  # ms
+            if cur >= 0:
+                p.set_time(max(0, cur + seconds * 1000))
+        except Exception:
+            pass
+
     def _setup_ui(self):
         """Construye interfaz."""
         layout = QVBoxLayout(self)
@@ -339,8 +361,33 @@ class PlaybackView(QWidget):
                 self.lbl_status.setText(f"{len(self.segments)} segmentos encontrados")
             else:
                 self.lbl_status.setText(f"Error: {response.error}")
-        
+
         api_client.get(f"recordings/timeline?camera_id={camera_id}&date={date}", on_timeline)
+        # Cargar también los EVENTOS del día para marcarlos en la línea de tiempo.
+        self._load_event_markers(camera_id, date)
+
+    def _load_event_markers(self, camera_id: int, date: str):
+        """Pinta marcas de detección sobre el timeline (puntos por evento)."""
+        def on_events(response):
+            if not response.success:
+                return
+            markers = []
+            for ev in (response.data or []):
+                if ev.get("camera_id") != camera_id:
+                    continue
+                ts = ev.get("created_at") or ev.get("timestamp")
+                try:
+                    d = datetime.fromisoformat(str(ts).replace("Z", "").split(".")[0])
+                    if d.strftime("%Y-%m-%d") != date:
+                        continue
+                    secs = d.hour * 3600 + d.minute * 60 + d.second
+                    markers.append((secs, ev.get("event_type", "")))
+                except Exception:
+                    continue
+            self.timeline.set_event_markers(markers)
+        # 168h cubre cualquier fecha reciente; filtramos por fecha arriba.
+        api_client.get("events/", on_events, params={"hours": 168, "limit": 500,
+                                                     "camera_id": camera_id})
     
     def _on_segment_click(self, recording_id: int, offset_seconds: int):
         """Click en segmento del timeline."""

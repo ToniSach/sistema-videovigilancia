@@ -243,6 +243,97 @@ def get_chats():
         return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
+@telegram_link_bp.route("/test", methods=["POST"])
+@jwt_required()
+def test_my_telegram():
+    """
+    Envía un mensaje de prueba a los chats de Telegram vinculados al usuario
+    actual. Verifica de extremo a extremo que las notificaciones llegan, sin
+    disparar un evento real ni grabar vídeo.
+    """
+    try:
+        user_id = int(get_jwt_identity())
+        chats = link_service.get_user_chats(user_id)
+        if not chats:
+            return jsonify({
+                "success": False,
+                "error": "No tienes ningún chat de Telegram vinculado.",
+            }), 400
+        # Necesitamos los chat_id reales (get_user_chats no los expone); leerlos.
+        from backend.app.notifications.telegram_notifier import telegram_notifier
+        sent = 0
+        with db_manager.get_session() as session:
+            rows = session.query(UserTelegramChat).filter_by(
+                user_id=user_id, is_active=True
+            ).all()
+            chat_ids = [r.telegram_chat_id for r in rows]
+        for cid in chat_ids:
+            try:
+                if telegram_notifier.send_message(
+                    cid, "✅ Mensaje de prueba del sistema de videovigilancia. "
+                         "Si ves esto, tus notificaciones funcionan."
+                ):
+                    sent += 1
+            except Exception:
+                pass
+        if sent > 0:
+            return jsonify({"success": True, "data": {"sent": sent}}), 200
+        return jsonify({
+            "success": False,
+            "error": "No se pudo enviar (¿bot configurado en el servidor?).",
+        }), 502
+    except Exception:
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
+
+
+@telegram_link_bp.route("/admin/overview", methods=["GET"])
+@jwt_required()
+def admin_overview():
+    """
+    Resumen para el ADMIN: por cada usuario, su(s) chat(s) de Telegram vinculados
+    y cuántas preferencias de notificación tiene activas. Alimenta la tabla
+    "Usuarios y Telegram" del panel de notificaciones (vista comercial, sin
+    exponer tokens ni pedir chat_id a mano).
+    """
+    from backend.app.services.user_service import UserService
+    try:
+        user_id = int(get_jwt_identity())
+        if not UserService().is_admin(user_id):
+            return jsonify({"success": False, "error": "Solo administradores"}), 403
+
+        from backend.app.database.models import (
+            User, UserTelegramChat, NotificationPreference,
+        )
+        rows = []
+        with db_manager.get_session() as session:
+            users = session.query(User).all()
+            for u in users:
+                chats = session.query(UserTelegramChat).filter_by(
+                    user_id=u.id, is_active=True
+                ).all()
+                n_prefs = session.query(NotificationPreference).filter_by(
+                    user_id=u.id, enabled=True
+                ).count()
+                rows.append({
+                    "user_id": u.id,
+                    "username": u.username,
+                    "role": getattr(u, "role", "user"),
+                    "telegram": [
+                        {
+                            "id": c.id,
+                            "username": c.telegram_username,
+                            "linked_at": c.linked_at.isoformat() if c.linked_at else None,
+                        }
+                        for c in chats
+                    ],
+                    "telegram_linked": len(chats) > 0,
+                    "active_preferences": n_prefs,
+                })
+        return jsonify({"success": True, "data": rows}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
+
+
 @telegram_link_bp.route("/chats/<int:chat_id>", methods=["DELETE"])
 @jwt_required()
 def unlink_chat(chat_id):

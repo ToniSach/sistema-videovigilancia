@@ -80,8 +80,11 @@ class MotionDetector:
         # Calcular score de movimiento (porcentaje de pixeles activos)
         motion_score = np.sum(mask > 0) / mask.size
 
-        # Actualizar frame previo
-        self._prev_gray = gray_blurred.copy()
+        # Actualizar frame previo. NO se necesita .copy(): cv2.GaussianBlur
+        # devuelve un array NUEVO en cada llamada (no es vista del frame), y
+        # solo se lee de forma no destructiva en cv2.absdiff. Copiar aquí eran
+        # ~345KB/frame (×fps) de memcpy puro sin beneficio.
+        self._prev_gray = gray_blurred
 
         has_motion = motion_score > self.sensitivity
 

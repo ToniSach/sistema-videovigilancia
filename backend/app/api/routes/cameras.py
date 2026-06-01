@@ -175,6 +175,29 @@ def webrtc_offer(camera_id: int):
     except Exception as e:
         return api_error_response(e, message="Error en signaling WebRTC")
 
+@cameras_bp.route("/url-suggestions", methods=["GET"])
+@jwt_required()
+def url_suggestions():
+    """
+    Sugiere rtsp_url y onvif_url a partir de la IP (para autocompletar el
+    formulario de alta MANUAL). El usuario puede editarlas. Formato XiongMai/
+    iCSee (las cámaras de este proyecto).
+    """
+    try:
+        from backend.app.cameras.camera_heuristics import build_default_urls
+        ip = request.args.get("ip", "").strip()
+        if not ip:
+            return jsonify({"success": False, "error": "Falta el parámetro ip"}), 400
+        urls = build_default_urls(
+            ip,
+            request.args.get("username", ""),
+            request.args.get("password", ""),
+        )
+        return jsonify({"success": True, "data": urls}), 200
+    except Exception as e:
+        return api_error_response(e, message="Error generando sugerencias de URL")
+
+
 @cameras_bp.route("/", methods=["POST"])
 @jwt_required()
 @require_admin
@@ -245,6 +268,47 @@ def toggle_camera(camera_id: int):
         return jsonify({"success": True, "data": camera})
     except Exception as e:
         return api_error_response(e, message="Error al cambiar estado de cámara")
+
+@cameras_bp.route("/test-connection", methods=["POST"])
+@jwt_required()
+@require_admin
+def test_connection():
+    """
+    Prueba la conexión a una cámara ANTES de darla de alta. Hace probe ONVIF a
+    la IP (con credenciales si se dan) y reporta si responde + capacidades
+    detectadas. No guarda nada. Body: {ip_address, username?, password?}.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        ip = (data.get("ip_address") or "").strip()
+        if not ip:
+            return jsonify({"success": False, "error": "Falta ip_address"}), 400
+        service = _get_service()
+        info = service._onvif_discovery.probe_single_ip(
+            ip,
+            username=data.get("username") or None,
+            password=data.get("password") or None,
+        )
+        if info:
+            return jsonify({
+                "success": True,
+                "data": {
+                    "reachable": True,
+                    "manufacturer": info.get("manufacturer", "?"),
+                    "model": info.get("model", "?"),
+                    "has_ptz": info.get("has_ptz", False),
+                    "has_audio": info.get("has_audio", False),
+                    "resolution": f"{info.get('resolution_width', '?')}x{info.get('resolution_height', '?')}",
+                    "rtsp_url": info.get("rtsp_url", ""),
+                },
+            }), 200
+        return jsonify({
+            "success": True,
+            "data": {"reachable": False},
+        }), 200
+    except Exception as e:
+        return api_error_response(e, message="Error probando la conexión")
+
 
 @cameras_bp.route("/discover", methods=["POST"])
 @jwt_required()

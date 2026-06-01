@@ -234,10 +234,17 @@ class NotificationWebSocketService : Service() {
             }
         }
 
+        // Al tocar la notificación se abre el TIMELINE de grabaciones de esa
+        // cámara en la fecha del evento (openCameraId + openDate los lee
+        // MainActivity.handleNotificationIntent).
+        val eventDate = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+            .format(java.util.Date((ev.timestamp * 1000).toLong()))
         val pi = PendingIntent.getActivity(
             this, ev.cameraId,
             Intent(this, MainActivity::class.java).apply {
                 putExtra("openCameraId", ev.cameraId)
+                putExtra("openDate", eventDate)
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )

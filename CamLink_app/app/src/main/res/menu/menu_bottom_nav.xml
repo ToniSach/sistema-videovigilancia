@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Barra de navegación inferior. Los IDs COINCIDEN con los destinos del
+    nav_graph para que BottomNavigationView.setupWithNavController(navController)
+    navegue automáticamente al tocar cada pestaña.
+-->
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <item
+        android:id="@+id/liveViewFragment"
+        android:icon="@drawable/ic_nav_live"
+        android:title="@string/nav_live" />
+
+    <item
+        android:id="@+id/cameraListFragment"
+        android:icon="@drawable/ic_nav_cameras"
+        android:title="@string/nav_cameras" />
+
+    <item
+        android:id="@+id/timelineFragment"
+        android:icon="@drawable/ic_nav_recordings"
+        android:title="@string/nav_recordings" />
+
+    <item
+        android:id="@+id/notificationsPanelFragment"
+        android:icon="@drawable/ic_nav_alerts"
+        android:title="@string/nav_alerts" />
+
+</menu>

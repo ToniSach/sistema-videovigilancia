@@ -38,7 +38,7 @@ Wire format
     "ack <event_id>" → reservado para acuses (no implementado aún)
 
 Implementación con flask-sock (sobre simple-websocket). flask-sock funciona
-con werkzeug-dev (Flask app.run) y con gunicorn-gevent (config actual).
+con el servidor de desarrollo de Flask (app.run threaded, el modo que usamos).
 """
 from __future__ import annotations
 

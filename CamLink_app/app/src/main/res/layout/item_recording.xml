@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    item_recording.xml — Fila glass del RecyclerView de grabaciones.
-    Columnas: nombre | Play | Estrella | Alerta (condicional)
+    item_recording.xml — Tarjeta de grabación.
+    [▶]  Título (fecha/hora)            [!]  [★]
+         Subtítulo (duración · cámara)
 -->
 <com.google.android.material.card.MaterialCardView
     xmlns:android="http://schemas.android.com/apk/res/android"
@@ -10,57 +11,97 @@
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:layout_marginVertical="6dp"
-    style="@style/Widget.CamLink.GlassCard"
-    app:contentPadding="12dp">
+    android:clickable="true"
+    android:focusable="true"
+    app:cardBackgroundColor="@color/surface"
+    app:cardCornerRadius="14dp"
+    app:cardElevation="0dp"
+    app:strokeColor="@color/glass_border"
+    app:strokeWidth="1dp"
+    app:rippleColor="@color/accent_cyan">
 
     <androidx.constraintlayout.widget.ConstraintLayout
         android:layout_width="match_parent"
-        android:layout_height="wrap_content">
+        android:layout_height="wrap_content"
+        android:padding="12dp">
+
+        <!-- Botón play circular -->
+        <FrameLayout
+            android:id="@+id/playWrap"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:background="@drawable/bg_play_circle"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintBottom_toBottomOf="parent">
+
+            <ImageButton
+                android:id="@+id/btnPlay"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="@android:color/transparent"
+                android:contentDescription="@string/btn_play"
+                android:padding="10dp"
+                android:scaleType="fitCenter"
+                app:tint="@color/primary_dark"
+                android:src="@drawable/ic_play" />
+        </FrameLayout>
 
         <TextView
             android:id="@+id/tvRecordingName"
-            style="@style/TextAppearance.CamLink.RecordingLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
             android:singleLine="true"
             android:ellipsize="end"
+            android:textColor="@color/text_primary"
+            android:textSize="15sp"
             android:textStyle="bold"
-            tools:text="Grabación 1"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintEnd_toStartOf="@id/btnPlay"
-            app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent" />
-
-        <ImageButton
-            android:id="@+id/btnPlay"
-            style="@style/Widget.CamLink.IconButton"
-            android:layout_marginEnd="8dp"
-            android:contentDescription="@string/btn_play"
-            android:src="@drawable/ic_play"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintEnd_toStartOf="@id/btnFavorite"
-            app:layout_constraintTop_toTopOf="parent" />
-
-        <ImageButton
-            android:id="@+id/btnFavorite"
-            style="@style/Widget.CamLink.IconButton"
-            android:layout_marginEnd="8dp"
-            android:contentDescription="@string/btn_favorite"
-            android:src="@drawable/ic_star_inactive"
-            app:layout_constraintBottom_toBottomOf="parent"
+            tools:text="31 may 2026 · 03:15"
+            app:layout_constraintStart_toEndOf="@id/playWrap"
             app:layout_constraintEnd_toStartOf="@id/ivAlert"
-            app:layout_constraintTop_toTopOf="parent" />
+            app:layout_constraintTop_toTopOf="@id/playWrap" />
+
+        <TextView
+            android:id="@+id/tvRecordingSub"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:layout_marginTop="2dp"
+            android:singleLine="true"
+            android:ellipsize="end"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp"
+            tools:text="0:20 · Cámara 3"
+            app:layout_constraintStart_toEndOf="@id/playWrap"
+            app:layout_constraintEnd_toStartOf="@id/ivAlert"
+            app:layout_constraintTop_toBottomOf="@id/tvRecordingName" />
 
         <ImageView
             android:id="@+id/ivAlert"
-            android:layout_width="24dp"
-            android:layout_height="24dp"
+            android:layout_width="22dp"
+            android:layout_height="22dp"
+            android:layout_marginEnd="10dp"
             android:contentDescription="@string/label_alert"
             android:src="@drawable/ic_alert"
+            app:tint="@color/accent_warning"
             android:visibility="gone"
-            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toStartOf="@id/btnFavorite"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintBottom_toBottomOf="parent" />
+
+        <ImageButton
+            android:id="@+id/btnFavorite"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="@android:color/transparent"
+            android:contentDescription="@string/btn_favorite"
+            android:scaleType="fitCenter"
+            android:padding="8dp"
+            android:src="@drawable/ic_star_inactive"
             app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintTop_toTopOf="parent" />
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintBottom_toBottomOf="parent" />
 
     </androidx.constraintlayout.widget.ConstraintLayout>
 

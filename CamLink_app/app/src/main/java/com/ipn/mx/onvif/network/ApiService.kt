@@ -39,10 +39,12 @@ interface ApiService {
     @GET("cameras/{id}")
     suspend fun getCamera(@Path("id") id: Int): CameraResponse
 
-    @POST("cameras/{id}/ptz")
-    suspend fun sendPtz(
+    // PTZ por dirección (ONVIF ContinuousMove). El backend expone
+    // /ptz/<direction> (up|down|left|right|stop); NO existe /ptz con body.
+    @POST("cameras/{id}/ptz/{direction}")
+    suspend fun ptzMove(
         @Path("id") id: Int,
-        @Body body: PtzRequest
+        @Path("direction") direction: String,
     ): Response<Unit>
 
     // ── Audio bidireccional (talk-back) ──────────────────────────────────────
@@ -78,11 +80,18 @@ interface ApiService {
 
     // ── Grabaciones (lista/playback) ──────────────────────────────────────────
 
-    @GET("recordings")
+    @GET("recordings/")
     suspend fun getRecordings(): RecordingListResponse
 
     @GET("recordings/{id}")
     suspend fun getRecording(@Path("id") id: String): RecordingDetailResponse
+
+    /** Timeline de grabaciones de una cámara en una fecha (YYYY-MM-DD). */
+    @GET("recordings/timeline")
+    suspend fun getTimeline(
+        @Query("camera_id") cameraId: Int,
+        @Query("date") date: String,
+    ): Response<TimelineResponse>
 
     @DELETE("recordings/{id}")
     suspend fun deleteRecording(@Path("id") id: String): Response<Unit>

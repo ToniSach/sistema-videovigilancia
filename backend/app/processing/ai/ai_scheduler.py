@@ -46,6 +46,11 @@ class AIScheduler:
         self._frame_count = 0
         self._frames_processed = 0
         self._detections_count = 0
+        # Latencia de inferencia: ventana de las últimas N duraciones (ms) de la
+        # llamada a YOLO, para reportar media/p95 en stats (prueba de carga IA).
+        from collections import deque
+        self._infer_ms = deque(maxlen=50)
+        self._last_infer_ms = 0.0
         
         # Cooldown tracking
         self._last_alert_time: Dict[str, float] = {}
@@ -215,10 +220,14 @@ class AIScheduler:
                     f"(score={motion_result.motion_score:.3f}) → ejecutando YOLO"
                 )
 
+                _t_infer = time.perf_counter()
                 detections = self._yolo.detect(task.frame)
+                infer_ms = (time.perf_counter() - _t_infer) * 1000.0
 
                 with self._lock:
                     self._frames_processed += 1
+                    self._last_infer_ms = infer_ms
+                    self._infer_ms.append(infer_ms)
 
                 if detections:
                     detections_total += len(detections)
@@ -332,6 +341,12 @@ class AIScheduler:
     def get_stats(self) -> dict:
         """Retorna estadísticas del scheduler."""
         with self._lock:
+            samples = list(self._infer_ms)
+            if samples:
+                avg_ms = sum(samples) / len(samples)
+                p95_ms = sorted(samples)[max(0, int(len(samples) * 0.95) - 1)]
+            else:
+                avg_ms = p95_ms = 0.0
             stats = {
                 "camera_id": self.camera_id,
                 "mode": self.mode,
@@ -340,6 +355,11 @@ class AIScheduler:
                 "detections": self._detections_count,
                 "queue_size": self._inference_queue.size(),
                 "cooldown_seconds": self._cooldown_seconds,
-                "active_cooldowns": len(self._last_alert_time)
+                "active_cooldowns": len(self._last_alert_time),
+                # Latencia de inferencia YOLO (ms): última + media/p95 de la ventana.
+                "inference_ms_last": round(self._last_infer_ms, 1),
+                "inference_ms_avg": round(avg_ms, 1),
+                "inference_ms_p95": round(p95_ms, 1),
+                "inference_fps": round(1000.0 / avg_ms, 1) if avg_ms > 0 else 0.0,
             }
             return stats

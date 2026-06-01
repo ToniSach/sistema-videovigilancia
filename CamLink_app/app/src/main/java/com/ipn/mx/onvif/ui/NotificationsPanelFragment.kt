@@ -52,20 +52,26 @@ class NotificationsPanelFragment : BaseMenuFragment() {
     private lateinit var btnOpenConfig: ImageButton
 
     private val adapter = NotificationAdapter { item ->
-        // Click — actualizar last_seen con este item y, si quiere, navegar
+        // Click en una notificación → abrir el TIMELINE de grabaciones de esa
+        // cámara en la fecha del evento (para ver la grabación del momento).
         markLatestAsSeen()
-        // Navegamos a la lista de cámaras y dejamos que el usuario elija;
-        // alternativamente podríamos pasar el cameraId en argumentos, pero
-        // LiveView toma argumento "cameraId" como String:
-        try {
-            findNavController().popBackStack(R.id.liveViewFragment, false)
-        } catch (_: Exception) {
-            // si no estaba en backstack, abre live
-            try { findNavController().navigate(R.id.liveViewFragment) } catch (_: Exception) {}
+        val date = dateFromIso(item.createdAt)
+        val args = Bundle().apply {
+            putInt("cameraId", item.cameraId)
+            if (date != null) putString("date", date)
         }
-        Toast.makeText(requireContext(),
-            "Cámara ${item.cameraId} • ${item.eventType}",
-            Toast.LENGTH_SHORT).show()
+        try {
+            findNavController().navigate(R.id.timelineFragment, args)
+        } catch (e: Exception) {
+            Toast.makeText(requireContext(),
+                "No se pudo abrir grabaciones: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** Extrae "YYYY-MM-DD" de un createdAt ISO ("2026-05-31T03:15:00"). */
+    private fun dateFromIso(iso: String?): String? {
+        if (iso.isNullOrBlank()) return null
+        return iso.substringBefore('T').takeIf { it.length == 10 }
     }
 
     private val liveEventReceiver = object : BroadcastReceiver() {

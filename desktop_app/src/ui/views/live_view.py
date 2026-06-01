@@ -96,9 +96,36 @@ class CameraWidget(QFrame):
         self.lbl_name.setStyleSheet("color: white; font-weight: bold; font-size: 11px;")
         info_layout.addWidget(self.lbl_name)
 
+        # Reloj en vivo (hora actual) sobre la barra de la cámara.
+        self.lbl_clock = QLabel("")
+        self.lbl_clock.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        info_layout.addWidget(self.lbl_clock)
+
+        # Indicador REC (rojo) — visible solo si la cámara está grabando.
+        self.lbl_rec = QLabel("●REC")
+        self.lbl_rec.setStyleSheet("color: #ef4444; font-size: 10px; font-weight: bold;")
+        self.lbl_rec.setVisible(False)
+        info_layout.addWidget(self.lbl_rec)
+
+        info_layout.addStretch()
+
         self.lbl_status = QLabel("●")
         self.lbl_status.setStyleSheet("color: #22c55e; font-size: 10px;")
-        info_layout.addWidget(self.lbl_status, alignment=Qt.AlignRight)
+        info_layout.addWidget(self.lbl_status)
+
+        # Botón snapshot (captura rápida del fotograma actual).
+        self.btn_snapshot = QPushButton()
+        self.btn_snapshot.setIcon(icon("snapshot", "#888888"))
+        self.btn_snapshot.setMaximumWidth(30)
+        self.btn_snapshot.setToolTip("Capturar imagen")
+        self.btn_snapshot.setStyleSheet("""
+            QPushButton { background-color: transparent; color: #888; border: none; font-size: 14px; }
+            QPushButton:hover { color: #38bdf8; }
+        """)
+        self.btn_snapshot.clicked.connect(
+            lambda: self.snapshot_requested.emit(self.camera_id)
+        )
+        info_layout.addWidget(self.btn_snapshot)
 
         self.btn_config = QPushButton()
         self.btn_config.setIcon(icon("settings"))
@@ -118,6 +145,24 @@ class CameraWidget(QFrame):
         info_layout.addWidget(self.btn_config)
 
         layout.addLayout(info_layout)
+
+        # Reloj que actualiza la hora cada segundo (barato).
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._tick_clock)
+        self._clock_timer.start(1000)
+        self._tick_clock()
+
+    def _tick_clock(self):
+        from datetime import datetime as _dt
+        try:
+            self.lbl_clock.setText(_dt.now().strftime("%H:%M:%S"))
+        except Exception:
+            pass
+
+    def set_recording(self, on: bool):
+        """Muestra/oculta el indicador ●REC."""
+        if hasattr(self, "lbl_rec"):
+            self.lbl_rec.setVisible(bool(on))
 
         # Ya no nos conectamos al signal global frame_updated — usamos
         # polling con _pull_timer. Esto evita la acumulación de signals.
@@ -182,6 +227,19 @@ class CameraWidget(QFrame):
         if getattr(self, "_use_rtsp", False):
             self._apply_fill()
 
+    def hideEvent(self, event):
+        # Pausar el reloj cuando el widget no se ve (queda en cache de páginas):
+        # evita ~1 tick/seg × N widgets ocultos corriendo en background.
+        if hasattr(self, "_clock_timer") and self._clock_timer.isActive():
+            self._clock_timer.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        if hasattr(self, "_clock_timer") and not self._clock_timer.isActive():
+            self._clock_timer.start(1000)
+            self._tick_clock()
+        super().showEvent(event)
+
     def set_live_url(self, url: str):
         """
         Cambia la fuente del directo SIN recrear el player (evita el crash de
@@ -194,8 +252,11 @@ class CameraWidget(QFrame):
             return
         self.stream_url = url
         try:
-            self._vlc.play_url(url)
-            QTimer.singleShot(300, self._apply_fill)
+            # ASÍNCRONO: player.stop() de libVLC es bloqueante (espera al decoder
+            # RTSP). En el hilo UI y para cada panel congelaba la app al cambiar
+            # calidad. play_url_async hace el swap en un hilo de fondo.
+            self._vlc.play_url_async(url)
+            QTimer.singleShot(800, self._apply_fill)
         except Exception as e:
             logger.error(f"set_live_url cam {self.camera_id}: {e}")
 
@@ -419,6 +480,11 @@ class LiveView(QWidget):
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._check_cameras_status)
         self._status_timer.start(5000)
+        # El estado de grabación (●REC) cambia raramente; consultar /cameras/
+        # cada 5s solo para eso era derrochador. Timer aparte cada 15s.
+        self._rec_timer = QTimer(self)
+        self._rec_timer.timeout.connect(self._refresh_recording_badges)
+        self._rec_timer.start(15000)
 
     # ------------------------------------------------------------------
     # UI
@@ -542,6 +608,25 @@ class LiveView(QWidget):
         self.btn_next.clicked.connect(self._on_next_page)
         header.addWidget(self.btn_next)
 
+        # Modo TV: rota automáticamente entre páginas cada N segundos (ideal
+        # para una pantalla de vigilancia desatendida). Botón conmutable.
+        self.btn_tv = QPushButton("  Modo TV")
+        self.btn_tv.setIcon(icon("live"))
+        self.btn_tv.setCheckable(True)
+        self.btn_tv.setStyleSheet(btn_style + """
+            QPushButton:checked {
+                background-color: #38bdf8; color: #0f172a; font-weight: bold;
+            }
+        """)
+        self.btn_tv.setToolTip("Rota automáticamente entre páginas cada 10 s")
+        self.btn_tv.toggled.connect(self._on_tv_toggle)
+        header.addWidget(self.btn_tv)
+
+        # Timer de rotación del modo TV (10 s por página).
+        self._tv_timer = QTimer(self)
+        self._tv_timer.setInterval(10000)
+        self._tv_timer.timeout.connect(self._tv_advance)
+
         layout.addLayout(header)
 
         # Grid
@@ -652,6 +737,9 @@ class LiveView(QWidget):
 
     def _load_page(self, page: int):
         """Pinta los widgets de la página solicitada usando el cache."""
+        # Al cambiar de página se sale del modo maximizado (evita estado colgado).
+        if getattr(self, "_maximized_key", None) is not None and not getattr(self, "_restoring", False):
+            self._maximized_key = None
         if page < 0:
             page = 0
         max_pages = max(1, self._get_page_count())
@@ -738,6 +826,29 @@ class LiveView(QWidget):
     def _on_next_page(self):
         if self._current_page < self._get_page_count() - 1:
             self._load_page(self._current_page + 1)
+
+    # ------------------------------------------------------------------
+    # Modo TV (rotación automática de páginas)
+    # ------------------------------------------------------------------
+    def _on_tv_toggle(self, on: bool):
+        if on:
+            # Solo tiene sentido si hay más de una página.
+            if self._get_page_count() <= 1:
+                self.btn_tv.setChecked(False)
+                return
+            self._tv_timer.start()
+        else:
+            self._tv_timer.stop()
+
+    def _tv_advance(self):
+        """Avanza a la siguiente página, volviendo a la primera al final (loop)."""
+        total = self._get_page_count()
+        if total <= 1:
+            self._tv_timer.stop()
+            self.btn_tv.setChecked(False)
+            return
+        nxt = (self._current_page + 1) % total
+        self._load_page(nxt)
 
     # ------------------------------------------------------------------
     # Cambio de layout (1×1 / 2×2 / 3×3)
@@ -828,10 +939,37 @@ class LiveView(QWidget):
         logger.debug(f"Cámara seleccionada: {camera_id}")
 
     def _on_camera_double_click(self, camera_id: int):
-        for (cid, _stype), widget in self.cameras.items():
+        """Doble-clic = maximizar esa cámara a todo el grid (y restaurar)."""
+        # ¿Ya hay una maximizada? Si es la misma, restaurar; si no, cambiar.
+        maxed = getattr(self, "_maximized_key", None)
+        target_key = None
+        for (cid, stype), _w in self.cameras.items():
             if cid == camera_id:
-                widget.is_maximized = not widget.is_maximized
+                target_key = (cid, stype)
                 break
+        if target_key is None:
+            return
+        if maxed == target_key:
+            self._restore_grid()
+        else:
+            self._maximize_camera(target_key)
+
+    def _maximize_camera(self, key):
+        """Oculta las demás y expande la cámara `key` a todo el grid."""
+        self._maximized_key = key
+        for k, widget in self.cameras.items():
+            if k == key:
+                self.grid.removeWidget(widget)
+                self.grid.addWidget(widget, 0, 0,
+                                    max(1, self._grid_cols), max(1, self._grid_cols))
+                widget.show()
+            else:
+                widget.hide()
+
+    def _restore_grid(self):
+        """Vuelve a la rejilla normal de la página actual."""
+        self._maximized_key = None
+        self._load_page(self._current_page)
 
     def _on_ptz_request(self, camera_id: int):
         logger.info(f"PTZ solicitado para cámara {camera_id}")
@@ -843,16 +981,40 @@ class LiveView(QWidget):
             if cid == camera_id:
                 widget = w
                 break
-        if widget and widget.lbl_video.pixmap():
-            from PySide6.QtCore import QStandardPaths
-            import time
-            pictures_path = QStandardPaths.writableLocation(
-                QStandardPaths.PicturesLocation
-            )
-            filename = f"snapshot_{camera_id}_{int(time.time())}.png"
-            full_path = f"{pictures_path}/{filename}"
-            if widget.lbl_video.pixmap().save(full_path):
-                logger.info(f"Snapshot guardado: {full_path}")
+        if not widget:
+            return
+        from PySide6.QtCore import QStandardPaths
+        import time, os
+        pictures_path = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation)
+        full_path = os.path.join(pictures_path, f"snapshot_{camera_id}_{int(time.time())}.png")
+
+        ok = False
+        # Modo RTSP (VLC): usar video_take_snapshot del player.
+        vlc = getattr(widget, "_vlc", None)
+        if vlc is not None:
+            try:
+                w = max(0, widget.lbl_video.width())
+                vlc.player.video_take_snapshot(0, full_path, w, 0)
+                ok = True  # VLC escribe el archivo de forma asíncrona
+            except Exception as e:
+                logger.error(f"snapshot VLC cam {camera_id}: {e}")
+        # Modo MJPEG (pixmap): guardar el frame actual.
+        elif widget.lbl_video.pixmap() and not widget.lbl_video.pixmap().isNull():
+            ok = widget.lbl_video.pixmap().save(full_path)
+
+        if ok:
+            logger.info(f"Snapshot guardado: {full_path}")
+            self._toast(f"Imagen guardada en {pictures_path}")
+        else:
+            self._toast("No se pudo capturar la imagen")
+
+    def _toast(self, message: str):
+        """Notificación breve no intrusiva (si la ventana la soporta)."""
+        try:
+            from desktop_app.src.ui.components.toast import show_toast
+            show_toast(self, message)
+        except Exception:
+            logger.info(message)
 
     def _on_config_request(self, camera_id: int):
         logger.info(f"Configuración solicitada para cámara {camera_id}")
@@ -865,6 +1027,30 @@ class LiveView(QWidget):
         for (cam_id, stream_type), widget in self.cameras.items():
             if not video_streamer.is_streaming(cam_id, stream_type):
                 widget.set_offline()
+
+    def _refresh_recording_badges(self):
+        """Consulta qué cámaras están grabando para mostrar el ●REC."""
+        if not self.cameras:
+            return
+        # Import diferido (mismo patrón que `config` en este archivo): api_client
+        # no está importado a nivel de módulo.
+        from desktop_app.src.services.api_client import api_client
+
+        def on_cams(response):
+            if not response.success:
+                return
+            rec_by_cam = {}
+            for c in (response.data or []):
+                ws = c.get("worker_status") or {}
+                # 'recording' puede venir en worker_status o como flag de la cámara.
+                rec = False
+                if isinstance(ws, dict):
+                    rec = bool(ws.get("recording") or ws.get("is_recording"))
+                rec = rec or bool(c.get("is_recording"))
+                rec_by_cam[c.get("id")] = rec
+            for (cam_id, _stype), widget in self.cameras.items():
+                widget.set_recording(rec_by_cam.get(cam_id, False))
+        api_client.get("cameras/", on_cams)
 
     # ------------------------------------------------------------------
     # Limpieza
@@ -902,16 +1088,26 @@ class LiveView(QWidget):
         """
         if self._status_timer.isActive():
             self._status_timer.stop()
+        if hasattr(self, "_rec_timer") and self._rec_timer.isActive():
+            self._rec_timer.stop()
         # Streams se mantienen vivos en background — el usuario eligió
         # "siempre vivos" en la configuración del modo paginación.
 
     def hideEvent(self, event):
+        # Detener la rotación TV al salir de la vista (no rotar en background).
+        if hasattr(self, "_tv_timer"):
+            self._tv_timer.stop()
+        if hasattr(self, "btn_tv"):
+            self.btn_tv.setChecked(False)
         self.cleanup()
         super().hideEvent(event)
 
     def showEvent(self, event):
         if not self._status_timer.isActive():
             self._status_timer.start(5000)
+        if hasattr(self, "_rec_timer") and not self._rec_timer.isActive():
+            self._rec_timer.start(15000)
+            self._refresh_recording_badges()  # actualización inmediata al entrar
         super().showEvent(event)
 
     def closeEvent(self, event):

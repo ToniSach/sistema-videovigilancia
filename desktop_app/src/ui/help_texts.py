@@ -180,9 +180,9 @@ HELP: Dict[str, HelpContent] = {
              "Monitor en tiempo real de CPU, RAM, disco, FPS por cámara, "
              "y estado de cada worker. Si algo está rojo, hay un problema."),
             ("Hardware",
-             "Detecta automáticamente GPU (CUDA) y configura YOLO para "
-             "usarla si está disponible. Si no, usa CPU con menor "
-             "rendimiento."),
+             "Detecta automáticamente la tarjeta gráfica (GPU) y la usa para "
+             "la detección de objetos si está disponible. Si no, usa el "
+             "procesador (CPU) con menor rendimiento."),
             ("Workers",
              "Cada cámara tiene un worker FFmpeg que captura el RTSP. "
              "«Running» = OK. «Reconnecting» = está reintentando. «Error» "

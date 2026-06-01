@@ -40,19 +40,6 @@ abstract class BaseMenuFragment : Fragment(), MenuProvider {
     override fun onMenuItemSelected(menuItem: MenuItem): Boolean {
         val nav = findNavController()
         return when (menuItem.itemId) {
-            R.id.menuGrabaciones -> {
-                when (nav.currentDestination?.id) {
-                    R.id.liveViewFragment   -> nav.navigate(R.id.action_liveView_to_recordings)
-                    R.id.cameraListFragment -> nav.navigate(R.id.action_cameraList_to_recordings)
-                    else                    -> nav.navigate(R.id.recordingsFragment)
-                }
-                true
-            }
-            R.id.menuNotificaciones -> {
-                // Abre el PANEL de historial (NotificationsPanelFragment).
-                nav.navigate(R.id.notificationsPanelFragment)
-                true
-            }
             R.id.menuConfigNotificaciones -> {
                 // CRUD de preferencias (qué eventos, canales, días).
                 nav.navigate(R.id.eventConfigFragment)

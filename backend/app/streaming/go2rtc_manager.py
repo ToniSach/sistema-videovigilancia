@@ -230,9 +230,11 @@ class Go2RtcManager:
     def _init_once(self) -> None:
         self._proc: Optional[subprocess.Popen] = None
         self._supervisor: Optional[threading.Thread] = None
+        self._reconciler: Optional[threading.Thread] = None
         self._running = False
         self._public_host = ""
         self._cfg = None  # config del sistema (lazy)
+        self._last_sig = None  # firma del último set de streams escrito
 
     # ───────────────────────────────────────────────────────────────────────
     # Configuración (lazy, robusta en runtime y en tests)
@@ -324,6 +326,102 @@ class Go2RtcManager:
         return path
 
     # ───────────────────────────────────────────────────────────────────────
+    # Reconciliador: mantiene el config de go2rtc sincronizado con la BD
+    # ───────────────────────────────────────────────────────────────────────
+    # PROBLEMA que resuelve: el config de go2rtc se generaba UNA vez al arrancar
+    # con las cámaras activas de ese momento. Si arrancabas con 0 activas y luego
+    # añadías/activabas una, go2rtc no tenía su stream → el worker leía
+    # rtsp://.../cam_X y recibía 404. Ahora un hilo revisa la BD cada pocos
+    # segundos y, si el conjunto de cámaras cambió, regenera el YAML y reinicia
+    # go2rtc. Incluye TODAS las cámaras (activas o no): go2rtc conecta a la cámara
+    # de forma PEREZOSA (solo cuando alguien consume el stream), así que tener
+    # streams de cámaras inactivas no cuesta nada hasta que se activan.
+    def _load_all_cameras(self) -> list:
+        """Carga TODAS las cámaras de la BD como snapshots ligeros.
+
+        Solo SELECT de las 4 columnas necesarias (no onvif_url/password/etc.),
+        ya que esto corre periódicamente en el reconciliador.
+        """
+        from types import SimpleNamespace
+        try:
+            from ..database.connection import db_manager
+            from ..database.models import Camera
+            cams = []
+            with db_manager.get_session() as session:
+                rows = session.query(
+                    Camera.id, Camera.rtsp_url, Camera.is_active, Camera.is_dual_lens
+                ).all()
+                for cid, rtsp, active, dual in rows:
+                    cams.append(SimpleNamespace(
+                        id=cid,
+                        rtsp_url=rtsp,
+                        is_active=bool(active),
+                        is_dual_lens=bool(dual),
+                    ))
+            return cams
+        except Exception as e:
+            logger.warning("go2rtc reconcile: no se pudo leer cámaras de BD: %s", e)
+            return []
+
+    def reconcile(self) -> None:
+        """Regenera el config desde la BD y reinicia go2rtc SOLO si cambió."""
+        if not self.is_enabled():
+            return
+        cfg = self.cfg
+        cams = self._load_all_cameras()
+        data = build_go2rtc_config(
+            cams,
+            api_host=cfg.GO2RTC_API_HOST,
+            api_port=cfg.GO2RTC_API_PORT,
+            rtsp_port=cfg.GO2RTC_RTSP_PORT,
+            webrtc_port=cfg.GO2RTC_WEBRTC_PORT,
+            public_host=self.public_host,
+            extra_candidates=cfg.GO2RTC_WEBRTC_CANDIDATES,
+            include_inactive=True,   # todas las cámaras; go2rtc conecta perezoso
+        )
+        sig = frozenset(data["streams"].items())
+        if sig == self._last_sig and self.is_running():
+            return  # nada cambió
+        self._last_sig = sig
+
+        import os
+        path = os.path.abspath(cfg.GO2RTC_CONFIG_PATH)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(_dump_yaml(data))
+            logger.info(
+                "go2rtc reconcile: %d stream(s) (reinicio para aplicar)",
+                len(data["streams"]),
+            )
+        except Exception as e:
+            logger.warning("go2rtc reconcile: no se pudo escribir config: %s", e)
+            return
+
+        # IMPORTANTE: NO respawneamos aquí. Solo matamos el proceso y dejamos
+        # que el hilo SUPERVISOR (único que hace _spawn) lo levante con el nuevo
+        # config. Si reconciliador y supervisor spawnearan a la vez habría DOS
+        # go2rtc peleando por el puerto 8554. Así el supervisor es el único
+        # spawner y no hay carrera.
+        if self.is_running():
+            self._terminate_proc()
+
+    def _reconcile_loop(self) -> None:
+        """Revisa la BD periódicamente y aplica cambios de cámaras a go2rtc."""
+        while self._running:
+            try:
+                self.reconcile()
+            except Exception as e:
+                logger.warning("go2rtc reconcile loop error: %s", e)
+            # 15s: el worker FFmpeg tarda ~60s en agotar sus reintentos, así que
+            # 15s da margen de sobra para que una cámara recién añadida tenga su
+            # stream, y reduce 3× la lectura periódica de la BD frente a 5s.
+            for _ in range(15):
+                if not self._running:
+                    break
+                time.sleep(1)
+
+    # ───────────────────────────────────────────────────────────────────────
     # Ciclo de vida del proceso (pasos 1, 3, 4)
     # ───────────────────────────────────────────────────────────────────────
     def start(self, cameras: Iterable[Any]) -> bool:
@@ -358,6 +456,12 @@ class Go2RtcManager:
             target=self._supervise_loop, name="Go2RtcSupervisor", daemon=True
         )
         self._supervisor.start()
+        # Reconciliador: sincroniza el config con la BD (cámaras añadidas/
+        # activadas/borradas en caliente) sin que nadie tenga que llamarlo.
+        self._reconciler = threading.Thread(
+            target=self._reconcile_loop, name="Go2RtcReconciler", daemon=True
+        )
+        self._reconciler.start()
         return True
 
     def _ensure_firewall_rules(self) -> None:
@@ -390,6 +494,8 @@ class Go2RtcManager:
         except Exception:
             pass
 
+        missing: list[tuple[str, int, str]] = []
+        needs_elevation = False
         for name, port, proto in ports:
             try:
                 # ¿Existe ya la regla? (evita duplicados en cada arranque)
@@ -411,13 +517,47 @@ class Go2RtcManager:
                 if add.returncode == 0:
                     logger.info("Firewall: regla añadida '%s' (%s/%s)", name, port, proto)
                 else:
-                    logger.warning(
-                        "Firewall: no se pudo añadir '%s' (%s/%s). "
-                        "¿Backend sin permisos de administrador? Detalle: %s",
-                        name, port, proto, (add.stderr or add.stdout).strip()[:160],
-                    )
+                    detail = (add.stderr or add.stdout).strip()
+                    missing.append((name, port, proto))
+                    if "elevaci" in detail.lower() or "elevation" in detail.lower():
+                        needs_elevation = True
             except Exception as e:
                 logger.warning("Firewall: error configurando '%s': %s", name, e)
+
+        # Sin permisos → intentar UNA sola vez con elevación (UAC). Las reglas
+        # persisten, así que el usuario solo verá el aviso de UAC la primera vez.
+        if missing and needs_elevation and not getattr(self, "_fw_elevation_tried", False):
+            self._fw_elevation_tried = True
+            self._add_firewall_rules_elevated(missing)
+
+    def _add_firewall_rules_elevated(self, rules: "list[tuple[str, int, str]]") -> None:
+        """Lanza UN proceso elevado (UAC) que crea todas las reglas que faltan."""
+        try:
+            cmds = " & ".join(
+                f'netsh advfirewall firewall add rule name="{n}" dir=in '
+                f"action=allow protocol={p} localport={port} profile=any"
+                for n, port, p in rules
+            )
+            # Start-Process -Verb RunAs dispara el diálogo de UAC una vez.
+            ps = (
+                f"Start-Process -FilePath cmd.exe "
+                f"-ArgumentList '/c {cmds}' -Verb RunAs -WindowStyle Hidden"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=30,
+            )
+            logger.info(
+                "Firewall: solicitada elevación (UAC) para abrir %d puerto(s) "
+                "de go2rtc/backend. Si aceptaste, ya quedaron abiertos.",
+                len(rules),
+            )
+        except Exception as e:
+            logger.warning(
+                "Firewall: no se pudo elevar para abrir puertos (%s). "
+                "Abre manualmente 1984/8554/8555 o ejecuta el backend como admin.",
+                e,
+            )
 
     def _spawn(self) -> None:
         """Lanza el subproceso go2rtc, volcando su salida a un archivo de log."""

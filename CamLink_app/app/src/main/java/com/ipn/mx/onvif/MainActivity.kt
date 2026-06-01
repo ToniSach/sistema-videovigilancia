@@ -15,7 +15,10 @@ import androidx.core.app.ActivityCompat
 import androidx.navigation.fragment.NavHostFragment
 import androidx.navigation.ui.AppBarConfiguration
 import androidx.navigation.ui.setupActionBarWithNavController
+import androidx.navigation.ui.setupWithNavController
+import com.google.android.material.appbar.AppBarLayout
 import com.google.android.material.appbar.MaterialToolbar
+import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.ipn.mx.onvif.network.JwtAuthenticator
 import com.ipn.mx.onvif.network.RetrofitClient
 import com.ipn.mx.onvif.service.NotificationWebSocketService
@@ -75,13 +78,66 @@ class MainActivity : AppCompatActivity() {
             .findFragmentById(R.id.navHostFragment) as NavHostFragment
         val navController = navHostFragment.navController
 
-        // QR y LiveView son destinos raíz — sin flecha de atrás en ellos.
+        // Destinos de primer nivel (pestañas de la barra inferior): sin flecha
+        // de atrás. El resto (playback, telegram, config) sí muestran la flecha.
         val appBarConfig = AppBarConfiguration(
-            setOf(R.id.qrScanFragment, R.id.liveViewFragment)
+            setOf(
+                R.id.liveViewFragment,
+                R.id.cameraListFragment,
+                R.id.timelineFragment,
+                R.id.notificationsPanelFragment,
+            )
         )
         setupActionBarWithNavController(navController, appBarConfig)
 
+        // Barra de navegación inferior enlazada al NavController (los IDs del
+        // menú coinciden con los destinos → navega sola al tocar cada pestaña).
+        val bottomNav = findViewById<BottomNavigationView>(R.id.bottomNav)
+        bottomNav.setupWithNavController(navController)
+
+        // En la pantalla de login (QR) ocultamos toolbar + barra inferior para
+        // una experiencia limpia de "fuera de sesión".
+        val appBar = findViewById<AppBarLayout>(R.id.appBar)
+        navController.addOnDestinationChangedListener { _, destination, _ ->
+            val isLogin = destination.id == R.id.qrScanFragment
+            appBar.visibility = if (isLogin) android.view.View.GONE else android.view.View.VISIBLE
+            bottomNav.visibility = if (isLogin) android.view.View.GONE else android.view.View.VISIBLE
+        }
+
+        // Link de notificación: si la app se abrió tocando una push de evento,
+        // navegar al timeline de esa cámara (la push lleva extras openCameraId).
+        handleNotificationIntent(navController)
+
         maybeRequestNotificationPermission()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        try {
+            val navHostFragment = supportFragmentManager
+                .findFragmentById(R.id.navHostFragment) as NavHostFragment
+            handleNotificationIntent(navHostFragment.navController)
+        } catch (_: Exception) {}
+    }
+
+    /** Si el intent trae openCameraId (de una notificación push), abre el
+     *  timeline de grabaciones de esa cámara en la fecha del evento. */
+    private fun handleNotificationIntent(navController: androidx.navigation.NavController) {
+        val camId = intent?.getIntExtra("openCameraId", -1) ?: -1
+        if (camId <= 0) return
+        // Consumir el extra para no re-navegar en rotaciones.
+        intent.removeExtra("openCameraId")
+        val date = intent.getStringExtra("openDate")  // YYYY-MM-DD, opcional
+        val args = Bundle().apply {
+            putInt("cameraId", camId)
+            if (!date.isNullOrBlank()) putString("date", date)
+        }
+        try {
+            navController.navigate(R.id.timelineFragment, args)
+        } catch (e: Exception) {
+            android.util.Log.w("MainActivity", "No pude abrir timeline desde notif: ${e.message}")
+        }
     }
 
     override fun onStart() {

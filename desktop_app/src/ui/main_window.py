@@ -60,6 +60,7 @@ VIEW_SYSTEM = 6
 VIEW_USERS = 7
 VIEW_PERMISSIONS = 8
 VIEW_SETTINGS = 9
+VIEW_DASHBOARD = 10  # pantalla de inicio (se añade al final del stack)
 
 
 class MainWindow(QMainWindow):
@@ -161,6 +162,15 @@ class MainWindow(QMainWindow):
         else:
             self.settings_view = None
 
+        # Dashboard de inicio (índice 10). Sus botones navegan a otras vistas.
+        from desktop_app.src.ui.views.dashboard_view import DashboardView
+        self.dashboard_view = DashboardView()
+        self.dashboard_view.open_live.connect(lambda: self._switch_view(VIEW_LIVE))
+        self.dashboard_view.open_events.connect(lambda: self._switch_view(VIEW_EVENTS))
+        self.dashboard_view.open_playback.connect(lambda: self._switch_view(VIEW_PLAYBACK))
+        self.dashboard_view.open_cameras.connect(lambda: self._switch_view(VIEW_CAMERAS))
+        self.content_stack.addWidget(self.dashboard_view)        # 10
+
         layout.addWidget(self.content_stack, stretch=1)
         return widget
 
@@ -185,7 +195,8 @@ class MainWindow(QMainWindow):
 
         # ===== Sección MONITOREO =====
         layout.addWidget(self._section_label("MONITOREO"))
-        self._add_nav(layout, "En vivo", VIEW_LIVE, active=True, icon_name="live")
+        self._add_nav(layout, "Inicio", VIEW_DASHBOARD, active=True, icon_name="system")
+        self._add_nav(layout, "En vivo", VIEW_LIVE, icon_name="live")
         self._add_nav(layout, "Eventos", VIEW_EVENTS, icon_name="events")
         self._add_nav(layout, "Reproducción", VIEW_PLAYBACK, icon_name="playback")
 
@@ -379,11 +390,13 @@ class MainWindow(QMainWindow):
         self.users_view.set_current_user(self.current_user.id, role)
         self.permissions_view.set_current_user(self.current_user.id, role)
         self.notifications_view.set_current_user(self.current_user.id, role)
+        self.dashboard_view.set_user(self.current_user.username)
 
         self._load_cameras()
 
-        # Switch a vista principal
+        # Switch a vista principal y abrir el Dashboard de inicio.
         self.stack.setCurrentIndex(1)
+        self._switch_view(VIEW_DASHBOARD)
         self.menuBar().setVisible(True)
         self.statusbar.setVisible(True)
 
@@ -541,7 +554,7 @@ class MainWindow(QMainWindow):
             "<b>NVR VMS Professional v2.0</b><br>"
             "Sistema de Videovigilancia profesional<br>"
             "para redes LAN.<br><br>"
-            "<i>Soporta cámaras ONVIF, IA con YOLOv8, "
+            "<i>Soporta cámaras ONVIF, detección de objetos por IA, "
             "PTZ, audio bidireccional, grabación continua "
             "y notificaciones Telegram.</i>"
         )

@@ -33,6 +33,9 @@ def get_preferences():
                     "start": p.schedule_start.isoformat() if p.schedule_start else None,
                     "end": p.schedule_end.isoformat() if p.schedule_end else None
                 },
+                # Campos planos "HH:MM" para clientes (móvil) que los consumen directos.
+                "schedule_start": p.schedule_start.strftime("%H:%M") if p.schedule_start else None,
+                "schedule_end": p.schedule_end.strftime("%H:%M") if p.schedule_end else None,
                 "days": days
             })
         
@@ -90,7 +93,22 @@ def update_preference(pref_id):
         prefs = pref_service.get_user_preferences(user_id)
         if not any(p.id == pref_id for p in prefs):
             return jsonify({"success": False, "error": "No autorizado"}), 403
-        
+
+        # Parsear horarios "HH:MM" → time (igual que en POST). Sin esto, el
+        # service hacía setattr(schedule_start, "08:00") guardando un string en
+        # una columna Time → la ventana horaria nunca se evaluaba bien.
+        from datetime import datetime as _dt
+        if "schedule_start" in data:
+            data["schedule_start"] = (
+                _dt.strptime(data["schedule_start"], "%H:%M").time()
+                if data["schedule_start"] else None
+            )
+        if "schedule_end" in data:
+            data["schedule_end"] = (
+                _dt.strptime(data["schedule_end"], "%H:%M").time()
+                if data["schedule_end"] else None
+            )
+
         pref = pref_service.update_preference(pref_id, **data)
         if not pref:
             return jsonify({"success": False, "error": "No encontrado"}), 404

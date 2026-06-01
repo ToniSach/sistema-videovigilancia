@@ -14,9 +14,10 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QSpinBox, QSplitter, QMessageBox, QFrame, QSizePolicy,
+    QStackedWidget, QListWidget, QListWidgetItem,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QSize
-from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QBrush
+from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QBrush, QIcon
 
 from desktop_app.src.config import config
 from desktop_app.src.services.api_client import api_client
@@ -114,6 +115,12 @@ class EventsView(QWidget):
         self.lbl_count.setStyleSheet(f"color: {config.THEME_TEXT_MUTED};")
         header.addWidget(self.lbl_count)
 
+        self.btn_ack_all = QPushButton("  Marcar todos")
+        self.btn_ack_all.setIcon(icon("ok"))
+        self.btn_ack_all.setToolTip("Marcar como revisados todos los eventos mostrados")
+        self.btn_ack_all.clicked.connect(self._acknowledge_all)
+        header.addWidget(self.btn_ack_all)
+
         self.btn_refresh = QPushButton("  Refrescar")
         self.btn_refresh.setIcon(icon("refresh"))
         self.btn_refresh.clicked.connect(self._load_events)
@@ -146,14 +153,39 @@ class EventsView(QWidget):
         self.spin_hours.valueChanged.connect(self._debounce_load)
         f_layout.addWidget(self.spin_hours)
 
+        # Filtro rápido: mostrar solo eventos sin revisar.
+        from PySide6.QtWidgets import QCheckBox
+        self.chk_unread = QCheckBox("Solo sin revisar")
+        self.chk_unread.stateChanged.connect(self._populate_table)
+        f_layout.addWidget(self.chk_unread)
+
         f_layout.addStretch()
+
+        # Conmutador Lista / Galería (vista de tabla vs. miniaturas).
+        self.btn_view_list = QPushButton("  Lista")
+        self.btn_view_list.setIcon(icon("events"))
+        self.btn_view_list.setCheckable(True)
+        self.btn_view_list.setChecked(True)
+        self.btn_view_gallery = QPushButton("  Galería")
+        self.btn_view_gallery.setIcon(icon("playback"))
+        self.btn_view_gallery.setCheckable(True)
+        for b in (self.btn_view_list, self.btn_view_gallery):
+            b.setMaximumWidth(110)
+        self.btn_view_list.clicked.connect(lambda: self._set_view_mode("list"))
+        self.btn_view_gallery.clicked.connect(lambda: self._set_view_mode("gallery"))
+        f_layout.addWidget(self.btn_view_list)
+        f_layout.addWidget(self.btn_view_gallery)
+
         self.lbl_auto = QLabel("Auto-refresh: ON")
         self.lbl_auto.setStyleSheet(f"color: {config.THEME_ACCENT}; font-size: 11px;")
         f_layout.addWidget(self.lbl_auto)
         layout.addWidget(filters)
 
-        # Splitter: tabla + detalle
+        # Splitter: (tabla | galería) + detalle
         splitter = QSplitter(Qt.Horizontal)
+
+        # Stack que alterna entre la tabla y la galería de miniaturas.
+        self.view_stack = QStackedWidget()
 
         # ----- Tabla de eventos -----
         self.table = QTableWidget(0, 5)
@@ -167,7 +199,44 @@ class EventsView(QWidget):
         self.table.itemSelectionChanged.connect(self._on_select)
         self.table.cellDoubleClicked.connect(self._on_double_click)
         self.table.setStyleSheet(self._table_style())
-        splitter.addWidget(self.table)
+        self.view_stack.addWidget(self.table)  # índice 0 = lista
+
+        # ----- Galería de miniaturas -----
+        self.gallery = QListWidget()
+        self.gallery.setViewMode(QListWidget.IconMode)
+        self.gallery.setIconSize(QSize(180, 135))
+        self.gallery.setGridSize(QSize(200, 185))
+        self.gallery.setResizeMode(QListWidget.Adjust)
+        self.gallery.setMovement(QListWidget.Static)
+        self.gallery.setSpacing(8)
+        self.gallery.setWordWrap(True)
+        self.gallery.itemSelectionChanged.connect(self._on_gallery_select)
+        self.gallery.itemDoubleClicked.connect(lambda *_: self._jump_selected())
+        self.gallery.setStyleSheet(f"""
+            QListWidget {{
+                background-color: {config.GLASS_BG};
+                border: 1px solid {config.GLASS_BORDER};
+                border-radius: 8px;
+                color: {config.THEME_TEXT};
+            }}
+            QListWidget::item {{
+                background-color: {config.THEME_SECONDARY};
+                border: 1px solid {config.GLASS_BORDER};
+                border-radius: 6px;
+                padding: 4px;
+            }}
+            QListWidget::item:selected {{
+                border: 2px solid {config.THEME_ACCENT};
+            }}
+        """)
+        self.view_stack.addWidget(self.gallery)  # índice 1 = galería
+
+        splitter.addWidget(self.view_stack)
+        self._view_mode = "list"
+        # Cola de carga de miniaturas (secuencial, para no saturar el backend).
+        self._thumb_queue: List[int] = []
+        self._thumb_worker: Optional[SnapshotLoaderThread] = None
+        self._thumb_cache: dict = {}
 
         # ----- Panel de detalle -----
         detail = GlassCard()
@@ -281,9 +350,15 @@ class EventsView(QWidget):
         self._pending_select_id = selected_id
         self._load_events()
 
+    def _visible_events(self):
+        """Eventos tras aplicar el filtro 'solo sin revisar'."""
+        if getattr(self, "chk_unread", None) and self.chk_unread.isChecked():
+            return [e for e in self._events if not e.get("acknowledged", False)]
+        return self._events
+
     def _populate_table(self):
         self.table.setRowCount(0)
-        for ev in self._events:
+        for ev in self._visible_events():
             r = self.table.rowCount()
             self.table.insertRow(r)
 
@@ -334,7 +409,8 @@ class EventsView(QWidget):
                     if item:
                         item.setBackground(QBrush(QColor(34, 49, 71)))
 
-        self.lbl_count.setText(f"{len(self._events)} eventos")
+        n_unread = sum(1 for e in self._events if not e.get("acknowledged", False))
+        self.lbl_count.setText(f"{len(self._events)} eventos · {n_unread} sin revisar")
 
         # Restaurar selección si había una
         pending = getattr(self, "_pending_select_id", None)
@@ -344,6 +420,97 @@ class EventsView(QWidget):
                     self.table.selectRow(r)
                     break
             self._pending_select_id = None
+
+        # Si la galería está visible, repoblarla también.
+        if self._view_mode == "gallery":
+            self._populate_gallery()
+
+    # ------------------------------------------------------------------
+    # Vista Galería
+    # ------------------------------------------------------------------
+    def _set_view_mode(self, mode: str):
+        self._view_mode = mode
+        is_list = mode == "list"
+        self.btn_view_list.setChecked(is_list)
+        self.btn_view_gallery.setChecked(not is_list)
+        self.view_stack.setCurrentIndex(0 if is_list else 1)
+        if not is_list:
+            self._populate_gallery()
+
+    def _populate_gallery(self):
+        self.gallery.clear()
+        self._thumb_queue = []
+        placeholder = self._placeholder_icon()
+        for ev in self._visible_events():
+            etype = ev.get("event_type", "")
+            label, color = EVENT_TYPES.get(etype, (etype, config.THEME_TEXT))
+            ts_str = ev.get("created_at") or ev.get("timestamp", "")
+            try:
+                if isinstance(ts_str, (int, float)):
+                    dt = datetime.fromtimestamp(ts_str)
+                else:
+                    dt = datetime.fromisoformat(str(ts_str).replace("Z", ""))
+                when = dt.strftime("%d/%m %H:%M")
+            except Exception:
+                when = str(ts_str)[:16]
+            cam_id = ev.get("camera_id")
+            ack = bool(ev.get("acknowledged", False))
+            mark = "" if ack else "● "
+            conf = ev.get("confidence", 0)
+            conf_txt = f" {float(conf):.0%}" if conf else ""
+            it = QListWidgetItem(f"{mark}{label}{conf_txt} · Cam {cam_id}\n{when}")
+            it.setData(Qt.UserRole, ev.get("id"))
+            it.setForeground(QBrush(QColor(color)))
+            it.setTextAlignment(Qt.AlignHCenter | Qt.AlignBottom)
+            eid = ev.get("id")
+            if eid in self._thumb_cache:
+                it.setIcon(QIcon(self._thumb_cache[eid]))
+            else:
+                it.setIcon(placeholder)
+                if eid is not None:
+                    self._thumb_queue.append(eid)
+            self.gallery.addItem(it)
+        self._load_next_thumb()
+
+    def _placeholder_icon(self) -> QIcon:
+        pix = QPixmap(180, 135)
+        pix.fill(QColor("#0b1220"))
+        return QIcon(pix)
+
+    def _load_next_thumb(self):
+        """Carga miniaturas de la cola de una en una (no satura el backend)."""
+        if self._view_mode != "gallery" or not self._thumb_queue:
+            return
+        if self._thumb_worker and self._thumb_worker.isRunning():
+            return
+        eid = self._thumb_queue.pop(0)
+        token = api_client.get_stream_token() or ""
+        url = f"{config.API_BASE_URL}/events/{eid}/snapshot"
+        self._thumb_worker = SnapshotLoaderThread(eid, url, token)
+        self._thumb_worker.loaded.connect(self._on_thumb_loaded)
+        self._thumb_worker.failed.connect(lambda *_: self._load_next_thumb())
+        self._thumb_worker.start()
+
+    def _on_thumb_loaded(self, event_id: int, pix: QPixmap):
+        scaled = pix.scaled(QSize(180, 135), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._thumb_cache[event_id] = scaled
+        for i in range(self.gallery.count()):
+            it = self.gallery.item(i)
+            if it.data(Qt.UserRole) == event_id:
+                it.setIcon(QIcon(scaled))
+                break
+        self._load_next_thumb()  # siguiente de la cola
+
+    def _on_gallery_select(self):
+        items = self.gallery.selectedItems()
+        if not items:
+            return
+        event_id = items[0].data(Qt.UserRole)
+        # Sincronizar selección con la tabla para reusar el panel de detalle.
+        for r in range(self.table.rowCount()):
+            if self.table.item(r, 0).data(Qt.UserRole) == event_id:
+                self.table.selectRow(r)
+                break
 
     # ------------------------------------------------------------------
     # Detalle de evento seleccionado
@@ -439,6 +606,31 @@ class EventsView(QWidget):
                 QMessageBox.warning(self, "Error", f"No se pudo marcar: {response.error}")
 
         api_client.patch(f"events/{event_id}/acknowledge", on_done)
+
+    def _acknowledge_all(self):
+        """Marca como revisados todos los eventos mostrados que estén sin revisar."""
+        pending = [e for e in self._visible_events() if not e.get("acknowledged", False)]
+        if not pending:
+            QMessageBox.information(self, "Eventos", "No hay eventos sin revisar.")
+            return
+        ans = QMessageBox.question(
+            self, "Marcar todos",
+            f"¿Marcar como revisados {len(pending)} evento(s)?",
+        )
+        if ans != QMessageBox.Yes:
+            return
+        # PATCH a cada uno; al terminar el último, recargamos.
+        self._ack_remaining = len(pending)
+
+        def make_cb():
+            def on_done(_response):
+                self._ack_remaining -= 1
+                if self._ack_remaining <= 0:
+                    self._load_events()
+            return on_done
+
+        for e in pending:
+            api_client.patch(f"events/{e.get('id')}/acknowledge", make_cb())
 
     def _on_double_click(self, row: int, _col: int):
         self._jump_selected()

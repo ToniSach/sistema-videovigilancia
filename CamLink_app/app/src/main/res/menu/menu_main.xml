@@ -2,15 +2,8 @@
 <menu xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto">
 
-    <item
-        android:id="@+id/menuGrabaciones"
-        android:title="@string/menu_grabaciones"
-        app:showAsAction="never" />
-
-    <item
-        android:id="@+id/menuNotificaciones"
-        android:title="@string/menu_notificaciones"
-        app:showAsAction="never" />
+    <!-- Grabaciones y Notificaciones ya están en la barra inferior. Aquí solo
+         queda lo secundario: configurar notificaciones, Telegram, cerrar sesión. -->
 
     <item
         android:id="@+id/menuConfigNotificaciones"

@@ -4,6 +4,7 @@ Servicio de playback de grabaciones usando VLC.
 import logging
 import os
 import tempfile
+import threading
 from typing import Optional, Callable
 from dataclasses import dataclass
 
@@ -75,6 +76,10 @@ class VLCPlayer(QObject):
         self._timer: Optional[QTimer] = None
         self._current_media = None
         self._is_seeking = False
+        # Lock para serializar swaps de media en hilo de fondo (evita que dos
+        # cambios de calidad solapados llamen stop()/play() a la vez).
+        self._swap_lock = threading.Lock()
+        self._swap_thread: Optional[threading.Thread] = None
 
     def _ensure_timer(self):
         """Crea el QTimer en el primer uso (con QApplication ya viva)."""
@@ -84,29 +89,55 @@ class VLCPlayer(QObject):
             self._timer.start(100)  # 100ms
     
     def play_url(self, url: str):
-        """Reproduce URL (http o file)."""
+        """Reproduce URL (http o file). Síncrono (úsalo solo en el arranque
+        inicial del stream; para CAMBIAR de fuente en vivo usa play_url_async,
+        porque player.stop() es bloqueante y congelaría la UI)."""
         try:
             self._ensure_timer()  # crear QTimer ahora que QApplication existe
-            self.player.stop()
-
-            media = self.instance.media_new(url)
-            # Opciones a nivel de media (por reproductor). Si no se especificó
-            # network-caching, usar 300ms por defecto (VOD).
-            if not any(o.startswith("network-caching") for o in self._media_opts):
-                media.add_option(":network-caching=300")
-            for o in self._media_opts:
-                media.add_option(f":{o}")
-            self.player.set_media(media)
-            self._current_media = media
-
-            result = self.player.play()
-            if result == -1:
-                self.error.emit("No se pudo iniciar reproducción")
-            else:
-                logger.info(f"Reproduciendo: {url}")
+            self._do_play(url)
         except Exception as e:
             logger.error(f"Error reproduciendo URL: {e}")
             self.error.emit(str(e))
+
+    def _do_play(self, url: str):
+        """Núcleo de reproducción (stop+set_media+play). Lo comparten play_url
+        y play_url_async. OJO: player.stop() es BLOQUEANTE en libVLC 3."""
+        self.player.stop()
+        media = self.instance.media_new(url)
+        # Opciones a nivel de media (por reproductor). Si no se especificó
+        # network-caching, usar 300ms por defecto (VOD).
+        if not any(o.startswith("network-caching") for o in self._media_opts):
+            media.add_option(":network-caching=300")
+        for o in self._media_opts:
+            media.add_option(f":{o}")
+        self.player.set_media(media)
+        self._current_media = media
+        result = self.player.play()
+        if result == -1:
+            self.error.emit("No se pudo iniciar reproducción")
+        else:
+            logger.info(f"Reproduciendo: {url}")
+
+    def play_url_async(self, url: str):
+        """
+        Igual que play_url pero ejecuta stop()+set_media()+play() en un hilo de
+        fondo. CRÍTICO para el DIRECTO: en libVLC 3 `player.stop()` es BLOQUEANTE
+        (espera a que el decoder RTSP/TCP termine, segundos); en el hilo UI y
+        repetido por panel (l1+l2) congelaba la app al cambiar de calidad. No
+        toca widgets Qt (solo emite señales, que Qt encola de forma segura).
+        Serializado por _swap_lock para que dos cambios seguidos no se pisen.
+        """
+        def _worker():
+            with self._swap_lock:
+                try:
+                    self._do_play(url)
+                except Exception as e:
+                    logger.error(f"play_url_async: {e}")
+                    self.error.emit(str(e))
+        self._swap_thread = threading.Thread(
+            target=_worker, name="VLCSwap", daemon=True
+        )
+        self._swap_thread.start()
     
     def play_file(self, file_path: str):
         """Reproduce archivo local."""

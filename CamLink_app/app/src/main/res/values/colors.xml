@@ -35,4 +35,14 @@
     <color name="glass_border">#1affffff</color>
     <color name="glass_border_strong">#33ffffff</color>
     <color name="card_bg">#1e293b</color>
+
+    <!-- Tokens nuevos del rediseño pro (dark premium refinado) -->
+    <color name="surface_variant">#273449</color>
+    <color name="surface_elevated">#223049</color>
+    <color name="accent_cyan_dim">#0ea5e9</color>
+    <color name="accent_success">#22c55e</color>
+    <color name="accent_warning">#f59e0b</color>
+    <color name="text_muted">#64748b</color>
+    <color name="scrim">#99000000</color>
+    <color name="nav_bar_bg">#111c30</color>
 </resources>

@@ -7,7 +7,7 @@ a JSON y lo reenvía a los clientes que tienen permiso sobre la cámara origen.
 
 Diseñado para LAN (típico 1-10 clientes simultáneos). No usa Redis ni queues
 externas; todo en memoria del proceso. Esto encaja con el modelo single-process
-del backend (workers=1 en gunicorn.conf.py por la arquitectura singleton).
+del backend (Flask app.run threaded; un solo proceso por la arquitectura singleton).
 
 Uso:
     from backend.app.notifications.ws_broker import ws_broker

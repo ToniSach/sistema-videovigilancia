@@ -30,6 +30,29 @@
             android:contentDescription="@string/btn_remove_cam"
             android:src="@drawable/ic_close_red" />
 
+        <!-- Selector de calidad (superpuesto arriba-izquierda) -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnQuality"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|start"
+            android:layout_margin="4dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:text="Alta"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp"
+            app:backgroundTint="#66000000"
+            app:cornerRadius="14dp"
+            app:icon="@drawable/ic_video_library"
+            app:iconSize="16dp"
+            app:iconTint="#FFFFFF" />
+
         <!-- Flecha izquierda — cambiar al feed anterior -->
         <ImageButton
             android:id="@+id/btnPrevFeed"

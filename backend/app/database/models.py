@@ -223,10 +223,16 @@ class Recording(Base):
     )
     
     def to_dict(self) -> dict:
+        import os as _os
         return {
             "id": self.id,
             "camera_id": self.camera_id,
             "start_time": self.start_time.isoformat() if self.start_time else None,
+            # Alias que espera la app móvil (started_at) + nombre de archivo.
+            # Antes faltaban → la lista/detalle de grabaciones llegaba con
+            # started_at/filename nulos y la móvil fallaba al cargarlas.
+            "started_at": self.start_time.isoformat() if self.start_time else None,
+            "filename": _os.path.basename(self.file_path) if self.file_path else None,
             "end_time": self.end_time.isoformat() if self.end_time else None,
             "file_path": self.file_path,
             "file_size_bytes": self.file_size_bytes,

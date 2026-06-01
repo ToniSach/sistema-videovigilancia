@@ -97,8 +97,22 @@ class RtspVideoWidget(QFrame):
             self._apply_fill()
 
     def set_url(self, url: str):
-        """Cambia la fuente sin recrear el player (evita churn/crash de VLC)."""
-        if url and url != self._url:
+        """Cambia la fuente sin recrear el player (evita churn/crash de VLC).
+
+        Si ya hay player visible, swap ASÍNCRONO (player.stop() de libVLC es
+        bloqueante y congelaría la UI). Si aún no hay player, usa play() (que
+        difiere a showEvent)."""
+        if not url or url == self._url:
+            return
+        self._url = url
+        self._pending_url = url
+        if self._vlc is not None and self.isVisible():
+            try:
+                self._vlc.play_url_async(url)
+                QTimer.singleShot(800, self._apply_fill)
+            except Exception as e:
+                logger.error(f"RtspVideoWidget.set_url: {e}")
+        else:
             self.play(url)
 
     def show_message(self, text: str):

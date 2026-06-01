@@ -15,31 +15,17 @@ import subprocess
 import threading
 import time
 from typing import Optional
-from urllib.parse import urlparse
 
 from onvif import ONVIFCamera
-from zeep.exceptions import Fault
 
 from ..database.models import Camera
+from .onvif_common import (
+    candidate_ports as _common_candidate_ports,
+    build_onvif_cam as _common_build_cam,
+    persist_onvif_port as _common_persist_port,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_wsdl_dir() -> Optional[str]:
-    try:
-        import onvif
-        pkg_dir = os.path.dirname(onvif.__file__)
-        site_packages = os.path.dirname(pkg_dir)
-        for cand in (os.path.join(site_packages, "wsdl"), os.path.join(pkg_dir, "wsdl")):
-            if os.path.isdir(cand):
-                return cand
-    except Exception:
-        pass
-    return None
-
-
-_WSDL_DIR = _resolve_wsdl_dir()
-_ONVIF_PORTS = [80, 8000, 8080, 8899]
 
 
 def list_input_audio_devices() -> list[str]:
@@ -125,53 +111,13 @@ class AudioController:
 
     # ------------------------------------------------------------------
     def _candidate_ports(self) -> list[int]:
-        if self._camera.onvif_url:
-            try:
-                p = urlparse(self._camera.onvif_url).port
-                if p:
-                    return [p] + [x for x in _ONVIF_PORTS if x != p]
-            except Exception:
-                pass
-        return list(_ONVIF_PORTS)
+        return _common_candidate_ports(self._camera)
 
     def _build_cam(self, port: int) -> Optional[ONVIFCamera]:
-        """El kwarg `wsse` no existe en esta versión; no lo pasamos."""
-        kwargs = {"encrypt": False, "no_cache": True}
-        if _WSDL_DIR:
-            kwargs["wsdl_dir"] = _WSDL_DIR
-        try:
-            logger.debug(f"[AUDIO] cam={self._camera.id} probando {self._camera.ip_address}:{port}")
-            cam = ONVIFCamera(
-                self._camera.ip_address, port,
-                self._camera.username or "", self._camera.password or "",
-                **kwargs
-            )
-            cam.devicemgmt.GetCapabilities({"Category": "All"})
-            logger.info(f"[AUDIO] cam={self._camera.id} ONVIF OK en :{port}")
-            return cam
-        except Fault as e:
-            logger.debug(f"[AUDIO] cam={self._camera.id} Fault :{port} → {e}")
-            return None
-        except Exception as e:
-            logger.debug(f"[AUDIO] cam={self._camera.id} :{port} → {type(e).__name__}: {e}")
-            return None
+        return _common_build_cam(self._camera, port, "AUDIO")
 
     def _persist_onvif_port(self, port: int) -> None:
-        expected = f"http://{self._camera.ip_address}:{port}/onvif/device_service"
-        if self._camera.onvif_url == expected:
-            return
-        try:
-            from ..database.connection import db_manager
-            from ..database.models import Camera as CameraModel
-            with db_manager.get_session() as session:
-                cam = session.query(CameraModel).filter_by(id=self._camera.id).first()
-                if cam is not None:
-                    cam.onvif_url = expected
-                    session.commit()
-                    self._camera.onvif_url = expected
-                    logger.info(f"[AUDIO] cam={self._camera.id} onvif_url guardado: {expected}")
-        except Exception as e:
-            logger.warning(f"[AUDIO] cam={self._camera.id} no pude guardar onvif_url: {e}")
+        _common_persist_port(self._camera, port, "AUDIO")
 
     def _detect_audio_support(self) -> None:
         ports = self._candidate_ports()

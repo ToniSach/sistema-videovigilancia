@@ -316,6 +316,20 @@ def create_app(config_name='default'):
 
         threading.Thread(target=delayed_camera_startup, daemon=True).start()
 
+        # Precargar YOLO en segundo plano al ARRANCAR (no en la 1ª activación).
+        # La 1ª vez con AI_FORMAT=onnx/openvino exporta el modelo (~30-90s en
+        # CPU); hacerlo aquí evita que el primer POST /ai/<id>/activate se quede
+        # colgado esperando ese export. Idempotente y best-effort.
+        def warmup_ai():
+            try:
+                time.sleep(2.0)  # dejar que el arranque HTTP termine primero
+                from backend.app.processing.ai.model_pool import YLOModelPool
+                YLOModelPool().warmup()
+            except Exception as e:
+                logger.warning(f"Warmup IA al arranque falló (no crítico): {e}")
+
+        threading.Thread(target=warmup_ai, daemon=True, name="AIWarmupBoot").start()
+
         # StorageManager
         try:
             from backend.app.recording.storage_manager import StorageManager

@@ -25,9 +25,9 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.navigation.fragment.findNavController
+import com.google.android.material.button.MaterialButton
 import com.ipn.mx.onvif.R
 import com.ipn.mx.onvif.model.CameraResponse
-import com.ipn.mx.onvif.model.PtzRequest
 import com.ipn.mx.onvif.network.RetrofitClient
 import kotlinx.coroutines.launch
 
@@ -86,6 +86,12 @@ class LiveViewFragment : BaseMenuFragment() {
     private var isRecording = false
     private var micOn       = false
     private var nightOn     = false
+    private var lastPtzDir: String? = null   // última dirección PTZ enviada
+    // Selector de calidad (HLS): high = nativo, medium = 480p, low = 360p.
+    private val qualities = listOf("high", "medium", "low")
+    private val qualityLabels = mapOf("high" to "Alta", "medium" to "Media", "low" to "Baja")
+    private var qualityIndex = 0
+    private val currentQuality get() = qualities[qualityIndex]
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -116,7 +122,10 @@ class LiveViewFragment : BaseMenuFragment() {
         cameraFeedRef    = cameraFeed
         controlsCardRef  = view.findViewById(R.id.controlsCard)
         joystickCardRef  = view.findViewById(R.id.joystickCard)
-        bottomRowRefs    = listOf(btnToggleView, btnFullscreen)
+        // NO incluir btnFullscreen aquí: debe seguir visible en pantalla
+        // completa para poder SALIR (antes se ocultaba a sí mismo → quedabas
+        // atrapado en fullscreen).
+        bottomRowRefs    = listOf(btnToggleView)
         btnMicRef        = btnMic
         btnFullscreenRef = btnFullscreen
 
@@ -145,21 +154,9 @@ class LiveViewFragment : BaseMenuFragment() {
         }
 
         // ── Joystick PTZ ─────────────────────────────────────────────────────
+        // El backend mueve por DIRECCIÓN (ONVIF ContinuousMove): up/down/left/
+        // right y stop al soltar. El joystick decide la dirección dominante.
         joystickOuter.setOnTouchListener { _, event ->
-            // La cámara actual puede no tener PTZ (p.ej. la dual-lens iCSee no
-            // tiene motor de giro). En ese caso el joystick no hace nada: se lo
-            // explicamos al usuario en vez de dejarlo "muerto" sin feedback.
-            if (currentCamera?.hasPtz != true) {
-                if (event.action == MotionEvent.ACTION_DOWN) {
-                    Toast.makeText(
-                        requireContext(),
-                        "Esta cámara no tiene control PTZ (giro/inclinación)",
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                }
-                return@setOnTouchListener true
-            }
-
             val cx     = joystickOuter.width / 2f
             val cy     = joystickOuter.height / 2f
             val radius = (joystickOuter.width / 2f) - (joystickThumb.width / 2f)
@@ -173,13 +170,24 @@ class LiveViewFragment : BaseMenuFragment() {
                     joystickThumb.translationX = dx
                     joystickThumb.translationY = dy
 
-                    val normX = dx / radius
-                    val normY = dy / radius
-                    sendPtz(normX, normY)
+                    // Zona muerta + dirección dominante (eje con mayor desplazam.)
+                    val dead = radius * 0.30f
+                    val dir = when {
+                        dist < dead          -> null
+                        Math.abs(dx) > Math.abs(dy) -> if (dx > 0) "right" else "left"
+                        else                 -> if (dy > 0) "down" else "up"
+                    }
+                    if (dir != null && dir != lastPtzDir) {
+                        lastPtzDir = dir
+                        sendPtzDirection(dir)
+                    }
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     joystickThumb.animate().translationX(0f).translationY(0f).setDuration(150).start()
-                    sendPtz(0f, 0f)  // detener movimiento
+                    if (lastPtzDir != null) {
+                        lastPtzDir = null
+                        sendPtzDirection("stop")
+                    }
                 }
             }
             true
@@ -303,14 +311,37 @@ class LiveViewFragment : BaseMenuFragment() {
             findNavController().navigate(R.id.action_liveView_to_cameraList)
         }
         btnFullscreen.setOnClickListener { toggleFullscreen() }
+
+        // ── Selector de calidad (cicla Alta → Media → Baja) ──────────────────
+        val btnQuality = view.findViewById<MaterialButton>(R.id.btnQuality)
+        btnQuality.text = qualityLabels[currentQuality]
+        btnQuality.setOnClickListener {
+            qualityIndex = (qualityIndex + 1) % qualities.size
+            btnQuality.text = qualityLabels[currentQuality]
+            Toast.makeText(requireContext(), "Calidad: ${qualityLabels[currentQuality]}", Toast.LENGTH_SHORT).show()
+            playCurrentCamera(surfaceView)  // recargar con la nueva calidad
+        }
+    }
+
+    /** Aplica la calidad al stream: high = url tal cual; medium/low → añade el
+     *  sufijo al nombre del substream de go2rtc (cam_X[_lY] → cam_X[_lY]_low). */
+    private fun applyQuality(url: String?, q: String): String? {
+        if (url.isNullOrBlank() || q == "high") return url
+        return "${url}_$q"
     }
 
     // ── Mostrar/ocultar controles según capacidades de la cámara ──────────────
     /** Oculta el micrófono si la cámara no tiene audio y el joystick si no tiene
      *  PTZ — así no hay botones "muertos" (diseño más limpio). */
     private fun updateControlsForCamera(cam: CameraResponse?) {
-        btnMicRef?.visibility = if (cam?.hasAudio == true) View.VISIBLE else View.GONE
-        joystickCardRef?.visibility = if (cam?.hasPtz == true) View.VISIBLE else View.GONE
+        // El "mic" (talk-back) del backend usa el micrófono del SERVIDOR, no el
+        // del teléfono → no es una función de la app móvil. Se oculta para no
+        // mostrar un botón que siempre da error.
+        btnMicRef?.visibility = View.GONE
+        // El joystick PTZ se muestra siempre: el flag has_ptz no es fiable
+        // (el escritorio mueve la cámara aunque venga en false). Si la cámara no
+        // tiene PTZ, el backend simplemente ignora el movimiento.
+        joystickCardRef?.visibility = View.VISIBLE
     }
 
     // ── Pantalla completa (landscape + inmersivo + video a pantalla) ──────────
@@ -319,9 +350,11 @@ class LiveViewFragment : BaseMenuFragment() {
         val act = activity ?: return
         isFullscreen = !isFullscreen
 
+        val bottomNav = act.findViewById<View>(R.id.bottomNav)
         if (isFullscreen) {
             act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             (act as? AppCompatActivity)?.supportActionBar?.hide()
+            bottomNav?.visibility = View.GONE
             setSystemBarsHidden(true)
             controlsCardRef?.visibility = View.GONE
             joystickCardRef?.visibility = View.GONE
@@ -331,6 +364,7 @@ class LiveViewFragment : BaseMenuFragment() {
         } else {
             act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             (act as? AppCompatActivity)?.supportActionBar?.show()
+            bottomNav?.visibility = View.VISIBLE
             setSystemBarsHidden(false)
             controlsCardRef?.visibility = View.VISIBLE
             bottomRowRefs.forEach { it.visibility = View.VISIBLE }
@@ -418,18 +452,22 @@ class LiveViewFragment : BaseMenuFragment() {
         player?.release()
         triedFallback = false
 
+        // Aplicar la calidad elegida (high/medium/low) a la URL preferida y a la
+        // de respaldo (go2rtc tiene substreams cam_X[_lY]_low/_medium).
+        val primaryUrl = applyQuality(feed.url, currentQuality) ?: feed.url
+        val fallbackUrl = applyQuality(feed.fallbackUrl, currentQuality)
+
         player = ExoPlayer.Builder(requireContext()).build().also { exo ->
             exo.setVideoSurfaceView(surfaceView)
             // ExoPlayer detecta el tipo por la URL: .m3u8 → HLS, rtsp:// → RTSP
             // (ambos módulos están en el classpath). No hace falta factory manual.
             exo.addListener(object : Player.Listener {
                 override fun onPlayerError(error: PlaybackException) {
-                    val fb = feed.fallbackUrl
-                    if (!triedFallback && !fb.isNullOrBlank() && fb != feed.url) {
+                    if (!triedFallback && !fallbackUrl.isNullOrBlank() && fallbackUrl != primaryUrl) {
                         // HLS falló → reintentar una vez con RTSP directo.
                         triedFallback = true
-                        android.util.Log.w("LiveView", "HLS falló (${error.errorCodeName}); probando RTSP: $fb")
-                        exo.setMediaItem(MediaItem.fromUri(fb))
+                        android.util.Log.w("LiveView", "HLS falló (${error.errorCodeName}); probando RTSP: $fallbackUrl")
+                        exo.setMediaItem(MediaItem.fromUri(fallbackUrl))
                         exo.prepare()
                         exo.playWhenReady = true
                     } else {
@@ -441,7 +479,7 @@ class LiveViewFragment : BaseMenuFragment() {
                     }
                 }
             })
-            exo.setMediaItem(MediaItem.fromUri(feed.url))
+            exo.setMediaItem(MediaItem.fromUri(primaryUrl))
             exo.prepare()
             exo.playWhenReady = true
         }
@@ -453,18 +491,25 @@ class LiveViewFragment : BaseMenuFragment() {
 
     // ── PTZ ───────────────────────────────────────────────────────────────────
 
-    private fun sendPtz(normX: Float, normY: Float) {
+    /** Envía un movimiento PTZ por dirección (up/down/left/right/stop). */
+    private fun sendPtzDirection(direction: String) {
         val camera = currentCamera ?: return
-        if (!camera.hasPtz) return  // la cámara iCSee no tiene PTZ
-
         val baseUrl = RetrofitClient.buildBaseUrl(requireContext()) ?: return
         val api     = RetrofitClient.create(baseUrl, requireContext())
 
         viewLifecycleOwner.lifecycleScope.launch {
             try {
-                api.sendPtz(camera.id, PtzRequest(normX, normY))
+                val resp = api.ptzMove(camera.id, direction)
+                if (!resp.isSuccessful && direction != "stop" && resp.code() != 423) {
+                    val human = when (resp.code()) {
+                        403 -> "Sin permiso para mover esta cámara"
+                        404, in 400..499 -> "Esta cámara no soporta PTZ"
+                        else -> "Error PTZ: ${resp.code()}"
+                    }
+                    Toast.makeText(requireContext(), human, Toast.LENGTH_SHORT).show()
+                }
             } catch (_: Exception) {
-                // PTZ es best-effort — no mostrar error al usuario en cada movimiento
+                // best-effort: no spamear toasts en cada movimiento
             }
         }
     }

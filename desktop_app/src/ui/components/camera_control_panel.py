@@ -339,13 +339,22 @@ class AIControlWidget(GlassCard):
         layout.setSpacing(12)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        lbl_title = QLabel("Inteligencia Artificial (YOLOv8)")
+        lbl_title = QLabel("Detección de objetos")
         lbl_title.setStyleSheet(f"""
             color: {config.THEME_ACCENT};
             font-weight: bold;
             font-size: 14px;
         """)
         layout.addWidget(lbl_title)
+
+        # Aviso: solo una cámara puede tener la detección activa a la vez.
+        # Si está en OTRA cámara, lo indicamos aquí (se actualiza en _refresh_status).
+        self.lbl_global_ai = QLabel("")
+        self.lbl_global_ai.setWordWrap(True)
+        self.lbl_global_ai.setStyleSheet(
+            f"color: {config.THEME_TEXT_MUTED}; font-size: 11px;"
+        )
+        layout.addWidget(self.lbl_global_ai)
 
         # Selector de lente
         lens_layout = QHBoxLayout()
@@ -359,8 +368,10 @@ class AIControlWidget(GlassCard):
         # Selector de modo
         mode_layout = QHBoxLayout()
         mode_layout.addWidget(QLabel("Modo:"))
+        # Etiquetas comerciales; el valor real (low_cpu/high_quality) va como data.
         self.cmb_mode = QComboBox()
-        self.cmb_mode.addItems(["low_cpu", "high_quality"])
+        self.cmb_mode.addItem("Bajo consumo (rápido)", "low_cpu")
+        self.cmb_mode.addItem("Alta precisión", "high_quality")
         self.cmb_mode.setStyleSheet(self._combo_style())
         mode_layout.addWidget(self.cmb_mode, 1)
         layout.addLayout(mode_layout)
@@ -422,12 +433,13 @@ class AIControlWidget(GlassCard):
         if not self.camera_id:
             return
         lens = self.cmb_lens.currentText()
-        mode = self.cmb_mode.currentText()
+        mode = self.cmb_mode.currentData() or "low_cpu"
+        mode_label = self.cmb_mode.currentText()
 
         def on_response(response):
             if response.success:
                 self._active_lenses.add(lens)
-                self.lbl_status.setText(f"IA activa en {lens} ({mode})")
+                self.lbl_status.setText(f"Detección activa en {lens} · {mode_label}")
                 self.lbl_status.setStyleSheet(
                     f"color: {config.THEME_ACCENT}; font-weight: bold;"
                 )
@@ -476,17 +488,39 @@ class AIControlWidget(GlassCard):
                         active.append(lens)
                         self._active_lenses.add(lens)
                 if active:
-                    self.lbl_status.setText(f"IA activa en: {', '.join(active)}")
+                    self.lbl_status.setText(f"Detección activa en: {', '.join(active)}")
                     self.lbl_status.setStyleSheet(
                         f"color: {config.THEME_ACCENT}; font-weight: bold;"
                     )
                 else:
-                    self.lbl_status.setText("IA: desactivada")
+                    self.lbl_status.setText("Detección: desactivada")
                     self.lbl_status.setStyleSheet(
                         f"color: {config.THEME_TEXT_MUTED}; font-size: 12px;"
                     )
 
         api_client.get(f"ai/{self.camera_id}", on_response)
+        self._refresh_global_ai()
+
+    def _refresh_global_ai(self):
+        """Indica si la detección está activa en OTRA cámara (solo 1 a la vez)."""
+        def on_global(response):
+            if not response.success:
+                self.lbl_global_ai.setText("")
+                return
+            active = (response.data or {}).get("active") or []
+            others = [a for a in active if a.get("camera_id") != self.camera_id]
+            if others:
+                cams = ", ".join(f"cámara {a['camera_id']}" for a in others)
+                self.lbl_global_ai.setText(
+                    f"⚠ La detección está activa en {cams}. Solo una cámara puede "
+                    f"tenerla a la vez; activarla aquí la moverá."
+                )
+                self.lbl_global_ai.setStyleSheet(
+                    "color: #fbbf24; font-size: 11px;"
+                )
+            else:
+                self.lbl_global_ai.setText("")
+        api_client.get("ai/status", on_global)
 
 
 class RecordingControlWidget(GlassCard):

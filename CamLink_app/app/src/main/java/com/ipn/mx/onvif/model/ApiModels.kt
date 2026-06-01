@@ -96,7 +96,9 @@ data class NotificationPreferenceDto(
     @SerializedName("camera_id")  val cameraId: Int? = null,
     val enabled: Boolean = true,
     val channels: List<String> = emptyList(),     // "push" | "telegram"
-    val days: List<Int> = emptyList(),            // 0..6
+    val days: List<Int> = emptyList(),            // 0..6 (0=domingo)
+    @SerializedName("schedule_start") val scheduleStart: String? = null,  // "HH:MM"
+    @SerializedName("schedule_end")   val scheduleEnd: String? = null,    // "HH:MM"
 )
 
 data class NotificationPreferencesResponse(
@@ -111,6 +113,8 @@ data class PreferenceMutation(
     val enabled: Boolean? = null,
     val channels: List<String>? = null,
     @SerializedName("days_of_week") val daysOfWeek: List<Int>? = null,
+    @SerializedName("schedule_start") val scheduleStart: String? = null,  // "HH:MM" o null = todo el día
+    @SerializedName("schedule_end")   val scheduleEnd: String? = null,
 )
 
 data class PreferenceMutationPayload(val id: Int)
@@ -208,6 +212,29 @@ data class RecordingListResponse(
 data class RecordingDetailResponse(
     val success: Boolean,
     val data: RecordingResponse
+)
+
+// ── Timeline de grabaciones ────────────────────────────────────────────────────
+
+data class TimelineSegment(
+    @SerializedName("recording_id")    val recordingId: Int,
+    val start: String? = null,
+    val end: String? = null,
+    @SerializedName("duration_seconds") val durationSeconds: Int = 0,
+    @SerializedName("file_size_mb")     val fileSizeMb: Double = 0.0,
+    val type: String = "continuous",   // "event" | "continuous"
+)
+
+data class TimelineData(
+    val date: String,
+    @SerializedName("camera_id") val cameraId: Int,
+    val segments: List<TimelineSegment> = emptyList(),
+)
+
+data class TimelineResponse(
+    val success: Boolean,
+    val data: TimelineData? = null,
+    val error: String? = null,
 )
 
 // ── Grabaciones ───────────────────────────────────────────────────────────────

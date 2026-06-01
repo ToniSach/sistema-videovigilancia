@@ -122,6 +122,19 @@ class CameraService:
                     data.setdefault('resolution_width', device_info.get('resolution_width', 1920))
                     data.setdefault('resolution_height', device_info.get('resolution_height', 1080))
                     data.setdefault('fps', device_info.get('fps', 15))
+                    # Auto-sugerir dual-lens por resolución/modelo (el cliente
+                    # puede sobreescribirlo). El ONVIF no expone "dual-lens", así
+                    # que lo inferimos.
+                    try:
+                        from backend.app.cameras.camera_heuristics import suggest_dual_lens
+                        data.setdefault('is_dual_lens', suggest_dual_lens(
+                            device_info.get('resolution_width', 0),
+                            device_info.get('resolution_height', 0),
+                            device_info.get('model', ''),
+                            data.get('name', ''),
+                        ))
+                    except Exception:
+                        pass
                 elif not has_rtsp:
                     # Sin rtsp_url y sin probe exitoso: no sabemos a qué apuntar.
                     raise ValueError(
@@ -178,6 +191,19 @@ class CameraService:
         # Iniciar si está activa
         if created_camera.is_active:
             self._camera_manager.start_camera(created_camera)  # register_mjpeg=True por defecto
+        else:
+            # Alta inactiva: aun así intentamos poner la hora correcta en la
+            # cámara (best-effort, en segundo plano). Si está activa, esto ya
+            # lo hace start_camera → _maybe_sync_time.
+            try:
+                import threading
+                from backend.app.cameras.time_sync import sync_camera_time
+                threading.Thread(
+                    target=lambda: sync_camera_time(created_camera),
+                    name=f"AddTimeSync-{created_camera.id}", daemon=True,
+                ).start()
+            except Exception:
+                pass
 
         result = created_camera.to_dict() if hasattr(created_camera, 'to_dict') else self._camera_to_dict(created_camera)
         result["worker_status"] = None

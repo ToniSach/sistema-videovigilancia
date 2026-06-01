@@ -71,6 +71,14 @@ class MetricsCollector:
         self._camera_metrics: Dict[int, CameraMetrics] = defaultdict(CameraMetrics)
         self._system_metrics = SystemMetrics()
         self._lock = threading.RLock()
+
+        # Disco a medir: el de la carpeta de GRABACIONES (no la raíz "/", que en
+        # Windows ni siquiera es válida y mide una unidad distinta a la del disco
+        # donde se guardan los vídeos → disk_percent engañoso). Se resuelve a una
+        # ruta absoluta existente; si falla, cae a la unidad del proceso.
+        self._disk_path = self._resolve_disk_path()
+        # Momento de arranque para calcular uptime del servicio.
+        self._start_time = time.time()
         
         # Thread de actualización de métricas de sistema (no bloqueante)
         self._running = True
@@ -130,13 +138,29 @@ class MetricsCollector:
                 timestamp=self._system_metrics.timestamp
             )
     
+    def _resolve_disk_path(self) -> str:
+        """Ruta cuyo disco se mide para disk_percent: el de las grabaciones."""
+        import os
+        try:
+            from backend.app.config import settings
+            p = os.path.abspath(getattr(settings, "RECORDINGS_PATH", ".") or ".")
+            # Subir hasta un directorio existente (la carpeta puede no existir aún).
+            while p and not os.path.exists(p):
+                parent = os.path.dirname(p)
+                if parent == p:
+                    break
+                p = parent
+            return p if p and os.path.exists(p) else os.path.abspath(os.sep)
+        except Exception:
+            return os.path.abspath(os.sep)
+
     def _update_system_metrics(self):
         """Loop background que actualiza métricas de sistema cada 2 segundos."""
         while self._running:
             try:
                 cpu = psutil.cpu_percent(interval=None)
                 memory = psutil.virtual_memory().percent
-                disk = psutil.disk_usage('/').percent
+                disk = psutil.disk_usage(self._disk_path).percent
                 
                 with self._lock:
                     self._system_metrics.cpu_percent = cpu
@@ -164,17 +188,20 @@ class MetricsCollector:
                 'status': 'healthy' if time_since < 5 else 'stalled',
                 'last_frame_seconds_ago': round(time_since, 1),
                 'fps': round(metrics.fps, 1),
-                'total_frames': metrics.frame_count
+                'total_frames': metrics.frame_count,
+                # Datos procesados (MB) — más legible que "total frames" en la UI.
+                'data_mb': round(metrics.bytes_processed / (1024 * 1024), 1),
             })
         
         sys_metrics = self.get_system_metrics()
-        
+
         return {
             "cameras": cameras,
             "system": {
                 "cpu_percent": sys_metrics.cpu_percent,
                 "memory_percent": sys_metrics.memory_percent,
                 "disk_percent": sys_metrics.disk_percent,
+                "uptime_seconds": round(now - self._start_time),
                 "last_updated": sys_metrics.timestamp
             }
         }

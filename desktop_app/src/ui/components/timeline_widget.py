@@ -34,6 +34,8 @@ class TimelineWidget(QWidget):
         self.segments: List[RecordingSegment] = []
         self.current_time: int = 0  # segundos desde medianoche (0-86399)
         self.duration: int = 86400  # 24 horas en segundos
+        # Marcas de evento: lista de (segundos_desde_medianoche, tipo_evento).
+        self.event_markers: List[tuple] = []
         
         # Visualización
         self.pixels_per_second: float = self.width() / self.duration
@@ -70,6 +72,11 @@ class TimelineWidget(QWidget):
         self.current_time = max(0, min(seconds, self.duration))
         self.update()
         self.position_changed.emit(self.current_time)
+
+    def set_event_markers(self, markers: List[tuple]):
+        """Marcas de eventos: lista de (segundos_desde_medianoche, tipo)."""
+        self.event_markers = markers or []
+        self.update()
     
     def paintEvent(self, event: QPaintEvent):
         """Renderiza el timeline."""
@@ -89,11 +96,39 @@ class TimelineWidget(QWidget):
         
         # Dibujar segmentos
         self._draw_segments(painter, height)
-        
+
+        # Dibujar marcas de evento (puntos de color arriba)
+        self._draw_event_markers(painter, height)
+
         # Dibujar línea de tiempo actual
         self._draw_current_line(painter, width, height)
-        
+
         painter.end()
+
+    # Colores por tipo de evento (coherente con events_view).
+    _EVENT_COLORS = {
+        "person": QColor("#ef4444"),
+        "vehicle": QColor("#f59e0b"),
+        "motion": QColor("#38bdf8"),
+        "camera_offline": QColor("#fb7185"),
+        "tampering": QColor("#ef4444"),
+    }
+
+    def _draw_event_markers(self, painter: QPainter, height: int):
+        """Dibuja un triangulito de color por cada evento, sobre la barra."""
+        if not self.event_markers:
+            return
+        for secs, etype in self.event_markers:
+            x = int(secs * self.pixels_per_second)
+            color = self._EVENT_COLORS.get(etype, QColor(config.THEME_ACCENT))
+            painter.setBrush(color)
+            painter.setPen(QPen(color.darker(140), 1))
+            # Triángulo apuntando hacia abajo, cerca del borde superior.
+            from PySide6.QtGui import QPolygon
+            tri = QPolygon([
+                QPoint(x - 4, 14), QPoint(x + 4, 14), QPoint(x, 22),
+            ])
+            painter.drawPolygon(tri)
     
     def _draw_grid(self, painter: QPainter, width: int, height: int):
         """Dibuja líneas de hora."""

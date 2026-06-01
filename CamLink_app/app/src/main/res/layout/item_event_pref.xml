@@ -65,6 +65,85 @@
                 android:textColor="@color/text_primary"
                 android:textSize="13sp" />
         </LinearLayout>
+
+        <!-- Días de la semana (toggle por chip). Lun..Dom = 1..6,0 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="@string/pref_days_label"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <com.google.android.material.chip.ChipGroup
+            android:id="@+id/daysGroup"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            app:singleLine="false"
+            app:chipSpacingHorizontal="4dp">
+
+            <com.google.android.material.chip.Chip android:id="@+id/chipMon" style="@style/Widget.MaterialComponents.Chip.Filter" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="L" android:checkable="true" />
+            <com.google.android.material.chip.Chip android:id="@+id/chipTue" style="@style/Widget.MaterialComponents.Chip.Filter" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="M" android:checkable="true" />
+            <com.google.android.material.chip.Chip android:id="@+id/chipWed" style="@style/Widget.MaterialComponents.Chip.Filter" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="X" android:checkable="true" />
+            <com.google.android.material.chip.Chip android:id="@+id/chipThu" style="@style/Widget.MaterialComponents.Chip.Filter" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="J" android:checkable="true" />
+            <com.google.android.material.chip.Chip android:id="@+id/chipFri" style="@style/Widget.MaterialComponents.Chip.Filter" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="V" android:checkable="true" />
+            <com.google.android.material.chip.Chip android:id="@+id/chipSat" style="@style/Widget.MaterialComponents.Chip.Filter" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="S" android:checkable="true" />
+            <com.google.android.material.chip.Chip android:id="@+id/chipSun" style="@style/Widget.MaterialComponents.Chip.Filter" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="D" android:checkable="true" />
+        </com.google.android.material.chip.ChipGroup>
+
+        <!-- Horario (opcional). Si está desmarcado = todo el día. -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <CheckBox
+                android:id="@+id/cbSchedule"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:buttonTint="@color/accent_cyan"
+                android:text="@string/pref_schedule_label"
+                android:textColor="@color/text_primary"
+                android:textSize="13sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnTimeStart"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:minWidth="0dp"
+                android:paddingStart="10dp"
+                android:paddingEnd="10dp"
+                android:text="00:00"
+                android:textColor="@color/text_primary"
+                android:textSize="12sp"
+                android:enabled="false" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_marginEnd="4dp"
+                android:text="–"
+                android:textColor="@color/text_secondary" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnTimeEnd"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:paddingStart="10dp"
+                android:paddingEnd="10dp"
+                android:text="23:59"
+                android:textColor="@color/text_primary"
+                android:textSize="12sp"
+                android:enabled="false" />
+        </LinearLayout>
     </LinearLayout>
 
 </com.google.android.material.card.MaterialCardView>

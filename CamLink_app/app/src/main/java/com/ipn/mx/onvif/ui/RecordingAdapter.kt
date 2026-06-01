@@ -9,6 +9,8 @@ import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import com.ipn.mx.onvif.R
 import com.ipn.mx.onvif.model.RecordingResponse
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 class RecordingAdapter(
     private val items: MutableList<RecordingResponse> = mutableListOf(),
@@ -18,6 +20,7 @@ class RecordingAdapter(
 
     inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val tvName:     TextView    = view.findViewById(R.id.tvRecordingName)
+        val tvSub:      TextView    = view.findViewById(R.id.tvRecordingSub)
         val btnPlay:    ImageButton = view.findViewById(R.id.btnPlay)
         val btnFav:     ImageButton = view.findViewById(R.id.btnFavorite)
         val ivAlert:    ImageView   = view.findViewById(R.id.ivAlert)
@@ -34,19 +37,39 @@ class RecordingAdapter(
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val rec = items[position]
 
-        // Nombre: usar filename si no hay otro campo descriptivo
-        holder.tvName.text = rec.filename
+        // Título: fecha/hora legible (si no hay, el nombre de archivo).
+        holder.tvName.text = formatDateTime(rec.startedAt) ?: rec.filename ?: "Grabación"
+        // Subtítulo: duración + cámara.
+        holder.tvSub.text = "${formatDuration(rec.durationSeconds)} · Cámara ${rec.cameraId}"
 
-        // Alerta visible solo si la grabación fue marcada como evento
         holder.ivAlert.visibility = if (rec.hasAlert) View.VISIBLE else View.GONE
-
-        // Ícono de favorito
         holder.btnFav.setImageResource(
             if (rec.isFavorite) R.drawable.ic_star_active else R.drawable.ic_star_inactive
         )
 
+        // Tocar la tarjeta o el botón reproduce; la estrella marca favorito.
+        holder.itemView.setOnClickListener { onPlay(rec) }
         holder.btnPlay.setOnClickListener { onPlay(rec) }
         holder.btnFav.setOnClickListener  { onFavorite(rec) }
+    }
+
+    private fun formatDateTime(iso: String?): String? {
+        if (iso.isNullOrBlank()) return null
+        return try {
+            val clean = iso.substringBefore('.')  // sin microsegundos
+            val parsed = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).parse(clean)
+            if (parsed != null)
+                SimpleDateFormat("dd MMM yyyy · HH:mm", Locale("es")).format(parsed)
+            else iso
+        } catch (e: Exception) {
+            iso
+        }
+    }
+
+    private fun formatDuration(seconds: Int): String {
+        val m = seconds / 60
+        val s = seconds % 60
+        return "%d:%02d".format(m, s)
     }
 
     /** Reemplaza toda la lista y notifica al RecyclerView. */

@@ -103,6 +103,28 @@
             app:popExitAnim="@anim/slide_out_right" />
     </fragment>
 
+    <!-- Timeline de grabaciones (cámara + fecha → segmentos). Es la pestaña
+         "Grabaciones" de la barra inferior. Acepta cameraId/date para abrir
+         directamente desde una notificación. -->
+    <fragment
+        android:id="@+id/timelineFragment"
+        android:name="com.ipn.mx.onvif.ui.TimelineFragment"
+        android:label="Grabaciones"
+        tools:layout="@layout/fragment_timeline">
+        <argument
+            android:name="cameraId"
+            app:argType="integer"
+            android:defaultValue="-1" />
+        <argument
+            android:name="date"
+            app:argType="string"
+            app:nullable="true"
+            android:defaultValue="@null" />
+        <action
+            android:id="@+id/action_timeline_to_playback"
+            app:destination="@id/playbackFragment" />
+    </fragment>
+
     <fragment
         android:id="@+id/playbackFragment"
         android:name="com.ipn.mx.onvif.ui.PlaybackFragment"

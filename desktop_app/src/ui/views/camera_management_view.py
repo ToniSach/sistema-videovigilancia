@@ -87,29 +87,51 @@ class CameraEditDialog(QDialog):
         self.txt_ip.setPlaceholderText("192.168.1.100")
         form_layout.addRow("Dirección IP:", self.txt_ip)
         
-        # RTSP URL
-        self.txt_rtsp = QLineEdit()
-        self.txt_rtsp.setPlaceholderText("rtsp://admin:pass@192.168.1.100:554/stream1")
-        form_layout.addRow("URL RTSP:", self.txt_rtsp)
-        
-        # ONVIF URL (opcional)
-        self.txt_onvif = QLineEdit()
-        self.txt_onvif.setPlaceholderText("http://192.168.1.100/onvif/device_service (opcional)")
-        form_layout.addRow("URL ONVIF:", self.txt_onvif)
-        
-        # Credenciales
-        cred_group = QGroupBox("Credenciales ONVIF")
+        # Credenciales de la cámara (usuario/contraseña). Visibles porque son
+        # lo único que el usuario normalmente necesita escribir.
+        cred_group = QGroupBox("Credenciales de la cámara")
         cred_layout = QFormLayout(cred_group)
-        
+
         self.txt_username = QLineEdit()
         self.txt_username.setPlaceholderText("admin")
         cred_layout.addRow("Usuario:", self.txt_username)
-        
+
         self.txt_password = QLineEdit()
         self.txt_password.setEchoMode(QLineEdit.Password)
         cred_layout.addRow("Contraseña:", self.txt_password)
-        
         form_layout.addRow(cred_group)
+
+        # ── AVANZADO (colapsable, oculto por defecto) ───────────────────────
+        # Las URLs RTSP/ONVIF se autocompletan con la IP; el usuario rara vez
+        # las toca. Un QGroupBox checkable funciona como sección plegable.
+        adv_group = QGroupBox("Avanzado (URLs de conexión)")
+        adv_group.setCheckable(True)
+        adv_group.setChecked(False)
+        adv_layout = QFormLayout(adv_group)
+
+        self.txt_rtsp = QLineEdit()
+        self.txt_rtsp.setPlaceholderText("Se completa automáticamente con la IP")
+        adv_layout.addRow("URL RTSP:", self.txt_rtsp)
+
+        self.txt_onvif = QLineEdit()
+        self.txt_onvif.setPlaceholderText("Se completa automáticamente (opcional)")
+        adv_layout.addRow("URL ONVIF:", self.txt_onvif)
+
+        # Colapsar/expandir: ocultar los hijos cuando no está marcado.
+        def _toggle_adv(on):
+            for w in (self.txt_rtsp, self.txt_onvif):
+                w.setVisible(on)
+            for lbl in adv_group.findChildren(QLabel):
+                lbl.setVisible(on)
+        adv_group.toggled.connect(_toggle_adv)
+        _toggle_adv(False)
+        form_layout.addRow(adv_group)
+
+        # Autocompletar RTSP/ONVIF al escribir la IP o las credenciales.
+        # Solo rellena si el campo está vacío o sigue siendo el autogenerado.
+        self.txt_ip.editingFinished.connect(self._autocomplete_urls)
+        self.txt_username.editingFinished.connect(self._autocomplete_urls)
+        self.txt_password.editingFinished.connect(self._autocomplete_urls)
         
         # Capacidades
         capabilities_group = QGroupBox("Capacidades de la Cámara")
@@ -127,37 +149,55 @@ class CameraEditDialog(QDialog):
         
         form_layout.addRow(capabilities_group)
         
-        # Resolución y FPS
-        res_group = QGroupBox("Configuración de Video")
+        # Resolución y FPS — AVANZADO/colapsable: se detectan automáticamente
+        # al descubrir/probar la cámara, así que normalmente no hace falta tocarlo.
+        res_group = QGroupBox("Resolución y FPS (avanzado)")
+        res_group.setCheckable(True)
+        res_group.setChecked(False)
         res_layout = QFormLayout(res_group)
-        
+
         self.spin_width = QSpinBox()
         self.spin_width.setRange(640, 3840)
         self.spin_width.setValue(1920)
         res_layout.addRow("Ancho (px):", self.spin_width)
-        
+
         self.spin_height = QSpinBox()
         self.spin_height.setRange(480, 2160)
         self.spin_height.setValue(1080)
         res_layout.addRow("Alto (px):", self.spin_height)
-        
+
         self.spin_fps = QSpinBox()
         self.spin_fps.setRange(1, 60)
         self.spin_fps.setValue(15)
         res_layout.addRow("FPS:", self.spin_fps)
-        
+
+        def _toggle_res(on):
+            for w in (self.spin_width, self.spin_height, self.spin_fps):
+                w.setVisible(on)
+            for lbl in res_group.findChildren(QLabel):
+                lbl.setVisible(on)
+        res_group.toggled.connect(_toggle_res)
+        _toggle_res(False)
         form_layout.addRow(res_group)
         
         # Configuración IA
         ai_group = QGroupBox("Inteligencia Artificial")
         ai_layout = QVBoxLayout(ai_group)
         
-        self.chk_ai = QCheckBox("Habilitar Detección IA (YOLO)")
+        self.chk_ai = QCheckBox("Habilitar detección de objetos")
         self.chk_ai.stateChanged.connect(self._on_ai_changed)
         ai_layout.addWidget(self.chk_ai)
-        
+
+        # Nota: solo UNA cámara puede tener la detección activa a la vez.
+        ai_note = QLabel(
+            "Solo una cámara puede tener la detección activa al mismo tiempo."
+        )
+        ai_note.setWordWrap(True)
+        ai_note.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 10px;")
+        ai_layout.addWidget(ai_note)
+
         self.cmb_ai_mode = QComboBox()
-        self.cmb_ai_mode.addItems(["Bajo consumo CPU", "Alta calidad"])
+        self.cmb_ai_mode.addItems(["Bajo consumo (rápido)", "Alta precisión"])
         self.cmb_ai_mode.setEnabled(False)
         ai_layout.addWidget(QLabel("Modo:"))
         ai_layout.addWidget(self.cmb_ai_mode)
@@ -179,17 +219,70 @@ class CameraEditDialog(QDialog):
         
         # Botones (fuera del scroll, siempre visibles)
         btn_layout = QHBoxLayout()
+
+        # Probar conexión antes de guardar (verifica IP/credenciales por ONVIF).
+        self.btn_test = QPushButton("  Probar conexión")
+        try:
+            self.btn_test.setIcon(icon("search"))
+        except Exception:
+            pass
+        self.btn_test.clicked.connect(self._test_connection)
+        btn_layout.addWidget(self.btn_test)
+
+        self.lbl_test_result = QLabel("")
+        self.lbl_test_result.setStyleSheet("font-size: 11px;")
+        btn_layout.addWidget(self.lbl_test_result)
+
         btn_layout.addStretch()
-        
+
         self.btn_cancel = QPushButton("Cancelar")
         self.btn_cancel.clicked.connect(self.reject)
         btn_layout.addWidget(self.btn_cancel)
-        
+
         self.btn_save = QPushButton("Guardar")
         self.btn_save.clicked.connect(self._validate_and_accept)
         btn_layout.addWidget(self.btn_save)
-        
+
         layout.addLayout(btn_layout)
+
+    def _test_connection(self):
+        """Llama a POST /cameras/test-connection con la IP/credenciales del form."""
+        ip = self.txt_ip.text().strip()
+        if not ip:
+            self.lbl_test_result.setText("Escribe una IP primero")
+            self.lbl_test_result.setStyleSheet("color: #f59e0b; font-size: 11px;")
+            return
+        self.btn_test.setEnabled(False)
+        self.lbl_test_result.setText("Probando…")
+        self.lbl_test_result.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 11px;")
+        payload = {
+            "ip_address": ip,
+            "username": self.txt_username.text().strip() or None,
+            "password": self.txt_password.text() or None,
+        }
+
+        def on_result(response):
+            self.btn_test.setEnabled(True)
+            if not response.success:
+                self.lbl_test_result.setText(f"Error: {response.error or 'sin respuesta'}")
+                self.lbl_test_result.setStyleSheet("color: #ef4444; font-size: 11px;")
+                return
+            d = response.data or {}
+            if d.get("reachable"):
+                self.lbl_test_result.setText(
+                    f"✓ {d.get('manufacturer','?')} {d.get('model','')} · {d.get('resolution','')}"
+                )
+                self.lbl_test_result.setStyleSheet("color: #22c55e; font-size: 11px;")
+                # Autocompletar capacidades detectadas (sin pisar lo marcado).
+                if d.get("has_ptz"):
+                    self.chk_ptz.setChecked(True)
+                if d.get("has_audio"):
+                    self.chk_audio.setChecked(True)
+            else:
+                self.lbl_test_result.setText("✗ No responde (revisa IP/credenciales)")
+                self.lbl_test_result.setStyleSheet("color: #ef4444; font-size: 11px;")
+
+        api_client.post("cameras/test-connection", on_result, data=payload)
     
     def _apply_styles(self):
         self.setStyleSheet(f"""
@@ -286,6 +379,29 @@ class CameraEditDialog(QDialog):
         
         self.chk_ai.setChecked(getattr(self.camera, 'has_ai', False))
     
+    def _autocomplete_urls(self):
+        """Rellena RTSP/ONVIF a partir de la IP (formato XiongMai/iCSee).
+
+        Solo escribe si el campo está vacío o aún contiene el valor
+        autogenerado, para no pisar una URL editada a mano por el usuario.
+        """
+        ip = self.txt_ip.text().strip()
+        if not ip:
+            return
+        user = self.txt_username.text().strip()
+        pwd = self.txt_password.text()
+        cred = ""
+        if user:
+            cred = f"{user}:{pwd}@" if pwd else f"{user}@"
+        auto_rtsp = f"rtsp://{cred}{ip}:554/cam/realmonitor?channel=1&subtype=0"
+        auto_onvif = f"http://{ip}:8899/onvif/device_service"
+        cur_rtsp = self.txt_rtsp.text().strip()
+        if not cur_rtsp or "/cam/realmonitor" in cur_rtsp:
+            self.txt_rtsp.setText(auto_rtsp)
+        cur_onvif = self.txt_onvif.text().strip()
+        if not cur_onvif or "/onvif/device_service" in cur_onvif:
+            self.txt_onvif.setText(auto_onvif)
+
     def _validate_and_accept(self):
         if not self.txt_name.text().strip():
             QMessageBox.warning(self, "Validación", "El nombre es requerido")
@@ -607,13 +723,31 @@ class CameraManagementView(QWidget):
                 # from_dict tolera campos extra del backend (connection_type, etc.)
                 camera = Camera.from_dict(cam_data)
                 self.cameras.append(camera)
-                item = QListWidgetItem(f"{camera.name}\n{camera.ip_address}")
+                # Semáforo de estado: 🟢 OK / 🟡 reconectando / 🔴 caída/inactiva.
+                dot, _ = self._status_semaphore(cam_data, camera)
+                item = QListWidgetItem(f"{dot}  {camera.name}\n      {camera.ip_address}")
                 item.setData(Qt.UserRole, camera.id)
                 if not camera.is_active:
                     item.setForeground(Qt.gray)
                 self.list_cameras.addItem(item)
 
         api_client.get("cameras/", on_response)
+
+    def _status_semaphore(self, cam_data: dict, camera) -> tuple:
+        """Devuelve (emoji_dot, texto) según el estado del worker de la cámara."""
+        if not getattr(camera, "is_active", True):
+            return "🔴", "Inactiva"
+        ws = cam_data.get("worker_status") or {}
+        status = (ws.get("status") if isinstance(ws, dict) else None) or ""
+        status = str(status).lower()
+        if status in ("running", "healthy", "ok"):
+            return "🟢", "En línea"
+        if status in ("reconnecting", "starting", "connecting"):
+            return "🟡", "Reconectando"
+        if status in ("error", "stalled", "frozen", "offline"):
+            return "🔴", "Sin conexión"
+        # Activa pero sin estado de worker conocido → asumimos OK suave.
+        return "🟢", "Activa"
     
     def _on_camera_selected(self, current, previous):
         if not current:
@@ -642,8 +776,14 @@ class CameraManagementView(QWidget):
             self.lbl_info_name.setText(camera.name)
             self.lbl_info_ip.setText(camera.ip_address)
             
-            status = "Activa" if getattr(camera, 'is_active', True) else "Inactiva"
-            self.lbl_info_status.setText(status)
+            # Estado con semáforo de color + tooltip del último error si lo hay.
+            ws = getattr(camera, "worker_status", None) or {}
+            dot, txt = self._status_semaphore({"worker_status": ws}, camera)
+            color = {"🟢": "#22c55e", "🟡": "#f59e0b", "🔴": "#ef4444"}.get(dot, "#94a3b8")
+            self.lbl_info_status.setText(f"{dot} {txt}")
+            self.lbl_info_status.setStyleSheet(f"color: {color}; font-weight: bold;")
+            err = getattr(camera, "last_error_code", None)
+            self.lbl_info_status.setToolTip(f"Último error: {err}" if err else "")
             
             caps = []
             if getattr(camera, 'has_ptz', False):

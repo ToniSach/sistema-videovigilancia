@@ -128,13 +128,24 @@ class SystemHealthView(QWidget):
         header.addWidget(self.lbl_last_update)
         layout.addLayout(header)
 
-        # Stat cards (CPU, RAM, Disco, Cámaras activas)
+        # Banner de SALUD GENERAL: un score 0-100 con color que resume el estado.
+        self.lbl_health = QLabel("Calculando estado del sistema…")
+        self.lbl_health.setStyleSheet(
+            "background:#1e293b; color:#94a3b8; padding:10px 14px; "
+            "border-radius:8px; font-size:13px; font-weight:bold;"
+        )
+        self.lbl_health.setWordWrap(True)
+        layout.addWidget(self.lbl_health)
+
+        # Stat cards (CPU, RAM, Disco, Cámaras activas, Tiempo activo)
         stats_row = QHBoxLayout()
         self.card_cpu = StatCard("CPU del servidor")
         self.card_ram = StatCard("Memoria RAM")
         self.card_disk = StatCard("Almacenamiento")
         self.card_cams = StatCard("Cámaras activas")
-        for c in (self.card_cpu, self.card_ram, self.card_disk, self.card_cams):
+        self.card_uptime = StatCard("Tiempo activo")
+        for c in (self.card_cpu, self.card_ram, self.card_disk,
+                  self.card_cams, self.card_uptime):
             stats_row.addWidget(c)
         layout.addLayout(stats_row)
 
@@ -160,6 +171,34 @@ class SystemHealthView(QWidget):
         hw_layout.addWidget(self.lbl_os_info, 1, 3)
         layout.addWidget(hw_box)
 
+        # Tendencia (sparklines CPU/RAM de los últimos ~minutos)
+        trend_box = GlassCard()
+        trend_layout = QHBoxLayout(trend_box)
+        trend_layout.setContentsMargins(16, 12, 16, 12)
+        trend_layout.setSpacing(20)
+        from desktop_app.src.ui.components.sparkline import Sparkline
+
+        def _trend_col(title: str, color: str):
+            col = QVBoxLayout()
+            head = QHBoxLayout()
+            t = QLabel(title)
+            t.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 12px; font-weight: bold;")
+            head.addWidget(t)
+            head.addStretch()
+            val = QLabel("—")
+            val.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold;")
+            head.addWidget(val)
+            col.addLayout(head)
+            spark = Sparkline(capacity=60, color=color)
+            col.addWidget(spark)
+            return col, spark, val
+
+        col_cpu, self.spark_cpu, self.lbl_spark_cpu = _trend_col("CPU", config.THEME_ACCENT)
+        col_ram, self.spark_ram, self.lbl_spark_ram = _trend_col("Memoria RAM", "#a78bfa")
+        trend_layout.addLayout(col_cpu, 1)
+        trend_layout.addLayout(col_ram, 1)
+        layout.addWidget(trend_box)
+
         # Tabla de cámaras
         cams_box = GlassCard()
         cams_layout = QVBoxLayout(cams_box)
@@ -172,7 +211,7 @@ class SystemHealthView(QWidget):
 
         self.table_cams = QTableWidget(0, 5)
         self.table_cams.setHorizontalHeaderLabels([
-            "ID", "Estado", "FPS", "Último frame", "Total frames"
+            "ID", "Estado", "FPS", "Último frame", "Datos procesados"
         ])
         self.table_cams.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         from desktop_app.src.ui.views.users_view import _TABLE_STYLE
@@ -236,6 +275,12 @@ class SystemHealthView(QWidget):
             color=("#ef4444" if mem_pct > 85 else config.THEME_ACCENT),
         )
 
+        # Tendencia (sparklines)
+        self.spark_cpu.add_value(cpu_pct)
+        self.spark_ram.add_value(mem_pct)
+        self.lbl_spark_cpu.setText(f"{cpu_pct:.0f}%")
+        self.lbl_spark_ram.setText(f"{mem_pct:.0f}%")
+
         # Disco
         disk_pct = sys_info.get("disk_percent", 0)
         self.card_disk.update_value(
@@ -251,6 +296,57 @@ class SystemHealthView(QWidget):
             f"{healthy}/{total}",
             subtitle=f"{total - healthy} inactivas" if total > healthy else "Todas OK",
         )
+
+        # Tiempo activo (uptime del servicio)
+        up = int(sys_info.get("uptime_seconds", 0) or 0)
+        self.card_uptime.update_value(self._format_uptime(up), subtitle="desde el arranque")
+
+        # Score de salud general (0-100): penaliza CPU/RAM/disco altos y cámaras caídas.
+        self._update_health_score(cpu_pct, mem_pct, disk_pct, healthy, total)
+
+    def _update_health_score(self, cpu, ram, disk, healthy, total):
+        score = 100
+        # Penalizaciones por recursos (solo si superan umbrales razonables).
+        if cpu > 70:  score -= min(25, (cpu - 70) * 0.8)
+        if ram > 70:  score -= min(25, (ram - 70) * 0.8)
+        if disk > 80: score -= min(30, (disk - 80) * 1.5)
+        # Penalización fuerte por cámaras caídas.
+        if total > 0:
+            down = total - healthy
+            score -= down * (40 / total)
+        score = max(0, int(round(score)))
+
+        if score >= 85:
+            estado, bg, fg = "Excelente", "#0a3622", "#22c55e"
+        elif score >= 60:
+            estado, bg, fg = "Aceptable", "#3a2a0a", "#f59e0b"
+        else:
+            estado, bg, fg = "Requiere atención", "#3a0a0a", "#ef4444"
+
+        partes = [f"Salud del sistema: {score}/100 · {estado}"]
+        # Avisos accionables.
+        if disk > 85:
+            partes.append(f"⚠ Disco al {disk:.0f}% — libera espacio o baja el límite de grabación.")
+        if total > 0 and healthy < total:
+            partes.append(f"⚠ {total - healthy} cámara(s) sin señal.")
+        if cpu > 90:
+            partes.append("⚠ CPU muy alta.")
+        self.lbl_health.setText("   ".join(partes))
+        self.lbl_health.setStyleSheet(
+            f"background:{bg}; color:{fg}; padding:10px 14px; "
+            f"border-radius:8px; font-size:13px; font-weight:bold;"
+        )
+
+    @staticmethod
+    def _format_uptime(seconds: int) -> str:
+        d, rem = divmod(seconds, 86400)
+        h, rem = divmod(rem, 3600)
+        m, _ = divmod(rem, 60)
+        if d > 0:
+            return f"{d}d {h}h"
+        if h > 0:
+            return f"{h}h {m}m"
+        return f"{m}m"
 
     def _update_cameras(self, cameras: List[dict]):
         self.table_cams.setRowCount(0)
@@ -272,7 +368,11 @@ class SystemHealthView(QWidget):
             self.table_cams.setItem(r, 2, QTableWidgetItem(f"{c.get('fps', 0):.1f}"))
             secs_ago = c.get("last_frame_seconds_ago", 0)
             self.table_cams.setItem(r, 3, QTableWidgetItem(f"hace {secs_ago:.0f}s"))
-            self.table_cams.setItem(r, 4, QTableWidgetItem(str(c.get("total_frames", 0))))
+            data_mb = c.get("data_mb")
+            if data_mb is None:
+                data_mb = round(c.get("total_frames", 0) * 0, 1)
+            mb_txt = f"{data_mb/1024:.1f} GB" if data_mb >= 1024 else f"{data_mb:.0f} MB"
+            self.table_cams.setItem(r, 4, QTableWidgetItem(mb_txt))
 
     def showEvent(self, event):
         if not self._timer.isActive():

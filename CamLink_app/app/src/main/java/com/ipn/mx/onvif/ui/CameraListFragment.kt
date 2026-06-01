@@ -33,10 +33,35 @@ import kotlinx.coroutines.launch
 class CameraListFragment : BaseMenuFragment() {
 
     // ── Estado ────────────────────────────────────────────────────────────────
-    private var cameras: List<CameraResponse> = emptyList()
-    private var pageIndex = 0                          // página actual (2 cámaras por página)
+    // Cada "tile" es un panel del grid. Una cámara dual-lens produce DOS tiles
+    // (L1 y L2) → se ven ambos lentes a la vez como si fueran cámaras
+    // independientes. Una cámara mono produce un solo tile.
+    private data class Tile(
+        val camera: CameraResponse,
+        val lens: String?,        // null | "l1" | "l2"
+        val url: String,          // HLS preferido
+        val fallbackUrl: String?, // RTSP de respaldo
+        val label: String,
+    )
+    private var tiles: List<Tile> = emptyList()
+    private var pageIndex = 0                          // página actual (2 tiles por página)
     private val pageSize  = 2
     private val players = arrayOfNulls<ExoPlayer>(2)   // un ExoPlayer por slot
+
+    private fun buildTiles(cams: List<CameraResponse>): List<Tile> {
+        val out = mutableListOf<Tile>()
+        for (c in cams) {
+            if (c.isDualLens && !c.streamUrlL1.isNullOrBlank() && !c.streamUrlL2.isNullOrBlank()) {
+                out.add(Tile(c, "l1", c.hlsUrlL1?.takeIf { it.isNotBlank() } ?: c.streamUrlL1!!,
+                             c.streamUrlL1, "${c.name} · L1"))
+                out.add(Tile(c, "l2", c.hlsUrlL2?.takeIf { it.isNotBlank() } ?: c.streamUrlL2!!,
+                             c.streamUrlL2, "${c.name} · L2"))
+            } else {
+                out.add(Tile(c, null, c.liveHlsUrl ?: c.liveUrl, c.liveUrl, c.name))
+            }
+        }
+        return out
+    }
 
     // ── Vistas ────────────────────────────────────────────────────────────────
     private lateinit var feedCam1:      FrameLayout
@@ -91,7 +116,7 @@ class CameraListFragment : BaseMenuFragment() {
             if (pageIndex > 0) { pageIndex--; renderPage() }
         }
         btnNextPage.setOnClickListener {
-            val totalPages = ((cameras.size - 1) / pageSize) + 1
+            val totalPages = ((tiles.size - 1) / pageSize) + 1
             if (pageIndex < totalPages - 1) { pageIndex++; renderPage() }
         }
 
@@ -114,7 +139,7 @@ class CameraListFragment : BaseMenuFragment() {
 
     override fun onResume() {
         super.onResume()
-        if (cameras.isNotEmpty()) renderPage()
+        if (tiles.isNotEmpty()) renderPage()
     }
 
     override fun onDestroyView() {
@@ -132,8 +157,9 @@ class CameraListFragment : BaseMenuFragment() {
             try {
                 val response = api.getCameras()
                 if (response.isSuccessful) {
-                    cameras = response.body()?.data ?: emptyList()
-                    if (cameras.isNotEmpty()) {
+                    val cams = response.body()?.data ?: emptyList()
+                    tiles = buildTiles(cams)
+                    if (tiles.isNotEmpty()) {
                         pageIndex = 0
                         renderPage()
                     } else {
@@ -158,26 +184,26 @@ class CameraListFragment : BaseMenuFragment() {
     private fun renderPage() {
         stopAllStreams()
 
-        val totalPages = ((cameras.size - 1) / pageSize) + 1
+        val totalPages = ((tiles.size - 1) / pageSize) + 1
         tvPageInfo.text = getString(R.string.page_format, pageIndex + 1, totalPages)
         btnPrevPage.isEnabled = pageIndex > 0
         btnNextPage.isEnabled = pageIndex < totalPages - 1
 
-        val cam1 = cameras.getOrNull(pageIndex * pageSize)
-        val cam2 = cameras.getOrNull(pageIndex * pageSize + 1)
+        val tile1 = tiles.getOrNull(pageIndex * pageSize)
+        val tile2 = tiles.getOrNull(pageIndex * pageSize + 1)
 
-        if (cam1 != null) {
+        if (tile1 != null) {
             feedCam1.visibility = View.VISIBLE
-            tvCamName1.text = cam1.name
-            startRtspStream(cam1, slot = 0, playerView = playerView1)
+            tvCamName1.text = tile1.label
+            startRtspStream(tile1, slot = 0, playerView = playerView1)
         } else {
             feedCam1.visibility = View.INVISIBLE
         }
 
-        if (cam2 != null) {
+        if (tile2 != null) {
             feedCam2.visibility = View.VISIBLE
-            tvCamName2.text = cam2.name
-            startRtspStream(cam2, slot = 1, playerView = playerView2)
+            tvCamName2.text = tile2.label
+            startRtspStream(tile2, slot = 1, playerView = playerView2)
         } else {
             feedCam2.visibility = View.INVISIBLE
         }
@@ -185,20 +211,11 @@ class CameraListFragment : BaseMenuFragment() {
 
     // ── Stream (go2rtc) por slot: HLS preferido, RTSP de fallback ────────────
 
-    private fun startRtspStream(camera: CameraResponse, slot: Int, playerView: PlayerView) {
+    private fun startRtspStream(tile: Tile, slot: Int, playerView: PlayerView) {
         players[slot]?.release()
 
-        // Para dual-lens, en la rejilla mostramos el primer lente (L1). HLS
-        // preferido (ExoPlayer fiable); RTSP de respaldo si el HLS falla.
-        val url: String
-        val fallback: String?
-        if (camera.isDualLens && !camera.streamUrlL1.isNullOrBlank()) {
-            url = camera.hlsUrlL1?.takeIf { it.isNotBlank() } ?: camera.streamUrlL1!!
-            fallback = camera.streamUrlL1
-        } else {
-            url = camera.liveHlsUrl ?: camera.liveUrl
-            fallback = camera.liveUrl
-        }
+        val url = tile.url
+        val fallback = tile.fallbackUrl
 
         var triedFallback = false
         players[slot] = ExoPlayer.Builder(requireContext()).build().also { exo ->
@@ -239,9 +256,9 @@ class CameraListFragment : BaseMenuFragment() {
         feed.visibility = View.INVISIBLE
     }
 
-    private fun navigateToLiveView(cameraIndex: Int) {
-        val camera = cameras.getOrNull(cameraIndex) ?: return
-        val bundle = Bundle().apply { putString("cameraId", camera.id.toString()) }
+    private fun navigateToLiveView(tileIndex: Int) {
+        val tile = tiles.getOrNull(tileIndex) ?: return
+        val bundle = Bundle().apply { putString("cameraId", tile.camera.id.toString()) }
         findNavController().navigate(R.id.action_cameraList_to_liveView, bundle)
     }
 

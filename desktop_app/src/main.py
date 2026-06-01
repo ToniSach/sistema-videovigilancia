@@ -21,6 +21,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QFontDatabase
 
 from desktop_app.src.ui.main_window import MainWindow
+from desktop_app.src.ui.theme import apply_theme
 
 def main():
     """Función principal."""
@@ -56,7 +57,12 @@ def main():
             font = QFont("Ubuntu", 10)
     
     app.setFont(font)
-    
+
+    # Tema global (QSS): da aspecto "pro" coherente a TODOS los widgets
+    # (scrollbars, desplegables, tablas, menús, inputs, diálogos…). Aditivo:
+    # las hojas inline de cada vista siguen teniendo prioridad.
+    apply_theme(app)
+
     # Crear y mostrar ventana principal
     window = MainWindow()
     window.show()

@@ -28,6 +28,12 @@
     <string name="track_previous">Anterior</string>
     <string name="track_next">Siguiente</string>
 
+    <!-- Bottom navigation -->
+    <string name="nav_live">En vivo</string>
+    <string name="nav_cameras">Cámaras</string>
+    <string name="nav_recordings">Grabaciones</string>
+    <string name="nav_alerts">Alertas</string>
+
     <!-- Popup menu -->
     <string name="menu_grabaciones">Grabaciones</string>
     <string name="menu_notificaciones">Notificaciones</string>
@@ -65,6 +71,8 @@
     <string name="pref_save_ok">Preferencia guardada</string>
     <string name="pref_save_failed">No se pudo guardar la preferencia</string>
     <string name="pref_load_failed">No se pudieron cargar las preferencias</string>
+    <string name="pref_days_label">Dias</string>
+    <string name="pref_schedule_label">Solo en horario</string>
 
     <!-- Dialog conexion manual -->
     <string name="dialog_title_manual">Conexion manual</string>
