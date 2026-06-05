@@ -7,8 +7,15 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Cargar variables de entorno desde .env
-env_path = Path(__file__).parent.parent.parent / '.env'
+# Cargar variables de entorno: se usa «.env» si existe; si no, se cae a la
+# plantilla «.env-example» para que un clon recién bajado arranque igualmente
+# (con valores por defecto). En despliegues reales crea tu propio «.env».
+_root = Path(__file__).parent.parent.parent
+env_path = _root / '.env'
+if not env_path.exists():
+    example_path = _root / '.env-example'
+    if example_path.exists():
+        env_path = example_path
 load_dotenv(dotenv_path=env_path, verbose=True)
 
 logger = logging.getLogger(__name__)
@@ -106,31 +113,10 @@ class Settings:
             # NUEVOS LÍMITES CRÍTICOS (NVR)
             self.MAX_CONCURRENT_FFMPEG: int = int(os.getenv("MAX_CONCURRENT_FFMPEG", "4"))
             self.MAX_AI_INFERENCE_QUEUE: int = int(os.getenv("MAX_AI_INFERENCE_QUEUE", "10"))
-            # 25 por defecto para soportar test de carga sin tener que tocar
-            # .env. Cada conexión MJPEG ocupa un hilo del WSGI server; 25 es
-            # razonable en hardware modesto. Subir si quieres más clientes.
-            self.MAX_MJPEG_CLIENTS_PER_CAMERA: int = int(os.getenv("MAX_MJPEG_CLIENTS_PER_CAMERA", "25"))
+            # NOTA: el streaming en vivo ahora lo sirve go2rtc (WebRTC/RTSP/HLS)
+            # directamente al cliente; MJPEG fue eliminado por completo, por eso
+            # ya no hay flags MJPEG aquí.
 
-            # ==============================
-            # CALIDAD DE STREAMING MJPEG
-            # ==============================
-            # max_width: ancho máximo del JPEG enviado al cliente.
-            #    640 → super rápido y baja calidad
-            #    960 → buen equilibrio (recomendado)
-            #   1280 → alta calidad pero más CPU
-            # quality: calidad JPEG (0-100).
-            #    75 → ~40% menos bytes que 85, diferencia perceptual imperceptible
-            #          en streaming en vivo. Mejor latencia.
-            #    85 → calidad de foto, innecesario para preview de cámara
-            self.MJPEG_MAX_WIDTH: int = int(os.getenv("MJPEG_MAX_WIDTH", "960"))
-            self.MJPEG_QUALITY: int = int(os.getenv("MJPEG_QUALITY", "75"))
-            # Cap de FPS para el encoder MJPEG. El cliente pull-based consume
-            # a ~15fps; si la cámara entrega passthrough a 60fps, sin cap
-            # estaríamos quemando 4× CPU en JPEGs que el cliente descarta.
-            # Bajar a 10 si la CPU sigue cargada; subir a 25 si tu cliente
-            # tiene monitor >60Hz y notas saltos.
-            self.MJPEG_TARGET_FPS: float = float(os.getenv("MJPEG_TARGET_FPS", "15"))
-            
             # ==============================
             # CONFIGURACIÓN AI/HARDWARE
             # ==============================
@@ -167,9 +153,8 @@ class Settings:
             # low_cpu=5 → 3 inferencias/s; suficiente para detectar a una
             # persona caminando (cruzar el FOV típico tarda 2-4s).
             # high_quality=3 → 5/s para escenas con movimiento rápido.
-            # Bajar a 3 fps libera CPU para que el encoder MJPEG no compita
-            # → menos contención de hilos en GlobalExecutor → menor delay
-            # percibido en live preview.
+            # Bajar a 3 fps libera CPU y reduce la contención de hilos en
+            # GlobalExecutor (grabación + IA comparten pool).
             self.AI_INFERENCE_INTERVAL_LOW: int = int(
                 os.getenv("AI_INFERENCE_INTERVAL_LOW", "5")
             )
@@ -188,8 +173,7 @@ class Settings:
             # cruza el FOV genera 1 alerta, no decenas. Con cooldown=0
             # (modo test) el flood de eventos satura GlobalExecutor con
             # tareas de cv2.imwrite + HTTP a Telegram (~2s c/u) + splice
-            # ffmpeg, y la encoder MJPEG queda esperando en cola → la
-            # live se ve "saltada" porque los frames llegan en ráfagas.
+            # ffmpeg, retrasando la grabación y la IA.
             self.AI_EVENT_COOLDOWN_SECONDS: int = int(
                 os.getenv("AI_EVENT_COOLDOWN_SECONDS", "30")
             )
@@ -246,17 +230,14 @@ class Settings:
             self.SERVER_PORT: int = int(os.getenv("SERVER_PORT", "5000"))
 
             # ==============================
-            # MIGRACIÓN STREAMING (go2rtc / WebRTC / -c copy)
+            # STREAMING (go2rtc / WebRTC)
             # ==============================
-            # TODOS estos flags vienen DESACTIVADOS por defecto: el sistema se
-            # comporta exactamente igual que antes (MJPEG + grabación libx264)
-            # hasta que se activen explícitamente. Esto permite desplegar la
-            # nueva infraestructura en paralelo y hacer rollback con un flag.
-            #
-            # go2rtc: servidor de medios (proceso sidecar) que habla RTSP con
-            # las cámaras UNA sola vez y reexpone WebRTC/RTSP/MSE sin transcode.
+            # go2rtc es la ÚNICA capa de directo (MJPEG fue eliminado): un
+            # proceso sidecar que habla RTSP con las cámaras UNA sola vez y
+            # reexpone WebRTC/RTSP/HLS sin transcode. Viene ACTIVADO por
+            # defecto; ponlo en false solo si no quieres directo en absoluto.
             self.GO2RTC_ENABLED: bool = (
-                os.getenv("GO2RTC_ENABLED", "false").lower() == "true"
+                os.getenv("GO2RTC_ENABLED", "true").lower() == "true"
             )
             # Binario: ruta absoluta o nombre en PATH. Se valida con shutil.which.
             self.GO2RTC_BINARY: str = os.getenv("GO2RTC_BINARY", "go2rtc")
@@ -289,8 +270,8 @@ class Settings:
                 os.getenv("WEBRTC_ENABLED", "false").lower() == "true"
             )
 
-            # Cuando True, el FFmpegWorker (decodifica para MJPEG/IA) lee del
-            # RESTREAM de go2rtc en vez de la cámara directa. CRÍTICO para
+            # Cuando True, el FFmpegWorker (decodifica para IA/grabación) lee
+            # del RESTREAM de go2rtc en vez de la cámara directa. CRÍTICO para
             # cámaras que solo aceptan 1 conexión RTSP (XiongMai, muchos
             # chinos baratos): así go2rtc es el ÚNICO que habla con la cámara
             # y todos los demás (worker, grabación) consumen go2rtc sin
@@ -371,6 +352,44 @@ class Settings:
             f"postgresql+psycopg2://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
+
+    def reload_storage_from_db(self) -> None:
+        """
+        Relee los overrides de almacenamiento (ruta de grabaciones y cuota) desde
+        SystemConfig y los aplica EN CALIENTE sobre el singleton.
+
+        Se llama: (1) al arrancar (tras init_db) para que un valor guardado
+        antes persista entre reinicios, y (2) tras guardar la config desde la
+        app de escritorio para que aplique sin reiniciar. Import diferido para
+        evitar dependencia circular en el import-time de config.
+        """
+        try:
+            import os as _os
+            from backend.app.database.connection import db_manager
+            from backend.app.database.models import SystemConfig
+            with db_manager.get_session() as session:
+                rows = {
+                    c.key: c.value
+                    for c in session.query(SystemConfig).filter(
+                        SystemConfig.key.in_(["recordings_path", "max_storage_gb"])
+                    ).all()
+                }
+            path = (rows.get("recordings_path") or "").strip()
+            if path:
+                try:
+                    _os.makedirs(path, exist_ok=True)
+                    self.RECORDINGS_PATH = path
+                except OSError:
+                    pass
+            gb = rows.get("max_storage_gb")
+            if gb:
+                try:
+                    self.MAX_STORAGE_GB = float(gb)
+                except (TypeError, ValueError):
+                    pass
+        except Exception:
+            # En el primer arranque la tabla puede no existir aún; es benigno.
+            pass
 
 
 # Instancia global de configuración

@@ -1,5 +1,8 @@
 package com.ipn.mx.onvif.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -98,12 +101,15 @@ class TelegramLinkFragment : Fragment() {
 
                 tvCode.text = data.code
                 tvExpiry.text = "Valido por ${data.expiresInSeconds / 60} min"
-                tvInstructions.text = if (data.instructions.isNotEmpty())
-                    data.instructions.mapIndexed { i, s -> "${i + 1}. $s" }.joinToString("\n")
-                else
-                    "1. Abre Telegram y busca @${data.botUsername}\n" +
-                    "2. Enviale: /vincular ${data.code}\n" +
-                    "3. Espera la confirmacion aqui"
+                // Instrucciones SIEMPRE explícitas sobre el paso manual: el
+                // deep link de Telegram sólo auto-envia /start la PRIMERA vez
+                // que abres el bot; si ya lo habias abierto antes, hay que
+                // enviar el comando a mano. Por eso al pulsar "Abrir Telegram"
+                // copiamos "/vincular CODE" al portapapeles.
+                tvInstructions.text =
+                    "1. Pulsa \"Abrir Telegram\" (copiaremos el comando).\n" +
+                    "2. En el chat del bot, pega y envia: /vincular ${data.code}\n" +
+                    "3. Espera la confirmacion aqui mismo."
                 btnOpenTelegram.isEnabled = true
                 tvStatus.text = "Esperando vinculacion..."
 
@@ -150,6 +156,23 @@ class TelegramLinkFragment : Fragment() {
                 Toast.makeText(requireContext(), "Deep link no disponible", Toast.LENGTH_SHORT).show()
                 return
             }
+
+        // Copiar "/vincular CODE" al portapapeles para que el usuario solo
+        // tenga que pegarlo y enviarlo. Esto resuelve el caso en que el bot
+        // ya fue iniciado antes y el deep link no auto-envia /start CODE.
+        currentCode?.let { code ->
+            try {
+                val cmd = "/vincular $code"
+                val cb = requireContext().getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cb.setPrimaryClip(ClipData.newPlainText("vincular", cmd))
+                Toast.makeText(
+                    requireContext(),
+                    "Comando copiado: pegalo y envialo en el chat del bot",
+                    Toast.LENGTH_LONG
+                ).show()
+            } catch (_: Exception) { /* no critico */ }
+        }
+
         try {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link)))
         } catch (e: Exception) {

@@ -57,6 +57,7 @@ class EventConfigFragment : BaseMenuFragment() {
 
     private lateinit var container: LinearLayout
     private lateinit var loading: ProgressBar
+    private var tvAiNotice: TextView? = null
 
     /** event_type → DTO actual del servidor (null si todavía no existe). */
     private val current: MutableMap<String, NotificationPreferenceDto?> = mutableMapOf()
@@ -73,8 +74,34 @@ class EventConfigFragment : BaseMenuFragment() {
         super.onViewCreated(view, savedInstanceState)
         container = view.findViewById(R.id.eventsContainer)
         loading   = view.findViewById(R.id.loading)
+        tvAiNotice = view.findViewById(R.id.tvAiNotice)
         renderRows()
-        loadPreferences()
+        checkAiThenLoad()
+    }
+
+    /**
+     * Regla de producto: sin IA activa NO se pueden personalizar notificaciones.
+     * Consulta /ai/status; si no hay ninguna cámara con IA, muestra el aviso y
+     * deshabilita la edición. Si sí la hay, carga las preferencias normalmente.
+     */
+    private fun checkAiThenLoad() {
+        val api = buildApi() ?: return
+        viewLifecycleOwner.lifecycleScope.launch {
+            val aiActive = try {
+                val resp = api.getAiStatus()
+                (resp.body()?.data?.activeCount ?: 0) > 0
+            } catch (e: Exception) {
+                Log.w(TAG, "No pude consultar estado IA: ${e.message}")
+                true  // ante fallo de red, no bloqueamos (fail-open)
+            }
+            setEditingEnabled(aiActive)
+            if (aiActive) loadPreferences()
+        }
+    }
+
+    private fun setEditingEnabled(enabled: Boolean) {
+        tvAiNotice?.visibility = if (enabled) View.GONE else View.VISIBLE
+        container.visibility = if (enabled) View.VISIBLE else View.GONE
     }
 
     // ── UI ────────────────────────────────────────────────────────────────────
@@ -163,7 +190,9 @@ class EventConfigFragment : BaseMenuFragment() {
             btnStart.text = "00:00"; btnEnd.text = "23:59"
         } else {
             swEnabled.isChecked = dto.enabled
-            cbPush.isChecked    = "push" in dto.channels
+            // "app" = recibir en este móvil (WebSocket LAN). Aceptamos "push"
+            // por compatibilidad con datos antiguos (FCM fue eliminado).
+            cbPush.isChecked    = "app" in dto.channels || "push" in dto.channels
             cbTel.isChecked     = "telegram" in dto.channels
             val days = dto.days.ifEmpty { listOf(0, 1, 2, 3, 4, 5, 6) }.toSet()
             for ((chipId, dayVal) in dayChipIds) {
@@ -251,9 +280,9 @@ class EventConfigFragment : BaseMenuFragment() {
     ) {
         val api = buildApi() ?: return
         val channels = buildList {
-            if (push)     add("push")
+            if (push)     add("app")        // recibir en la app (WebSocket LAN)
             if (telegram) add("telegram")
-        }.ifEmpty { listOf("push") }
+        }.ifEmpty { listOf("app") }
         // Si no hay días marcados, lo tratamos como "todos" (evitar silencio total accidental).
         val daysFinal = days.ifEmpty { listOf(0, 1, 2, 3, 4, 5, 6) }
         val existing = current[eventType]

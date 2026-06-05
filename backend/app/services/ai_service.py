@@ -233,8 +233,8 @@ class AIService:
             # Cooldown configurable vía .env (AI_EVENT_COOLDOWN_SECONDS).
             # Default 30s en producción. Bajar a 0 SOLO para tests rápidos
             # — con 0s el flood de eventos satura GlobalExecutor (Telegram
-            # + snapshot + splice) y la encoder MJPEG queda en cola → la
-            # live preview salta segundos. Ver settings.AI_EVENT_COOLDOWN_SECONDS.
+            # + snapshot + splice), retrasando grabación e IA.
+            # Ver settings.AI_EVENT_COOLDOWN_SECONDS.
             cooldown_s = getattr(settings, "AI_EVENT_COOLDOWN_SECONDS", 30)
             scheduler = AIScheduler(camera_id, mode, cooldown_seconds=cooldown_s)
             # BUG FIX CRÍTICO: el callback DEBE registrarse SIEMPRE.

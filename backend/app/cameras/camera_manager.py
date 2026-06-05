@@ -15,8 +15,7 @@ class CameraManager:
     - Crea buffers y distribuidores por cámara
     - Proporciona acceso centralizado a componentes de streaming
     - SOPORTE DUAL LENS: Divide cámaras side-by-side en dos streams independientes
-      SIN crear buffers/distribuidores separados; los frames divididos se inyectan
-      directamente en el MJPEG streamer con un stream_id ('l1' / 'l2').
+      identificados por stream_id ('l1' / 'l2'), que go2rtc publica por separado.
     """
 
     _instance = None
@@ -198,7 +197,7 @@ class CameraManager:
         except Exception:
             pass
 
-    def start_camera(self, camera: Camera, register_mjpeg: bool = True) -> bool:
+    def start_camera(self, camera: Camera) -> bool:
         if camera.is_dual_lens:
             return self.start_dual_lens_camera(camera)
 
@@ -244,7 +243,8 @@ class CameraManager:
                 self._buffers[camera.id] = buffer
                 self._distributors[camera.id] = distributor
 
-                # El directo se sirve por go2rtc (WebRTC/RTSP). MJPEG eliminado.
+                # El directo se sirve por go2rtc (WebRTC/RTSP/HLS) directo al
+                # cliente; el backend solo procesa frames para IA y grabación.
                 self._wire_recording_manager(camera.id, distributor)
                 self._maybe_sync_time(camera)
 
@@ -318,7 +318,7 @@ class CameraManager:
                 self._lens_distributors[(parent_camera.id, "l2")] = lens_dist_l2
 
                 # El directo por lente se sirve por go2rtc (cam_X_l1/l2). Los
-                # distribuidores de lente quedan para la IA. MJPEG eliminado.
+                # distribuidores de lente quedan únicamente para la IA.
 
                 def split_and_distribute(frame_data: FrameData):
                     # splitter.split() retorna VIEWS (no copia) del frame.
@@ -335,8 +335,7 @@ class CameraManager:
                 # needs_copy=False: splitter solo lee (slices) y los views
                 # quedan en lens_buf. Antes con needs_copy=True se hacía un
                 # memcpy de ~5.5 MB del frame combinado por cada cuadro,
-                # competing por ancho de banda de memoria con el encoder
-                # MJPEG → contribuía al lag acumulativo en la live.
+                # malgastando ancho de banda de memoria.
                 raw_distributor.register_consumer(
                     "dual_lens_splitter",
                     split_and_distribute,
@@ -431,7 +430,7 @@ class CameraManager:
             self.stop_camera(camera_id)
             import time
             time.sleep(0.5)
-            return self.start_camera(camera, register_mjpeg=True)
+            return self.start_camera(camera)
 
     def get_distributor(self, camera_id, stream_id: str = "main"):
         """
@@ -564,7 +563,7 @@ class CameraManager:
             if not camera.rtsp_url:
                 self._logger.warning(f"Cámara {camera.id} no tiene URL RTSP, omitiendo")
                 continue
-            self.start_camera(camera, register_mjpeg=True)
+            self.start_camera(camera)
 
     def stop_all(self) -> None:
         camera_ids = list(self._workers.keys())

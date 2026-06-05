@@ -97,8 +97,7 @@ class AIScheduler:
         # (`frame_data.frame.copy()`). Tener needs_copy=True aquí causaba
         # DOBLE memcpy por frame: una en el distribuidor + otra al enqueue.
         # Para dual-lens con frames de 1.5 MB a 15 fps eso eran 22 MB/s
-        # de memcpy desperdiciado compitiendo con el encoder MJPEG por
-        # ancho de banda de memoria → contribuía al delay de la live.
+        # de memcpy desperdiciado en ancho de banda de memoria.
         consumer_name = f"ai_scheduler_{self.camera_id}"
         frame_distributor.register_consumer(
             consumer_name,

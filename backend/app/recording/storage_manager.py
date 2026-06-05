@@ -16,12 +16,20 @@ class StorageManager:
 
     def __init__(self, recording_repo: RecordingRepository):
         self._recording_repo = recording_repo
-        self._recordings_path = settings.RECORDINGS_PATH
-        self._max_size_bytes = int(settings.MAX_STORAGE_GB * 1024**3)
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
         logging.info(f"StorageManager inicializado: max={settings.MAX_STORAGE_GB}GB")
+
+    # Ruta y cuota se leen EN CALIENTE desde settings (no se cachean), para que
+    # un cambio guardado desde la app de escritorio aplique sin reiniciar.
+    @property
+    def _recordings_path(self) -> str:
+        return settings.RECORDINGS_PATH
+
+    @property
+    def _max_size_bytes(self) -> int:
+        return int(settings.MAX_STORAGE_GB * 1024 ** 3)
 
     # Usar repositorio para calcular tamaño total
     def get_used_space_bytes(self) -> int:

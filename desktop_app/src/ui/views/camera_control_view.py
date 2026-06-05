@@ -117,6 +117,16 @@ class CameraControlView(QWidget):
         self.control_panel.setMaximumWidth(420)
         self.splitter.addWidget(self.control_panel)
 
+        # Audio CLIENT-SIDE: "Escuchar cámara" desmutea el player del directo
+        # y el slider ajusta su volumen → el operador oye el audio de la cámara
+        # por sus propios auriculares.
+        try:
+            aw = self.control_panel.audio_widget
+            aw.listen_changed.connect(self.video_widget.set_audio_enabled)
+            aw.volume_changed.connect(self.video_widget.set_volume)
+        except Exception as e:
+            logger.warning(f"No se pudo cablear el audio del directo: {e}")
+
         # Proporción inicial 75% video / 25% panel
         self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 1)
@@ -170,7 +180,6 @@ class CameraControlView(QWidget):
     # ------------------------------------------------------------------
     def _on_camera_change(self, idx: int):
         camera_id = self.cmb_camera.itemData(idx)
-        self._stop_current_stream()
 
         if camera_id is None:
             self.video_widget.show_message("Selecciona una cámara…")
@@ -202,16 +211,17 @@ class CameraControlView(QWidget):
                 self.control_panel.set_camera(camera_id, response.data or {})
         api_client.get(f"cameras/{camera_id}", on_cam_data)
 
-        # Iniciar stream
-        self._start_stream()
+        # Cambiar de fuente SIN bloquear la UI (swap asíncrono de VLC).
+        self._load_stream(swap=True)
 
     def _on_lens_change(self, idx: int):
         lens = self.cmb_lens.itemData(idx)
         if not lens or lens == self._current_stream_type:
             return
-        self._stop_current_stream()
         self._current_stream_type = lens
-        self._start_stream()
+        # Swap asíncrono: NO llamamos stop()+play() (bloqueaban el hilo de la UI
+        # esperando al decodificador RTSP → la app se quedaba "No responde").
+        self._load_stream(swap=True)
 
     def _pick_url(self, camera, stream_type: str) -> str:
         """URL go2rtc para (cámara, lente). Calidad alta por defecto."""
@@ -226,19 +236,29 @@ class CameraControlView(QWidget):
         }.get(stream_type)
         return by_q.get("high") or legacy or (getattr(camera, "stream_url", "") or "")
 
-    def _start_stream(self):
+    def _load_stream(self, swap: bool = False):
+        """
+        Carga el stream de la cámara/lente actual.
+          - swap=True  → cambio de fuente EN VIVO (lente/cámara): swap ASÍNCRONO
+            de VLC (no bloquea el hilo de la UI; antes congelaba la app).
+          - swap=False → (re)enlazar al mostrar la vista: play() reengancha el
+            HWND y reproduce (el stop interno es instantáneo si ya estaba parado).
+        """
         if self._current_camera_id is None:
             return
         camera = next(
             (c for c in self._cameras_cache if c.id == self._current_camera_id), None
         )
         url = self._pick_url(camera, self._current_stream_type)
-        if url:
-            self.video_widget.play(url)
-        else:
+        if not url:
             self.video_widget.show_message(
                 "Sin stream go2rtc (¿GO2RTC_ENABLED en el backend?)"
             )
+            return
+        if swap:
+            self.video_widget.set_url(url)
+        else:
+            self.video_widget.play(url)
 
     def _stop_current_stream(self):
         try:
@@ -248,9 +268,9 @@ class CameraControlView(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        # Si volvemos a la vista, restaurar stream
+        # Si volvemos a la vista, restaurar stream (reengancha HWND).
         if self._current_camera_id is not None:
-            self._start_stream()
+            self._load_stream(swap=False)
 
     def hideEvent(self, event):
         # Liberar stream cuando se cambia de vista (ahorra red+CPU)

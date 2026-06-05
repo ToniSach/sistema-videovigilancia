@@ -640,7 +640,7 @@ class CameraManagementView(QWidget):
         info_v.setContentsMargins(0, 0, 0, 0)
         info_v.setSpacing(8)
 
-        # --- Preview de video MJPEG ---
+        # --- Preview de video (go2rtc/RTSP) ---
         # Selector de lente (solo visible para cámaras dual-lens)
         from PySide6.QtWidgets import QComboBox
         self.preview_lens_row = QHBoxLayout()
@@ -813,7 +813,7 @@ class CameraManagementView(QWidget):
             self.camera_selected.emit(camera_id)
     
     # ------------------------------------------------------------------
-    # Preview MJPEG en panel de detalles
+    # Preview en vivo (go2rtc/RTSP) en panel de detalles
     # ------------------------------------------------------------------
     def _pick_preview_url(self, camera, stream_type: str) -> str:
         """URL go2rtc para (cámara, lente). Calidad alta para el preview."""

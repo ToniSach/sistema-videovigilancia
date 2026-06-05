@@ -21,62 +21,25 @@ PIPELINE
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime
 from typing import Optional
-from urllib.parse import urlparse
 
 from onvif import ONVIFCamera
 from zeep.exceptions import Fault
 
 from ..database.models import Camera
+# Reutilizamos las utilidades ONVIF comunes (puertos candidatos + build) en vez
+# de duplicarlas aquí (estaban repetidas idénticas en ptz/led/audio).
+from .onvif_common import (
+    candidate_ports as _candidate_ports,
+    build_onvif_cam as _build_cam_common,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_wsdl_dir() -> Optional[str]:
-    try:
-        import onvif
-        pkg_dir = os.path.dirname(onvif.__file__)
-        site_packages = os.path.dirname(pkg_dir)
-        for cand in (os.path.join(site_packages, "wsdl"), os.path.join(pkg_dir, "wsdl")):
-            if os.path.isdir(cand):
-                return cand
-    except Exception:
-        pass
-    return None
-
-
-_WSDL_DIR = _resolve_wsdl_dir()
-_ONVIF_PORTS = [80, 8000, 8080, 8899]
-
-
-def _candidate_ports(camera: Camera) -> list[int]:
-    """Prioriza el puerto ONVIF ya conocido (camera.onvif_url) si lo hay."""
-    if camera.onvif_url:
-        try:
-            p = urlparse(camera.onvif_url).port
-            if p:
-                return [p] + [x for x in _ONVIF_PORTS if x != p]
-        except Exception:
-            pass
-    return list(_ONVIF_PORTS)
-
-
 def _build_cam(camera: Camera, port: int) -> Optional[ONVIFCamera]:
-    kwargs = {"encrypt": False, "no_cache": True}
-    if _WSDL_DIR:
-        kwargs["wsdl_dir"] = _WSDL_DIR
-    try:
-        cam = ONVIFCamera(
-            camera.ip_address, port,
-            camera.username or "", camera.password or "",
-            **kwargs,
-        )
-        cam.devicemgmt.GetCapabilities({"Category": "All"})
-        return cam
-    except Exception:
-        return None
+    return _build_cam_common(camera, port, "TIME")
 
 
 def sync_camera_time(camera: Camera) -> bool:

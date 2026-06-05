@@ -82,14 +82,23 @@ def update_storage_config():
             
             # Verificar que se puede crear el directorio
             os.makedirs(requested_path, exist_ok=True)
+
+            # PERSISTIR en BD (SystemConfig) para que sobreviva a reinicios, y
+            # aplicar EN CALIENTE (StorageManager/RecordingManager leen settings
+            # de forma dinámica, así que la ruta nueva tiene efecto al momento
+            # para grabaciones nuevas).
+            from backend.app.database.connection import db_manager
+            from backend.app.database.models import SystemConfig
+            with db_manager.get_session() as session:
+                session.merge(SystemConfig(key="recordings_path", value=str(requested_path)))
             settings.RECORDINGS_PATH = str(requested_path)
-            
+
         except Exception as e:
             return jsonify({"success": False, "error": f"Path inválido: {e}"}), 400
-        
+
         return jsonify({
             "success": True,
-            "message": "Configuración actualizada. Reinicie el servidor para aplicar cambios completos."
+            "message": "Ruta de almacenamiento actualizada y aplicada."
         }), 200
         
     except Exception as e:

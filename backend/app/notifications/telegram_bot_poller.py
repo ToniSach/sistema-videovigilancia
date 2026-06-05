@@ -75,6 +75,13 @@ class TelegramBotPoller:
         """
         Lee config de Telegram desde BD; si hay bot_token, arranca el poller.
         Devuelve True si arrancó, False si no había token configurado.
+
+        IMPORTANTE (resiliencia): el arranque del loop NO depende de que
+        getMe responda. Si en el momento del boot no hay internet (o Telegram
+        tarda), antes el poller quedaba MUERTO para siempre y el bot no
+        procesaba ningún /vincular hasta reiniciar el backend. Ahora el loop
+        arranca igual y reintenta identidad + getUpdates en cuanto vuelve la
+        red (self-healing). Sólo se exige tener bot_token configurado.
         """
         self._load_config()
         if not self._bot_token:
@@ -85,10 +92,13 @@ class TelegramBotPoller:
             logger.warning("[TelegramPoller] Ya está corriendo")
             return True
 
-        # Verificar token contactando con /getMe (también obtenemos username)
+        # Verificar token con /getMe para obtener el @username cuanto antes.
+        # Si falla (sin red, timeout), NO abortamos: el loop reintentará.
         if not self._fetch_bot_identity():
-            logger.error("[TelegramPoller] bot_token inválido o sin red")
-            return False
+            logger.warning(
+                "[TelegramPoller] No pude verificar el bot ahora (¿sin red?). "
+                "Arranco el loop igual y reintentaré automáticamente."
+            )
 
         self._stop_event.clear()
         self._thread = threading.Thread(
@@ -97,7 +107,10 @@ class TelegramBotPoller:
             name="TelegramBotPoller"
         )
         self._thread.start()
-        logger.info(f"[TelegramPoller] Iniciado para @{self._bot_username}")
+        logger.info(
+            f"[TelegramPoller] Iniciado"
+            + (f" para @{self._bot_username}" if self._bot_username else " (identidad pendiente)")
+        )
         return True
 
     def stop(self) -> None:
@@ -204,6 +217,11 @@ class TelegramBotPoller:
         offline_streak = 0  # contador consecutivo de errores de red
         while not self._stop_event.is_set():
             try:
+                # Si la identidad quedó pendiente (getMe falló en el arranque
+                # por falta de red), reintentar aquí en cuanto haya conexión.
+                if not self._bot_username:
+                    self._fetch_bot_identity()
+
                 updates, offline_err = self._get_updates()
                 if updates is None:
                     if offline_err:

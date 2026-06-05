@@ -153,13 +153,10 @@ class SettingsView(QWidget):
         self.spin_pre_buffer.setValue(10)
         self.spin_pre_buffer.setSuffix(" segundos")
         video_layout.addRow("Buffer Pre-Evento:", self.spin_pre_buffer)
-        
-        self.spin_quality = QSpinBox()
-        self.spin_quality.setRange(50, 100)
-        self.spin_quality.setValue(75)
-        self.spin_quality.setSuffix("%")
-        video_layout.addRow("Calidad MJPEG:", self.spin_quality)
-        
+
+        # La calidad del directo se elige por cámara en la vista "Cámaras en
+        # vivo" (Auto/Alta/Media/Baja sobre go2rtc), no aquí.
+
         layout.addWidget(video_group)
         
         # Configuración de IA

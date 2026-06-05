@@ -62,6 +62,15 @@ class UserService:
             self.logger.error(f"Error creando usuario: {e}")
             raise
     
+    def count_users(self) -> int:
+        """Número total de usuarios (para detectar el primer arranque)."""
+        try:
+            with db_manager.get_session() as session:
+                return session.query(User).count()
+        except Exception as e:
+            self.logger.error(f"Error contando usuarios: {e}")
+            return 0
+
     def get_user_by_id(self, user_id: int) -> Optional[User]:
         """Obtiene usuario por ID."""
         try:

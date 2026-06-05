@@ -1,8 +1,8 @@
 """
 Widget reutilizable de vídeo en VIVO por RTSP/go2rtc con VLC (baja latencia).
 
-Reemplaza el consumo MJPEG en las vistas que muestran el directo (control de
-cámara, preview de gestión, etc.). Encapsula:
+Es la única vía de directo en las vistas (control de cámara, preview de
+gestión, etc.). Encapsula:
   - creación perezosa de un VLCPlayer con flags de baja latencia,
   - bind del HWND/xwindow a su superficie,
   - relleno del panel (sin barras negras),
@@ -35,6 +35,11 @@ class RtspVideoWidget(QFrame):
         self._vlc = None
         self._url = ""
         self._pending_url = None  # URL a reproducir cuando el widget sea visible
+        # Audio del directo: por defecto SILENCIADO (convención NVR — el mosaico
+        # en vivo no debe sonar). El botón "Escuchar cámara" lo desmutea para
+        # que el usuario oiga el audio de la cámara por SUS auriculares (cliente).
+        self._audio_enabled = False
+        self._volume = 80
         self.setStyleSheet("background-color: #000000; border-radius: 4px;")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumHeight(120)
@@ -83,6 +88,8 @@ class RtspVideoWidget(QFrame):
                 self._vlc.set_xwindow(wid)
             self._vlc.play_url(url)
             QTimer.singleShot(300, self._apply_fill)
+            # El audio hay que fijarlo cuando el output ya existe (tras play).
+            QTimer.singleShot(500, self._apply_audio)
         except Exception as e:
             logger.error(f"RtspVideoWidget._do_play: {e}")
             self._surface.setText("Error de vídeo")
@@ -110,6 +117,7 @@ class RtspVideoWidget(QFrame):
             try:
                 self._vlc.play_url_async(url)
                 QTimer.singleShot(800, self._apply_fill)
+                QTimer.singleShot(1000, self._apply_audio)
             except Exception as e:
                 logger.error(f"RtspVideoWidget.set_url: {e}")
         else:
@@ -121,6 +129,37 @@ class RtspVideoWidget(QFrame):
         self._url = ""
         self._pending_url = None
         self._surface.setText(text)
+
+    # ------------------------------------------------------------------
+    # Audio (client-side) — el botón "Escuchar cámara" lo controla.
+    # ------------------------------------------------------------------
+    def _apply_audio(self):
+        """Aplica mute/volumen al player VLC según el estado deseado."""
+        try:
+            if self._vlc is None:
+                return
+            p = self._vlc.player
+            p.audio_set_mute(not self._audio_enabled)
+            p.audio_set_volume(int(self._volume))
+        except Exception as e:
+            logger.debug(f"RtspVideoWidget._apply_audio: {e}")
+
+    def set_audio_enabled(self, enabled: bool):
+        """Activa (desmutea) o desactiva el audio del directo en el cliente."""
+        self._audio_enabled = bool(enabled)
+        self._apply_audio()
+
+    def set_volume(self, value: int):
+        """Ajusta el volumen del audio del directo (0-100)."""
+        self._volume = max(0, min(100, int(value)))
+        self._apply_audio()
+
+    def has_audio(self) -> bool:
+        """True si el stream actual tiene al menos una pista de audio."""
+        try:
+            return self._vlc is not None and self._vlc.player.audio_get_track_count() > 0
+        except Exception:
+            return False
 
     def _apply_fill(self):
         """Estira el vídeo para llenar el panel (sin barras negras)."""

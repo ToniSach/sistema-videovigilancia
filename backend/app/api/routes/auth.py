@@ -25,6 +25,58 @@ auth_service = AuthService()
 qr_generator = QRGenerator()
 
 
+@auth_bp.route("/setup-status", methods=["GET"])
+def setup_status():
+    """
+    Indica si el sistema necesita configuración inicial (no existe ningún
+    usuario todavía). Público: lo consulta el cliente la PRIMERA vez para
+    mostrar la pantalla de "Crear administrador" en lugar del login.
+    """
+    try:
+        from backend.app.services.user_service import UserService
+        needs = UserService().count_users() == 0
+        return jsonify({"success": True, "data": {"needs_setup": needs}}), 200
+    except Exception as error:
+        logger.error(f"Error en setup-status: {error}")
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
+
+
+@auth_bp.route("/setup", methods=["POST"])
+def setup_admin():
+    """
+    Crea el PRIMER usuario administrador. Solo funciona si la base de datos no
+    tiene usuarios (primer arranque); si ya hay usuarios devuelve 403. Tras
+    crearlo, hace login y devuelve los tokens para entrar directamente.
+
+    Body: { "username": "...", "password": "..." }
+    """
+    try:
+        from backend.app.services.user_service import UserService
+        svc = UserService()
+        if svc.count_users() > 0:
+            return jsonify({
+                "success": False,
+                "error": "El sistema ya está configurado. Inicia sesión.",
+            }), 403
+
+        data = request.get_json() or {}
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
+        try:
+            svc.create_user(username, password, role="admin")
+        except ValueError as ve:
+            return jsonify({"success": False, "error": str(ve)}), 400
+
+        result = auth_service.login(username, password)
+        if result is None:
+            # Creado pero login falló (no debería pasar): pide iniciar sesión.
+            return jsonify({"success": True, "data": None}), 201
+        return jsonify({"success": True, "data": result}), 201
+    except Exception as error:
+        logger.error(f"Error en setup admin: {error}")
+        return jsonify({"success": False, "error": "Error interno del servidor"}), 500
+
+
 @auth_bp.route("/login", methods=["POST"])
 def login():
     """

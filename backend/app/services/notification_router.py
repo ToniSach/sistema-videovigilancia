@@ -6,12 +6,12 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Dict
+from typing import Dict, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 from backend.app.database.models import (
-    Event, User, NotificationPreference, NotificationChannel, 
-    NotificationDay, UserTelegramChat, MobileDevice, NotificationLog,
+    Event, User, NotificationPreference, NotificationChannel,
+    NotificationDay, UserTelegramChat, NotificationLog,
     UserCameraPermission, Camera
 )
 from backend.app.database.connection import db_manager
@@ -88,29 +88,40 @@ class NotificationRouter:
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="NotifyRouter")
         self._cooldown_cache: Dict[str, datetime] = {}
         self._cooldown_lock = threading.Lock()
-        
-        # Circuit breakers
+
+        # Circuit breaker (solo Telegram; FCM/push fue eliminado del proyecto)
         self._telegram_cb = CircuitBreaker()
-        self._fcm_cb = CircuitBreaker()
-        
-        # Lazy notifiers
+
+        # Lazy notifier
         self._telegram_notifier = None
-        self._fcm_notifier = None
-        
+
         logger.info("NotificationRouter inicializado")
-    
+
     def _get_telegram_notifier(self):
         if self._telegram_notifier is None:
             from backend.app.notifications.telegram_notifier import telegram_notifier
             self._telegram_notifier = telegram_notifier
         return self._telegram_notifier
-    
-    def _get_fcm_notifier(self):
-        if self._fcm_notifier is None:
-            from backend.app.services.fcm_notifier import fcm_notifier
-            self._fcm_notifier = fcm_notifier
-        return self._fcm_notifier
-    
+
+    def _ai_active_camera_ids(self) -> Optional[set]:
+        """
+        Conjunto de camera_id con IA ACTIVA en este momento (vía AIService).
+
+        Regla de producto: las notificaciones SOLO existen para la cámara con
+        IA activa. Devuelve:
+          - set de ids con IA activa (puede ser vacío → no notificar nada),
+          - None si no se pudo consultar el estado (en ese caso NO filtramos,
+            para no perder notificaciones por un fallo transitorio).
+        """
+        try:
+            from backend.app.container import get_container
+            ai_service = get_container().get("ai_service")
+            status = ai_service.get_ai_status() or {}
+            return {a.get("camera_id") for a in status.get("active", [])}
+        except Exception as e:
+            logger.debug(f"No pude consultar IA activa para filtrar notif: {e}")
+            return None
+
     def route_event(self, event: Event, event_data=None):
         self._executor.submit(self._process_event, event, event_data)
     
@@ -125,6 +136,23 @@ class NotificationRouter:
         """
         try:
             camera_id = event.camera_id
+
+            # GATE IA: solo se notifica de la cámara con IA activa. Si no hay
+            # ninguna IA activa → no se notifica nada (los usuarios tampoco
+            # pueden personalizar notificaciones hasta que se active).
+            ai_cams = self._ai_active_camera_ids()
+            if ai_cams is not None:  # None = no se pudo consultar → no filtrar
+                if not ai_cams:
+                    logger.debug(
+                        "Evento sin notificación: no hay IA activa en ninguna cámara"
+                    )
+                    return
+                if camera_id not in ai_cams:
+                    logger.debug(
+                        f"Evento de cam {camera_id} sin notificación: la IA está "
+                        f"activa en {ai_cams}, no en esta cámara"
+                    )
+                    return
 
             with db_manager.get_session() as session:
                 # Usuarios con permiso explícito + owner de la cámara
@@ -246,8 +274,13 @@ class NotificationRouter:
                 success = False
                 if channel == 'telegram':
                     success = self._send_telegram(user_id, event, sess)
-                elif channel == 'push':
-                    success = self._send_push(user_id, event, sess)
+                elif channel in ('app', 'push', 'web'):
+                    # Canal "en la app": la entrega en tiempo real la hace el
+                    # WSNotificationBroker a los clientes (escritorio/móvil)
+                    # conectados por WebSocket — funciona en LAN sin internet.
+                    # ('push'/'web' se aceptan por compatibilidad con datos
+                    # antiguos; FCM fue eliminado.) Aquí solo se registra.
+                    success = True
 
                 log.status = 'sent' if success else 'failed'
 
@@ -259,15 +292,18 @@ class NotificationRouter:
     
     def _send_telegram(self, user_id, event, session):
         try:
-            chat = session.query(UserTelegramChat).filter_by(
+            # Un usuario puede tener VARIOS chats de Telegram vinculados
+            # (distintas cuentas: su móvil, el de un familiar, un grupo…).
+            # Hay que enviar a TODOS, no solo al primero.
+            chats = session.query(UserTelegramChat).filter_by(
                 user_id=user_id, is_active=True
-            ).first()
-            
-            if not chat:
+            ).all()
+
+            if not chats:
                 return False
-            
+
             notifier = self._get_telegram_notifier()
-            
+
             message = (
                 f"🚨 Alerta de Videovigilancia\n\n"
                 f"📹 Cámara: {event.camera.name if event.camera else event.camera_id}\n"
@@ -275,56 +311,20 @@ class NotificationRouter:
                 f"📊 Confianza: {event.confidence:.0%}\n"
                 f"🕐 Hora: {event.created_at.strftime('%d/%m/%Y %H:%M:%S')}"
             )
-            
-            result = self._telegram_cb.call(
-                notifier.send_message,
-                chat.telegram_chat_id,
-                message
-            )
-            
-            return bool(result)
-            
+
+            any_ok = False
+            for chat in chats:
+                try:
+                    result = self._telegram_cb.call(
+                        notifier.send_message, chat.telegram_chat_id, message
+                    )
+                    any_ok = any_ok or bool(result)
+                except Exception as e:
+                    logger.warning(f"Telegram a chat {chat.telegram_chat_id} falló: {e}")
+            return any_ok
+
         except Exception as e:
             logger.error(f"Error enviando Telegram: {e}")
-            return False
-    
-    def _send_push(self, user_id, event, session):
-        try:
-            devices = session.query(MobileDevice).filter_by(
-                user_id=user_id, is_active=True
-            ).all()
-            
-            if not devices:
-                return False
-            
-            notifier = self._get_fcm_notifier()
-            success = True
-            
-            for device in devices:
-                try:
-                    result = self._fcm_cb.call(
-                        notifier.send_to_device,
-                        fcm_token=device.fcm_token,
-                        title=f"Alerta: {event.event_type}",
-                        body=f"Cámara {event.camera.name if event.camera else event.camera_id}",
-                        data={
-                            "event_id": str(event.id),
-                            "camera_id": str(event.camera_id),
-                            "event_type": event.event_type
-                        }
-                    )
-                    
-                    if result is None:
-                        success = False
-                        
-                except Exception as e:
-                    logger.error(f"Error enviando push a dispositivo {device.id}: {e}")
-                    success = False
-            
-            return success
-            
-        except Exception as e:
-            logger.error(f"Error enviando push: {e}")
             return False
     
     def shutdown(self):

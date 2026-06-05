@@ -36,9 +36,15 @@ def generate_code():
 
         # Datos auxiliares para que el frontend muestre instrucciones completas
         from backend.app.notifications.telegram_bot_poller import telegram_bot_poller
+        # GARANTÍA: el poller debe estar vivo SIEMPRE que alguien intenta
+        # vincular. Si murió (p.ej. getMe falló sin red al boot) o nunca
+        # arrancó, lo (re)arrancamos aquí. Sin esto, el usuario generaba
+        # código pero el bot no procesaba el /vincular → ni confirmaba ni el
+        # móvil detectaba la vinculación.
+        if telegram_bot_poller.is_configured() and not telegram_bot_poller.is_running():
+            telegram_bot_poller.start()
         bot_username = telegram_bot_poller.get_bot_username()
         if not bot_username:
-            # Si el poller aún no arrancó, intenta cargar config para devolver algo
             telegram_bot_poller.start()
             bot_username = telegram_bot_poller.get_bot_username()
 
@@ -302,8 +308,13 @@ def admin_overview():
             return jsonify({"success": False, "error": "Solo administradores"}), 403
 
         from backend.app.database.models import (
-            User, UserTelegramChat, NotificationPreference,
+            User, UserTelegramChat, NotificationPreference, MobileDevice,
         )
+        # Etiquetas legibles de tipo de evento para el resumen de preferencias.
+        _EV = {
+            "person": "Persona", "vehicle": "Vehículo", "motion": "Movimiento",
+            "camera_offline": "Cámara offline", "tampering": "Sabotaje",
+        }
         rows = []
         with db_manager.get_session() as session:
             users = session.query(User).all()
@@ -311,9 +322,15 @@ def admin_overview():
                 chats = session.query(UserTelegramChat).filter_by(
                     user_id=u.id, is_active=True
                 ).all()
-                n_prefs = session.query(NotificationPreference).filter_by(
+                prefs = session.query(NotificationPreference).filter_by(
                     user_id=u.id, enabled=True
-                ).count()
+                ).all()
+                devices = session.query(MobileDevice).filter_by(
+                    user_id=u.id, is_active=True
+                ).all()
+                # Resumen compacto de tipos de evento que el usuario quiere recibir.
+                ev_types = sorted({p.event_type for p in prefs})
+                pref_summary = ", ".join(_EV.get(e, e) for e in ev_types) if ev_types else "—"
                 rows.append({
                     "user_id": u.id,
                     "username": u.username,
@@ -327,7 +344,10 @@ def admin_overview():
                         for c in chats
                     ],
                     "telegram_linked": len(chats) > 0,
-                    "active_preferences": n_prefs,
+                    "mobile_devices": [d.device_name for d in devices],
+                    "mobile_count": len(devices),
+                    "active_preferences": len(prefs),
+                    "preferences_summary": pref_summary,
                 })
         return jsonify({"success": True, "data": rows}), 200
     except Exception as e:

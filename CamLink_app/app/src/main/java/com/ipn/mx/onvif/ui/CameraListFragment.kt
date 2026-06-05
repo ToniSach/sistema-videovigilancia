@@ -48,16 +48,25 @@ class CameraListFragment : BaseMenuFragment() {
     private val pageSize  = 2
     private val players = arrayOfNulls<ExoPlayer>(2)   // un ExoPlayer por slot
 
+    /** Rejilla en calidad MEDIA por defecto (varias a la vez = lo más pesado).
+     *  Añade el sufijo _medium al nombre del substream de go2rtc (cam_X[_lY] →
+     *  cam_X[_lY]_medium); el src va al final de la URL (HLS y RTSP). */
+    private fun toMedium(url: String?): String? =
+        if (url.isNullOrBlank()) url else "${url}_medium"
+
     private fun buildTiles(cams: List<CameraResponse>): List<Tile> {
         val out = mutableListOf<Tile>()
         for (c in cams) {
             if (c.isDualLens && !c.streamUrlL1.isNullOrBlank() && !c.streamUrlL2.isNullOrBlank()) {
-                out.add(Tile(c, "l1", c.hlsUrlL1?.takeIf { it.isNotBlank() } ?: c.streamUrlL1!!,
-                             c.streamUrlL1, "${c.name} · L1"))
-                out.add(Tile(c, "l2", c.hlsUrlL2?.takeIf { it.isNotBlank() } ?: c.streamUrlL2!!,
-                             c.streamUrlL2, "${c.name} · L2"))
+                out.add(Tile(c, "l1",
+                             toMedium(c.hlsUrlL1?.takeIf { it.isNotBlank() } ?: c.streamUrlL1!!)!!,
+                             toMedium(c.streamUrlL1), "${c.name} · L1"))
+                out.add(Tile(c, "l2",
+                             toMedium(c.hlsUrlL2?.takeIf { it.isNotBlank() } ?: c.streamUrlL2!!)!!,
+                             toMedium(c.streamUrlL2), "${c.name} · L2"))
             } else {
-                out.add(Tile(c, null, c.liveHlsUrl ?: c.liveUrl, c.liveUrl, c.name))
+                out.add(Tile(c, null, toMedium(c.liveHlsUrl ?: c.liveUrl)!!,
+                             toMedium(c.liveUrl), c.name))
             }
         }
         return out

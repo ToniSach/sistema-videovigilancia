@@ -5,14 +5,14 @@ rtsp:
 webrtc:
   listen: :8555
   candidates:
-  - 192.168.1.22:8555
+  - 192.168.0.102:8555
 streams:
-  cam_5: rtsp://admin:admin@192.168.1.19:554/user=admin_password=tlJwpbo6_channel=0_stream=0&onvif=0.sdp?real_stream
-  cam_5_l1: ffmpeg:cam_5#video=h264#raw=-vf crop=iw:ih/2:0:ih/2
-  cam_5_l1_medium: ffmpeg:cam_5#video=h264#raw=-vf crop=iw:ih/2:0:ih/2,scale=-2:480
-  cam_5_l1_low: ffmpeg:cam_5#video=h264#raw=-vf crop=iw:ih/2:0:ih/2,scale=-2:360
-  cam_5_l2: ffmpeg:cam_5#video=h264#raw=-vf crop=iw:ih/2:0:0
-  cam_5_l2_medium: ffmpeg:cam_5#video=h264#raw=-vf crop=iw:ih/2:0:0,scale=-2:480
-  cam_5_l2_low: ffmpeg:cam_5#video=h264#raw=-vf crop=iw:ih/2:0:0,scale=-2:360
+  cam_9: rtsp://admin:admin@192.168.0.100:554/user=admin_password=tlJwpbo6_channel=0_stream=0&onvif=0.sdp?real_stream
+  cam_9_l1: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:ih/2
+  cam_9_l1_medium: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:ih/2,scale=-2:480
+  cam_9_l1_low: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:ih/2,scale=-2:360
+  cam_9_l2: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:0
+  cam_9_l2_medium: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:0,scale=-2:480
+  cam_9_l2_low: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:0,scale=-2:360
 log:
   level: info

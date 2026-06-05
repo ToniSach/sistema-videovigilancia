@@ -1,6 +1,6 @@
 """
 Frame Distributor v2.1 - Distribución eficiente con opción de copia.
-Usa GlobalExecutor y permite consumidores sin copia (zero-copy) para MJPEG.
+Usa GlobalExecutor y permite consumidores sin copia (zero-copy).
 FIX: Reducido overhead de métricas y mejor manejo de excepciones.
 """
 import threading

@@ -99,6 +99,17 @@ class APIClient(QObject):
             "Content-Type": "application/json",
             "Accept": "application/json"
         })
+        # Al iniciar sesión la UI dispara ~12 peticiones en paralelo (cámaras,
+        # usuarios, ai/status, salud, telegram, eventos…). El pool urllib3 por
+        # defecto es 10 → "Connection pool is full, discarding connection" y
+        # reconexiones. Subimos el pool para absorber la ráfaga sin descartes.
+        try:
+            from requests.adapters import HTTPAdapter
+            _adapter = HTTPAdapter(pool_connections=20, pool_maxsize=30)
+            self.session.mount("http://", _adapter)
+            self.session.mount("https://", _adapter)
+        except Exception:
+            pass
         self.tokens: Optional[AuthTokens] = None
         self._thread_pool = QThreadPool.globalInstance()
         self._base_url = config.API_BASE_URL
@@ -153,9 +164,9 @@ class APIClient(QObject):
         return False
 
     # ──────────────────────────────────────────────────────────────────────
-    # Token fresco para streaming (MJPEG, HLS, snapshots con ?token=...)
+    # Token fresco para streaming (HLS, snapshots con ?token=...)
     # ──────────────────────────────────────────────────────────────────────
-    # El access_token del JWT vive ~15 min. Los streams MJPEG van por HTTP
+    # El access_token del JWT vive ~15 min. Los streams van por HTTP
     # directo con ?token=... y NO pasan por _make_request → cuando un
     # cliente Qt reabre un stream a los 20 min sigue mandando el token viejo
     # y el backend devuelve 401 "Signature has expired".
@@ -322,6 +333,40 @@ class APIClient(QObject):
 
         worker = APIWorker(do_login, callback, self._get_dispatcher())
         self._thread_pool.start(worker)
+
+    def check_setup_status(self, callback: Callable[[APIResponse], None]):
+        """Consulta si el sistema necesita crear el primer admin (sin token)."""
+        def do():
+            try:
+                r = requests.get(f"{self._base_url}/auth/setup-status", timeout=8)
+                if r.status_code == 200:
+                    return APIResponse(success=True, data=r.json().get("data", {}))
+                return APIResponse(success=False, error="status", status_code=r.status_code)
+            except Exception as e:
+                return APIResponse(success=False, error=str(e))
+        self._thread_pool.start(APIWorker(do, callback, self._get_dispatcher()))
+
+    def setup_admin(self, username: str, password: str,
+                    callback: Callable[[APIResponse], None]):
+        """Crea el primer usuario administrador (sin token). Callback en main thread."""
+        def do():
+            try:
+                r = requests.post(
+                    f"{self._base_url}/auth/setup",
+                    json={"username": username, "password": password},
+                    timeout=10,
+                )
+                data = r.json() if r.content else {}
+                if r.status_code in (200, 201) and data.get("success"):
+                    return APIResponse(success=True, data=data.get("data"))
+                return APIResponse(
+                    success=False,
+                    error=data.get("error", "No se pudo crear el administrador"),
+                    status_code=r.status_code,
+                )
+            except Exception as e:
+                return APIResponse(success=False, error=str(e))
+        self._thread_pool.start(APIWorker(do, callback, self._get_dispatcher()))
 
 
 # Instancia global

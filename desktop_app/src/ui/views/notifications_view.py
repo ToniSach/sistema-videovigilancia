@@ -34,12 +34,12 @@ EVENT_ICONS = {
     "camera_offline": "offline", "tampering": "tamper",
 }
 
+# En el ESCRITORIO las notificaciones solo se VEN aquí mismo (canal "app").
+# El envío por Telegram o al móvil se configura desde la app MÓVIL.
 CHANNEL_OPTIONS = [
-    ("telegram", "Telegram"),
-    ("push", "Push (móvil)"),
-    ("email", "Email"),
+    ("app", "Ver en la app"),
 ]
-CHANNEL_ICONS = {"telegram": "telegram", "push": "push", "email": "email"}
+CHANNEL_ICONS = {"app": "notifications"}
 
 DAY_NAMES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 
@@ -95,9 +95,19 @@ class PreferenceDialog(QDialog):
             cb.setIcon(icon(CHANNEL_ICONS.get(key, "")))
             self.chk_channels[key] = cb
             canales.addWidget(cb)
-        self.chk_channels["telegram"].setChecked(True)
+        # Por defecto, marcar el primer canal disponible ("app" en escritorio).
+        first_channel = CHANNEL_OPTIONS[0][0]
+        self.chk_channels[first_channel].setChecked(True)
         canales.addStretch()
         layout.addLayout(canales)
+
+        nota_canal = QLabel(
+            "ℹ️ En el escritorio las alertas se ven aquí mismo. Para recibirlas "
+            "en <b>Telegram</b> o en el <b>móvil</b>, configúralo desde la app móvil."
+        )
+        nota_canal.setWordWrap(True)
+        nota_canal.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 11px;")
+        layout.addWidget(nota_canal)
 
         # Horario
         layout.addWidget(QLabel("<b>Horario (opcional):</b>"))
@@ -224,6 +234,8 @@ class NotificationPreferencesView(QWidget):
         self._prefs: List[dict] = []
         self._cameras: List[dict] = []
         self._role: str = ""
+        self._ai_active_cams: List[int] = []
+        self._dialog_open = False  # guard anti-reentrada (doble clic)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -258,6 +270,17 @@ class NotificationPreferencesView(QWidget):
         self.btn_add.clicked.connect(self._add)
         header.addWidget(self.btn_add)
         layout.addLayout(header)
+
+        # Aviso de IA: las notificaciones SOLO existen para la cámara con IA
+        # activa. Si no hay ninguna activa, no se puede personalizar.
+        self.lbl_ai_banner = QLabel()
+        self.lbl_ai_banner.setWordWrap(True)
+        self.lbl_ai_banner.setVisible(False)
+        self.lbl_ai_banner.setStyleSheet(
+            "background-color: #422006; color: #fcd34d; border: 1px solid #a16207;"
+            "border-radius: 8px; padding: 10px; font-size: 12px;"
+        )
+        layout.addWidget(self.lbl_ai_banner)
 
         # ============ SECCIÓN TELEGRAM ============
         self._setup_telegram_section(layout)
@@ -338,9 +361,42 @@ class NotificationPreferencesView(QWidget):
         # Recargar también la sección Telegram
         self._refresh_telegram_chats()
 
+        # Gateo por IA activa
+        self._check_ai_and_gate()
+
         # Tabla admin (solo si es admin y la tarjeta existe)
         if self._role == "admin" and hasattr(self, "admin_table"):
             self._refresh_admin_overview()
+
+    def _check_ai_and_gate(self):
+        """
+        Consulta si hay IA activa. Las notificaciones SOLO tienen sentido para
+        la cámara con IA activa; si no hay ninguna, se bloquea la personalización
+        y se muestra un aviso (regla de producto).
+        """
+        def on_status(response):
+            active = []
+            if response.success and response.data:
+                active = response.data.get("active", []) or []
+            has_ai = len(active) > 0
+            self.btn_add.setEnabled(has_ai)
+            self.table.setEnabled(has_ai)
+            if has_ai:
+                cams = ", ".join(f"#{a.get('camera_id')}" for a in active)
+                self.lbl_ai_banner.setVisible(False)
+                self.btn_add.setToolTip("")
+                self._ai_active_cams = [a.get("camera_id") for a in active]
+            else:
+                self._ai_active_cams = []
+                self.lbl_ai_banner.setText(
+                    "⚠️ <b>La detección por IA no está activa.</b> Las notificaciones "
+                    "se generan a partir de lo que detecta la IA, así que primero "
+                    "actívala en una cámara (pestaña «En vivo» → panel de la cámara "
+                    "→ Activar IA). Mientras tanto no puedes crear preferencias."
+                )
+                self.lbl_ai_banner.setVisible(True)
+                self.btn_add.setToolTip("Activa la IA en una cámara para personalizar notificaciones")
+        api_client.get("ai/status", on_status)
 
     def _populate(self):
         self.table.setRowCount(0)
@@ -399,8 +455,23 @@ class NotificationPreferencesView(QWidget):
         return next((p for p in self._prefs if p.get("id") == pid), None)
 
     def _add(self):
-        dlg = PreferenceDialog(self._cameras, parent=self)
-        if dlg.exec() != QDialog.Accepted:
+        if self._dialog_open:
+            return
+        if not self._ai_active_cams:
+            QMessageBox.information(
+                self, "IA no activa",
+                "Activa la detección por IA en una cámara antes de crear "
+                "preferencias de notificación.\n\nVe a «En vivo», abre el panel "
+                "de la cámara y pulsa «Activar IA»."
+            )
+            return
+        self._dialog_open = True
+        try:
+            dlg = PreferenceDialog(self._cameras, parent=self)
+            accepted = dlg.exec() == QDialog.Accepted
+        finally:
+            self._dialog_open = False
+        if not accepted:
             return
 
         def on_create(response):
@@ -411,11 +482,18 @@ class NotificationPreferencesView(QWidget):
         api_client.post("notifications/preferences", on_create, data=dlg.get_data())
 
     def _edit(self):
+        if self._dialog_open:
+            return
         p = self._selected_pref()
         if not p:
             return
-        dlg = PreferenceDialog(self._cameras, preference=p, parent=self)
-        if dlg.exec() != QDialog.Accepted:
+        self._dialog_open = True
+        try:
+            dlg = PreferenceDialog(self._cameras, preference=p, parent=self)
+            accepted = dlg.exec() == QDialog.Accepted
+        finally:
+            self._dialog_open = False
+        if not accepted:
             return
 
         def on_update(response):
@@ -788,28 +866,31 @@ class NotificationPreferencesView(QWidget):
         InfoDialog(
             title="Ayuda — Notificaciones",
             sections=[
-                ("¿Cómo funcionan las notificaciones?",
-                 "Cuando una cámara detecta un evento (persona, vehículo, "
-                 "movimiento) el sistema te avisa por los canales que hayas "
-                 "configurado. Necesitas: 1) vincular al menos un canal (Telegram "
-                 "es lo más común) y 2) crear preferencias que digan qué eventos "
-                 "y de qué cámaras quieres recibir."),
-                ("Telegram",
-                 "Telegram requiere que TÚ envíes el primer mensaje al bot "
-                 "(es una regla de Telegram). Pulsa «Vincular nuevo chat» y "
-                 "sigue los pasos: el sistema te dará un código, lo envías al "
-                 "bot, y automáticamente quedará vinculado. Puedes tener varios "
-                 "chats (PC, móvil, grupo familiar...)."),
+                ("Primero: activa la IA",
+                 "Las notificaciones se generan a partir de lo que detecta la "
+                 "IA (personas, vehículos…). Si la IA no está activa en ninguna "
+                 "cámara, no puedes crear preferencias. Actívala en «En vivo» → "
+                 "panel de la cámara → «Activar IA». Las alertas serán de esa "
+                 "cámara."),
+                ("Escritorio vs. móvil",
+                 "En el ESCRITORIO las alertas se ven aquí mismo, en la app "
+                 "(canal «Ver en la app»). Para recibirlas en TELEGRAM o en el "
+                 "MÓVIL, hazlo desde la app móvil: allí vinculas tu Telegram y "
+                 "eliges esos canales. (El push por Firebase fue eliminado; el "
+                 "móvil recibe por la red local, sin internet.)"),
+                ("Telegram (lo configura el admin una vez)",
+                 "El administrador define el bot en «Configurar bot». Luego, "
+                 "desde la app móvil, cada usuario vincula su Telegram enviando "
+                 "el código de 6 caracteres al bot. La tabla «Dispositivos "
+                 "Telegram» (menú lateral, admin) muestra quién está vinculado."),
                 ("Preferencias",
-                 "Cada preferencia es una regla: «qué evento + qué cámara + "
-                 "qué canales + qué horario + qué días». Puedes tener varias. "
-                 "Ejemplo: «Persona en cámara puerta, por Telegram, 24/7» y "
-                 "«Movimiento en cámara jardín, por push, sólo 22:00-07:00»."),
+                 "Cada preferencia es una regla: «qué evento + qué cámara + qué "
+                 "horario + qué días». Puedes tener varias. Sin preferencias no "
+                 "recibes avisos (las cámaras siguen grabando igual)."),
                 ("Horario y días",
-                 "Si no marcas horario, recibes 24 horas. Si marcas días, sólo "
-                 "esos días se aplica. Útil para no recibir alertas mientras "
-                 "trabajas en casa (las cámaras siguen grabando, sólo silencias "
-                 "el aviso)."),
+                 "Si no marcas horario, recibes 24 horas. Si marcas días, solo "
+                 "esos días aplica. Útil para silenciar avisos cuando estás en "
+                 "casa (las cámaras siguen grabando)."),
             ],
             parent=self,
         )

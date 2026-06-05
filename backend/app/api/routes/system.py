@@ -129,6 +129,13 @@ def update_config():
                 else:
                     session.add(SystemConfig(key=key, value=str(value)))
             session.commit()
+
+        # Aplicar EN CALIENTE los overrides de almacenamiento (cuota/ruta) para
+        # que el cambio tenga efecto sin reiniciar el backend.
+        if any(k in data for k in ("max_storage_gb", "recordings_path")):
+            from ...config import settings as _settings
+            _settings.reload_storage_from_db()
+
         return jsonify({"success": True, "message": "Configuración actualizada"})
     except Exception as e:
         logger.error(f"Error al actualizar configuración: {e}")

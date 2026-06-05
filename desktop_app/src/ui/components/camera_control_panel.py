@@ -116,6 +116,11 @@ class AudioControlWidget(GlassCard):
 
     talk_started = Signal()
     talk_ended = Signal()
+    # Escucha CLIENT-SIDE: el audio de la cámara se reproduce desmuteando el
+    # player VLC del directo (por los auriculares del usuario, esté donde esté
+    # el servidor). La vista conecta estas señales al RtspVideoWidget.
+    listen_changed = Signal(bool)
+    volume_changed = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent, border_radius=8)
@@ -222,10 +227,15 @@ class AudioControlWidget(GlassCard):
 
     def set_camera(self, camera_id: int):
         self.camera_id = camera_id
-        # Cargar mics solo una vez (es lento: ffmpeg list_devices)
-        if not self._mics_loaded:
-            self._mics_loaded = True
-            self._load_mics()
+        # Al cambiar de cámara, dejar la escucha en OFF (silencio) para no
+        # reproducir audio de golpe de la nueva cámara.
+        if self.btn_listen.isChecked():
+            self.btn_listen.setChecked(False)  # dispara _toggle_listen(False)
+        # Refrescar la lista de micrófonos cada vez que se abre el panel, para
+        # detectar dispositivos conectados después de arrancar (p.ej. un headset).
+        # Es asíncrono (api_client.get), no bloquea la UI.
+        self._mics_loaded = True
+        self._load_mics()
 
     def _load_mics(self):
         """Carga la lista de micrófonos disponibles desde el backend."""
@@ -277,7 +287,16 @@ class AudioControlWidget(GlassCard):
         api_client.post(f"cameras/{self.camera_id}/audio/stop", on_response)
 
     def _toggle_listen(self, checked: bool):
-        """Activa/desactiva la reproducción del audio de la cámara en el host."""
+        """
+        Escucha el audio de la cámara reproduciéndolo en el SERVIDOR (ffplay).
+
+        Por qué server-side y no en el cliente: go2rtc reexpone los lentes como
+        streams SOLO-vídeo (transcodifica `#video=h264`), así que el directo del
+        cliente NO tiene pista de audio que desmutear. El audio de la cámara sí
+        está disponible en su RTSP, y el backend lo reproduce con ffplay. En la
+        instalación típica (servidor y operador en el MISMO PC) el audio sale por
+        los altavoces/auriculares del operador.
+        """
         if not self.camera_id:
             self.btn_listen.setChecked(False)
             return
@@ -293,12 +312,11 @@ class AudioControlWidget(GlassCard):
                         f"color: {config.THEME_ACCENT}; font-weight: bold;"
                     )
                 else:
-                    err = response.error or "Error"
                     self.btn_listen.setChecked(False)
                     self.btn_listen.setText("Escuchar cámara")
-                    self.lbl_status.setText(f"Listen falló: {err[:60]}")
+                    err = response.error or "Error"
+                    self.lbl_status.setText(f"No se pudo escuchar: {err[:50]}")
                     self.lbl_status.setStyleSheet(f"color: {config.THEME_DANGER};")
-                    QMessageBox.warning(self, "Escuchar", f"No se pudo iniciar:\n{err[:300]}")
 
             api_client.post(f"cameras/{self.camera_id}/audio/listen/start", on_started)
         else:
@@ -310,9 +328,10 @@ class AudioControlWidget(GlassCard):
                 self.lbl_status.setStyleSheet(f"color: {config.THEME_TEXT_MUTED};")
 
             api_client.post(f"cameras/{self.camera_id}/audio/listen/stop", on_stopped)
-    
+
     def _set_volume(self, value):
-        # Aquí se ajustaría el volumen del stream de audio entrante
+        """El volumen de la escucha server-side lo controla el sistema operativo
+        (ffplay). Mantenemos el slider por familiaridad pero no actúa sobre él."""
         pass
 
 

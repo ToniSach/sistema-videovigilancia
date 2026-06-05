@@ -24,7 +24,6 @@ from PySide6.QtGui import (
 )
 
 from desktop_app.src.models.camera import Camera
-from desktop_app.src.services.video_streamer import video_streamer, Frame
 from desktop_app.src.ui.icons import icon
 
 logger = logging.getLogger(__name__)
@@ -54,22 +53,11 @@ class CameraWidget(QFrame):
         self.camera_name = camera_name
         self.stream_type = stream_type  # "main" | "l1" | "l2"
         self.stream_url = stream_url or ""
-        # Modo RTSP/go2rtc (OPT-IN). Si hay stream_url Y USE_GO2RTC_LIVE=true,
-        # el directo se reproduce con VLC (baja latencia, una sola conexión a
-        # la cámara) en vez de MJPEG. Si no, comportamiento clásico intacto.
-        from desktop_app.src.config import config as _cfg
-        self._use_rtsp = bool(self.stream_url) and getattr(_cfg, "USE_GO2RTC_LIVE", False)
+        # El directo se reproduce SIEMPRE con go2rtc + VLC (RTSP de baja
+        # latencia, una sola conexión a la cámara). MJPEG fue eliminado.
         self._vlc = None
+        self._rtsp_started = False
         self.is_maximized = False
-        self._signal_connected = False
-        # PULL-BASED rendering (modo MJPEG): un QTimer cada 67ms pregunta al
-        # thread por el último frame decodificado. En modo RTSP NO se usa.
-        self._last_pixmap_seq = -1
-        self._pull_timer = QTimer(self)
-        self._pull_timer.setInterval(67)  # ~15 fps
-        self._pull_timer.timeout.connect(self._pull_latest_frame)
-        if not self._use_rtsp:
-            self._pull_timer.start()
 
         self.setMinimumSize(280, 200)
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
@@ -164,22 +152,37 @@ class CameraWidget(QFrame):
         if hasattr(self, "lbl_rec"):
             self.lbl_rec.setVisible(bool(on))
 
-        # Ya no nos conectamos al signal global frame_updated — usamos
-        # polling con _pull_timer. Esto evita la acumulación de signals.
-        # Mantenemos la conexión para errores (camera_error) por compat.
-        self._signal_connected = False
-
-        # Modo RTSP: arrancar VLC tras tener winId nativo (QTimer 0ms).
-        if self._use_rtsp:
-            self.lbl_video.setText("Conectando (RTSP)…")
-            QTimer.singleShot(0, self._start_rtsp)
+    def start_live(self):
+        """
+        Arranca el directo (go2rtc + VLC) una sola vez. Si la cámara no tiene
+        stream_url (go2rtc aún no publicó su feed), muestra un aviso claro en
+        lugar de quedarse en "Esperando video..." indefinidamente.
+        """
+        if self._rtsp_started:
+            return
+        if not self.stream_url:
+            self.lbl_video.setText("Sin stream disponible\n(go2rtc no configurado)")
+            self.lbl_status.setStyleSheet("color: #f59e0b;")
+            return
+        self._rtsp_started = True
+        self.lbl_video.setText("Conectando…")
+        # Arrancar VLC tras tener winId nativo (QTimer 0ms).
+        QTimer.singleShot(0, self._start_rtsp)
 
     def _start_rtsp(self):
         """
         Reproduce el restream RTSP de go2rtc con VLC, tuneado a LATENCIA MÍNIMA
         para directo (no VOD). VLC pinta directamente sobre el HWND/xwindow del
-        QLabel de vídeo, así que no pasa por el pipeline MJPEG/pixmaps.
+        QLabel de vídeo.
         """
+        # El widget puede haber sido destruido entre el QTimer diferido y aquí
+        # (cambio de página/calidad rápido) → su QLabel C++ ya no existe.
+        try:
+            import shiboken6
+            if not shiboken6.isValid(self.lbl_video):
+                return
+        except Exception:
+            pass
         try:
             from desktop_app.src.services.playback_service import VLCPlayer
             import os as _os
@@ -203,9 +206,15 @@ class CameraWidget(QFrame):
             # instante (cuando el vídeo ya tiene tamaño) y en cada resize.
             QTimer.singleShot(300, self._apply_fill)
             self.lbl_status.setStyleSheet("color: #22c55e;")
+        except RuntimeError:
+            # QLabel/objeto C++ borrado a mitad → abortar silenciosamente.
+            return
         except Exception as e:
             logger.error(f"No se pudo iniciar RTSP live cam {self.camera_id}: {e}")
-            self.lbl_video.setText("Error RTSP")
+            try:
+                self.lbl_video.setText("Error RTSP")
+            except Exception:
+                pass
 
     def _apply_fill(self):
         """
@@ -216,6 +225,15 @@ class CameraWidget(QFrame):
         try:
             if self._vlc is None:
                 return
+            # NO tocar el player mientras hay un swap (stop+play) en curso: el
+            # método bloquearía esperando el mutex interno y congelaría la UI
+            # ("No responde") al cambiar de calidad. Reintentar luego.
+            if self._vlc.is_swapping():
+                QTimer.singleShot(400, self._apply_fill)
+                return
+            import shiboken6
+            if not shiboken6.isValid(self.lbl_video):
+                return
             w = max(1, self.lbl_video.width())
             h = max(1, self.lbl_video.height())
             self._vlc.player.video_set_aspect_ratio(f"{w}:{h}".encode("ascii"))
@@ -224,7 +242,7 @@ class CameraWidget(QFrame):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if getattr(self, "_use_rtsp", False):
+        if self._vlc is not None:
             self._apply_fill()
 
     def hideEvent(self, event):
@@ -246,7 +264,7 @@ class CameraWidget(QFrame):
         destruir/crear VLC). Reutiliza la misma ventana: VLC hace stop+play.
         Usado por el selector de calidad.
         """
-        if not getattr(self, "_use_rtsp", False) or not url or self._vlc is None:
+        if self._vlc is None or not url:
             return
         if url == self.stream_url:
             return
@@ -285,123 +303,29 @@ class CameraWidget(QFrame):
         except Exception:
             pass
 
-    def closeEvent(self, event):
-        self.stop_video()
-        super().closeEvent(event)
-
-    def _pull_latest_frame(self):
-        if self._use_rtsp:
-            return  # en modo RTSP VLC pinta solo; no hay pull de pixmaps
-        """
-        Polling 15fps que pregunta al MJPEGThread por el último pixmap.
-        Si hay uno nuevo lo pinta. Si no, no hace nada.
-
-        Como solo procesamos el ÚLTIMO frame disponible (descartando los
-        intermedios automáticamente), nunca hay backlog acumulado aunque
-        el widget esté oculto durante minutos.
-        """
+    def is_live(self) -> bool:
+        """True si VLC está reproduciendo el directo en este momento."""
         try:
-            pixmap, seq, age_ms = video_streamer.pop_latest_pixmap(
-                self.camera_id, self.stream_type, self._last_pixmap_seq
-            )
-            if pixmap is None or seq == self._last_pixmap_seq:
-                return
-            self._last_pixmap_seq = seq
-
-            w = self.lbl_video.width()
-            h = self.lbl_video.height()
-            if w <= 0 or h <= 0:
-                return
-
-            scaled = pixmap.scaled(
-                w, h,
-                Qt.KeepAspectRatio,
-                Qt.FastTransformation
-            )
-            if scaled.isNull():
-                return
-
-            self.lbl_video.setPixmap(scaled)
-            self.lbl_status.setStyleSheet("color: #22c55e;")
-        except Exception as e:
-            logger.error(f"Error pull frame: {e}")
-
-    @Slot(Frame)
-    def _on_frame(self, frame: Frame):
-        """
-        [LEGACY] Mantenido por compatibilidad. Ya NO se conecta a la signal
-        global frame_updated (usamos pull-based via _pull_latest_frame).
-
-        COALESCING POR TIMESTAMP: si el frame que llega ya tiene >250ms de
-        antigüedad significa que la queue de signals de Qt acumuló backlog
-        (típicamente porque este widget estuvo oculto un rato y las signals
-        se quedaron en cola). Lo descartamos: no tiene sentido pintar un
-        frame de hace 10 segundos cuando ya hay frames más nuevos detrás.
-
-        Esto eliminó el bug "al volver a ver la cámara lleva N segundos de
-        retraso y luego se recupera": antes Qt procesaba TODAS las signals
-        acumuladas en orden; ahora descarta las viejas instantáneamente.
-        """
-        if frame.camera_id != self.camera_id:
-            return
-        if getattr(frame, "stream_type", "main") != self.stream_type:
-            return
-
-        import time as _time
-        try:
-            frame_ts = float(frame.timestamp)
+            if self._vlc is None:
+                return False
+            # Durante un swap (stop+play) NO consultar is_playing(): bloquearía
+            # el hilo UI esperando el mutex del player. Asumir "vivo".
+            if self._vlc.is_swapping():
+                return True
+            return bool(self._vlc.player.is_playing())
         except Exception:
-            frame_ts = 0.0
-        if frame_ts > 0 and (_time.time() - frame_ts) > 0.25:
-            # Frame con backlog → descartar y dejar pasar los más nuevos
-            return
-
-        try:
-            w = self.lbl_video.width()
-            h = self.lbl_video.height()
-            if w <= 0 or h <= 0:
-                return
-
-            # FastTransformation: ~5x más rápido que SmoothTransformation,
-            # imperceptible en stream a 15fps.
-            scaled = frame.pixmap.scaled(
-                w, h,
-                Qt.KeepAspectRatio,
-                Qt.FastTransformation
-            )
-
-            if scaled.isNull():
-                return
-
-            self.lbl_video.setPixmap(scaled)
-            self.lbl_status.setStyleSheet("color: #22c55e;")
-
-        except Exception as e:
-            logger.error(f"Error mostrando frame: {e}")
-
-    def disconnect_signals(self):
-        """Desconecta señales de forma segura e idempotente."""
-        if not self._signal_connected:
-            return
-        try:
-            video_streamer.frame_updated.disconnect(self._on_frame)
-        except (TypeError, RuntimeError):
-            pass
-        self._signal_connected = False
+            return False
 
     def release_resources(self):
         """
-        Libera pixmap y desconecta signals ANTES de deleteLater().
-        Sin esto, los QPixmap quedaban en memoria GPU aunque el widget
-        se destruyera (memory creep tras cambios frecuentes de layout).
+        Detiene VLC y libera el pixmap ANTES de deleteLater(). Sin esto, VLC
+        podía seguir pintando sobre una ventana liberada (crash nativo) y los
+        QPixmap quedaban en memoria GPU (memory creep al recrear layouts).
         """
-        # Detener el pull timer
         try:
-            if hasattr(self, "_pull_timer") and self._pull_timer.isActive():
-                self._pull_timer.stop()
+            self.stop_video()
         except Exception:
             pass
-        self.disconnect_signals()
         self.lbl_video.setPixmap(QPixmap())  # libera el pixmap anterior
 
     def set_offline(self):
@@ -447,9 +371,6 @@ class LiveView(QWidget):
     ptz_requested = Signal(Camera)
     camera_config_requested = Signal(int)
 
-    # Marshalling al thread principal (camera_id, token, stream_type)
-    _start_stream_signal = Signal(int, str, str)
-
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -470,12 +391,13 @@ class LiveView(QWidget):
         self._current_page = 0
         self._restart_timer: Optional[QTimer] = None
         # Calidad del directo: "auto" | "high" | "medium" | "low".
-        # "auto" se resuelve UNA vez por nº de núcleos (sin monitoreo continuo).
-        self._quality = "auto"
+        # Por defecto "medium" (480p): aligera CPU/red en cámaras dual-lens con
+        # IA activa (evita transcodes/decodes a resolución plena). El usuario
+        # puede subir a Alta/Auto desde el selector.
+        self._quality = "medium"
 
         self._setup_ui()
         self._setup_shortcuts()
-        self._start_stream_signal.connect(self._do_start_stream)
 
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._check_cameras_status)
@@ -552,7 +474,7 @@ class LiveView(QWidget):
             ("Auto", "auto"), ("Alta", "high"), ("Media", "medium"), ("Baja", "low"),
         ]:
             self.cmb_quality.addItem(text, val)
-        self.cmb_quality.setCurrentIndex(0)
+        self.cmb_quality.setCurrentIndex(2)  # "Media" por defecto (aligera)
         self.cmb_quality.setToolTip(
             "Alta = sin recodificar (más calidad). Media/Baja = transcode "
             "(menos red/CPU del cliente). Auto = según los núcleos del equipo."
@@ -677,7 +599,6 @@ class LiveView(QWidget):
         stale = [k for k in self._widget_cache.keys() if k not in new_keys]
         for key in stale:
             widget = self._widget_cache.pop(key)
-            video_streamer.stop_stream(key[0], key[1])
             widget.release_resources()
             widget.hide()
             widget.setParent(None)
@@ -703,7 +624,6 @@ class LiveView(QWidget):
         # Forzar reinicio total: destruir todo el cache para que se vuelvan
         # a crear los streams con el token nuevo.
         self._destroy_all_widgets()
-        video_streamer.stop_all()
 
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
@@ -780,21 +700,14 @@ class LiveView(QWidget):
                 widget.config_requested.connect(self._on_config_request)
                 self._widget_cache[key] = widget
 
-                # En modo RTSP (go2rtc) el widget arranca VLC solo; NO registramos
-                # cliente MJPEG. En modo MJPEG, arrancamos el stream escalonado.
-                if not widget._use_rtsp:
-                    QTimer.singleShot(
-                        i * 200,
-                        lambda c=cam_id, t=self._current_api_token, s=stream_type:
-                            self._start_stream(c, t, s)
-                    )
+                # Arranque escalonado del directo (go2rtc + VLC). El escalonado
+                # evita que N conexiones RTSP golpeen las cámaras a la vez.
+                QTimer.singleShot(i * 200, widget.start_live)
             else:
                 # Reutilizado del cache: actualizar label por si cambió el name
                 widget.lbl_name.setText(label)
-                # Asegurar que el stream esté vivo. Si no lo está (porque la
-                # app se quedó sin conexión o fue logout previo), reiniciarlo.
-                if not video_streamer.is_streaming(cam_id, stream_type):
-                    self._start_stream(cam_id, self._current_api_token, stream_type)
+                # Asegurar que el directo esté vivo (idempotente).
+                widget.start_live()
 
             row = i // cols
             col = i % cols
@@ -912,27 +825,6 @@ class LiveView(QWidget):
             widget.set_live_url(self._pick_stream_url(cam, stream_type, q))
 
     # ------------------------------------------------------------------
-    # Streams
-    # ------------------------------------------------------------------
-    def _start_stream(self, camera_id: int, api_token: str,
-                      stream_type: str = "main"):
-        if QThread.currentThread() != self.thread():
-            self._start_stream_signal.emit(camera_id, api_token, stream_type)
-            return
-        self._do_start_stream(camera_id, api_token, stream_type)
-
-    @Slot(int, str, str)
-    def _do_start_stream(self, camera_id: int, api_token: str,
-                         stream_type: str = "main"):
-        from desktop_app.src.config import config
-        video_streamer.set_base_url(config.API_BASE_URL)
-        video_streamer.start_stream(camera_id, api_token, stream_type=stream_type)
-        # Marcar widget como "esperando frame" si está visible
-        widget = self.cameras.get((camera_id, stream_type))
-        if widget:
-            widget.set_online_pending()
-
-    # ------------------------------------------------------------------
     # Click handlers
     # ------------------------------------------------------------------
     def _on_camera_click(self, camera_id: int):
@@ -998,7 +890,7 @@ class LiveView(QWidget):
                 ok = True  # VLC escribe el archivo de forma asíncrona
             except Exception as e:
                 logger.error(f"snapshot VLC cam {camera_id}: {e}")
-        # Modo MJPEG (pixmap): guardar el frame actual.
+        # Fallback: si por lo que sea hay un pixmap pintado, guardarlo.
         elif widget.lbl_video.pixmap() and not widget.lbl_video.pixmap().isNull():
             ok = widget.lbl_video.pixmap().save(full_path)
 
@@ -1024,9 +916,12 @@ class LiveView(QWidget):
     # Status
     # ------------------------------------------------------------------
     def _check_cameras_status(self):
+        # El directo lo gestiona VLC; si dejó de reproducir (RTSP caído,
+        # reconexión) lo marcamos en ámbar. Sólo aplica a widgets que ya
+        # intentaron arrancar y tienen stream_url.
         for (cam_id, stream_type), widget in self.cameras.items():
-            if not video_streamer.is_streaming(cam_id, stream_type):
-                widget.set_offline()
+            if widget._rtsp_started and widget.stream_url and not widget.is_live():
+                widget.set_online_pending()
 
     def _refresh_recording_badges(self):
         """Consulta qué cámaras están grabando para mostrar el ●REC."""
@@ -1112,7 +1007,6 @@ class LiveView(QWidget):
 
     def closeEvent(self, event):
         self._destroy_all_widgets()
-        video_streamer.stop_all()
         if self._status_timer.isActive():
             self._status_timer.stop()
         super().closeEvent(event)

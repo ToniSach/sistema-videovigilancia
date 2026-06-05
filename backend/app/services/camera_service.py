@@ -190,7 +190,7 @@ class CameraService:
 
         # Iniciar si está activa
         if created_camera.is_active:
-            self._camera_manager.start_camera(created_camera)  # register_mjpeg=True por defecto
+            self._camera_manager.start_camera(created_camera)
         else:
             # Alta inactiva: aun así intentamos poner la hora correcta en la
             # cámara (best-effort, en segundo plano). Si está activa, esto ya
@@ -246,8 +246,6 @@ class CameraService:
 
         if restart_needed:
             self._camera_manager.restart_camera(camera_id)
-            # ✅ CORREGIDO: No llamamos start_mjpeg_for_camera aquí
-            # porque restart_camera ya llama a start_camera con register_mjpeg=True
 
         return self.get_camera(camera_id)
 
@@ -330,7 +328,6 @@ class CameraService:
         updated = self._camera_repo.update(camera)
 
         if active:
-            # CRÍTICO: El registro MJPEG es automático en CameraManager
             self._camera_manager.start_camera(updated)
         else:
             self._camera_manager.stop_camera(camera_id)
@@ -520,8 +517,12 @@ class CameraService:
             raise ValueError("Cámara no encontrada")
         from backend.app.cameras.audio_controller import audio_manager
         ctrl = audio_manager.get(camera)
-        if not ctrl.is_supported():
-            raise RuntimeError("Audio no disponible en esta cámara")
+        # OJO: hablar NO depende del micro de la cámara (is_supported), sino de
+        # poder alcanzarla por ONVIF (is_talk_supported, best-effort).
+        if not ctrl.is_talk_supported():
+            raise RuntimeError(
+                "No se puede contactar la cámara por ONVIF para hablar"
+            )
         mic = (data or {}).get("mic_device")
         ok = ctrl.start_talk(mic_device=mic)
         if not ok:
@@ -545,21 +546,41 @@ class CameraService:
         ctrl = audio_manager.get(camera)
         return {
             "camera_id": camera_id,
-            "supported": ctrl.is_supported(),
+            "supported": ctrl.is_supported(),          # micro (escuchar)
+            "talk_supported": ctrl.is_talk_supported(),  # hablar (best-effort)
             "active": ctrl.is_active(),
             "listening": ctrl.is_listening(),
         }
 
     def audio_listen_start(self, camera_id: int) -> dict:
-        """Reproduce el audio de la cámara en los altavoces locales del servidor."""
+        """
+        Reproduce el audio de la cámara en los altavoces del servidor (ffplay).
+
+        Usa el RESTREAM de go2rtc (rtsp://127.0.0.1:8554/cam_X) en vez de la RTSP
+        directa: así NO abre una 2ª conexión a la cámara (las XiongMai solo
+        aceptan 1) y reaprovecha el audio que go2rtc ya recibe. Si go2rtc está
+        desactivado, cae a la RTSP directa de la cámara.
+        """
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
             raise ValueError("Cámara no encontrada")
-        if not camera.rtsp_url:
+
+        listen_url = None
+        try:
+            from backend.app.config import settings as _s
+            if getattr(_s, "GO2RTC_ENABLED", False):
+                from backend.app.streaming.go2rtc_manager import Go2RtcManager
+                listen_url = Go2RtcManager().rtsp_restream_url(camera_id)
+        except Exception:
+            listen_url = None
+        if not listen_url:
+            listen_url = camera.rtsp_url
+        if not listen_url:
             raise ValueError("La cámara no tiene RTSP configurada")
+
         from backend.app.cameras.audio_controller import audio_manager
         ctrl = audio_manager.get(camera)
-        ok = ctrl.start_listen(camera.rtsp_url)
+        ok = ctrl.start_listen(listen_url)
         if not ok:
             raise RuntimeError("No se pudo iniciar listen (¿ffplay en PATH? ¿stream tiene audio?)")
         return {"camera_id": camera_id, "listening": True}

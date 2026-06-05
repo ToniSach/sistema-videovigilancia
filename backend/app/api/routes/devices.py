@@ -33,7 +33,6 @@ device_service = DeviceService()
 # ---- Validadores -----------------------------------------------------------
 
 _DEVICE_NAME_RE = re.compile(r"^[\w\s\-\._]{1,100}$", re.UNICODE)
-_FCM_TOKEN_MAX = 512
 
 
 def _validate_device_uuid(raw: str) -> str | None:
@@ -44,18 +43,6 @@ def _validate_device_uuid(raw: str) -> str | None:
         return str(_uuid.UUID(raw))
     except (ValueError, AttributeError):
         return None
-
-
-def _validate_fcm_token(raw) -> str | None:
-    """FCM tokens son strings de hasta ~200 chars (Apple/Google). Aceptamos opcional."""
-    if raw is None or raw == "":
-        return ""  # FCM opcional: el móvil puede no tener push
-    if not isinstance(raw, str) or len(raw) > _FCM_TOKEN_MAX:
-        return None
-    # FCM tokens son alfanuméricos + : _ - .
-    if not re.match(r"^[A-Za-z0-9:_\-\.\/]+$", raw):
-        return None
-    return raw
 
 
 def _validate_device_name(raw) -> str:
@@ -102,8 +89,7 @@ def register_device():
         "link_token": "<uuid generado por desktop>",
         "device_uuid": "<uuid único del móvil>",
         "device_name": "Mi iPhone",
-        "platform": "android" | "ios",
-        "fcm_token": "<opcional, para push>"
+        "platform": "android" | "ios"
       }
     """
     try:
@@ -117,13 +103,6 @@ def register_device():
             return jsonify({
                 "success": False,
                 "error": "device_uuid inválido (debe ser UUID válido)"
-            }), 400
-
-        fcm_token = _validate_fcm_token(data.get("fcm_token", ""))
-        if fcm_token is None:
-            return jsonify({
-                "success": False,
-                "error": f"fcm_token inválido (max {_FCM_TOKEN_MAX} chars, alfanumérico)"
             }), 400
 
         device_name = _validate_device_name(data.get("device_name"))
@@ -148,7 +127,6 @@ def register_device():
             device_uuid=device_uuid,
             device_name=device_name,
             platform=platform,
-            fcm_token=fcm_token,
         )
 
         # Obtener role del usuario para meterlo en el JWT

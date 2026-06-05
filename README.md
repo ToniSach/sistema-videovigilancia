@@ -53,9 +53,11 @@ sistema-videovigilancia/
    ```
 4. Configurar variables de entorno:
    ```bash
-   cp .env.example .env
+   cp .env-example .env       # Linux/Mac
+   copy .env-example .env     # Windows
    # Editar .env con tus valores (claves JWT, token de Telegram, etc.)
    ```
+   (Si no creas `.env`, el sistema usa `.env-example` con valores por defecto.)
 
 ## Uso
 

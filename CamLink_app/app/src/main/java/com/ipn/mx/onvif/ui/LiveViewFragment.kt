@@ -90,7 +90,8 @@ class LiveViewFragment : BaseMenuFragment() {
     // Selector de calidad (HLS): high = nativo, medium = 480p, low = 360p.
     private val qualities = listOf("high", "medium", "low")
     private val qualityLabels = mapOf("high" to "Alta", "medium" to "Media", "low" to "Baja")
-    private var qualityIndex = 0
+    // Arranca en "Media" (índice 1) para aligerar CPU/red, igual que el escritorio.
+    private var qualityIndex = 1
     private val currentQuality get() = qualities[qualityIndex]
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────

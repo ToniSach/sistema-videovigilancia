@@ -24,7 +24,6 @@ from desktop_app.src.config import config
 from desktop_app.src.ui.icons import icon
 from desktop_app.src.models.user import User
 from desktop_app.src.services.api_client import api_client
-from desktop_app.src.services.video_streamer import video_streamer
 
 from desktop_app.src.ui.views.login_view import LoginView
 from desktop_app.src.ui.views.live_view import LiveView
@@ -35,6 +34,7 @@ from desktop_app.src.ui.views.events_view import EventsView
 from desktop_app.src.ui.views.users_view import UsersView
 from desktop_app.src.ui.views.permissions_view import PermissionsView
 from desktop_app.src.ui.views.notifications_view import NotificationPreferencesView
+from desktop_app.src.ui.views.telegram_devices_view import TelegramDevicesView
 from desktop_app.src.ui.views.system_view import SystemHealthView
 
 try:
@@ -61,6 +61,7 @@ VIEW_USERS = 7
 VIEW_PERMISSIONS = 8
 VIEW_SETTINGS = 9
 VIEW_DASHBOARD = 10  # pantalla de inicio (se añade al final del stack)
+VIEW_TELEGRAM_DEVICES = 11  # tabla de dispositivos Telegram (solo admin)
 
 
 class MainWindow(QMainWindow):
@@ -171,6 +172,11 @@ class MainWindow(QMainWindow):
         self.dashboard_view.open_cameras.connect(lambda: self._switch_view(VIEW_CAMERAS))
         self.content_stack.addWidget(self.dashboard_view)        # 10
 
+        # Dispositivos Telegram (índice 11, solo admin). Se refresca solo en su
+        # showEvent al navegar a ella.
+        self.telegram_devices_view = TelegramDevicesView()
+        self.content_stack.addWidget(self.telegram_devices_view)  # 11
+
         layout.addWidget(self.content_stack, stretch=1)
         return widget
 
@@ -215,6 +221,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lbl_section_admin)
         self._add_nav(layout, "Usuarios", VIEW_USERS, admin_only=True, icon_name="users")
         self._add_nav(layout, "Permisos", VIEW_PERMISSIONS, admin_only=True, icon_name="permissions")
+        self._add_nav(layout, "Dispositivos Telegram", VIEW_TELEGRAM_DEVICES,
+                      admin_only=True, icon_name="telegram")
         if SETTINGS_AVAILABLE:
             self._add_nav(layout, "Ajustes", VIEW_SETTINGS, admin_only=True, icon_name="settings")
 
@@ -443,12 +451,8 @@ class MainWindow(QMainWindow):
         if ans != QMessageBox.Yes:
             return
 
-        # Detener streams MJPEG en curso (cierra sockets, libera threads)
-        video_streamer.stop_all()
-
-        # Destruir widgets del live view: libera QPixmaps en GPU y desconecta
-        # signals que apuntaban a video_streamer. Sin esto, hacer logout/login
-        # repetidos causaba GPU memory creep.
+        # Destruir widgets del live view: detiene VLC y libera QPixmaps en GPU.
+        # Sin esto, hacer logout/login repetidos causaba GPU memory creep.
         try:
             self.live_view._destroy_all_widgets()
         except Exception as e:
@@ -493,17 +497,16 @@ class MainWindow(QMainWindow):
     # Navegación
     # ------------------------------------------------------------------
     def _switch_view(self, index: int):
-        # Detener streams si vamos a una vista que no usa video.
-        # VIEW_LIVE y VIEW_CONTROL ambos usan video — no detener entre ellos.
-        if index not in (VIEW_LIVE, VIEW_CONTROL):
-            video_streamer.stop_all()
+        # El directo lo gestiona cada vista con VLC (go2rtc). Al salir del live
+        # view, su hideEvent mantiene los players en cache (go2rtc multiplexa
+        # una sola conexión a la cámara, así que no penaliza). No hace falta
+        # detener nada globalmente aquí.
 
         # Si vamos a LIVE, reiniciar grid de streams.
         # (CameraControlView gestiona su propio stream en su showEvent.)
         if index == VIEW_LIVE:
             token = api_client.get_stream_token() or ""
             self.live_view.restart_streams(token)
-            video_streamer.set_base_url(config.API_BASE_URL)
 
         # Actualizar checked en sidebar (solo botones que existen en sidebar)
         for view_idx, btn in self._nav_buttons.items():
@@ -534,16 +537,14 @@ class MainWindow(QMainWindow):
         # Cambiar a esa vista
         self._switch_view(VIEW_CONTROL)
 
-    def _on_jump_to_playback(self, camera_id: int, _timestamp):
-        """Doble-click en evento → cambiar a playback en esa cámara."""
-        # Cambiar a la pestaña de playback
+    def _on_jump_to_playback(self, camera_id: int, timestamp):
+        """Doble-click/«ver en playback» en un evento → abre playback en esa
+        cámara, carga el día del evento y salta al segundo exacto del evento."""
         self._switch_view(VIEW_PLAYBACK)
-        # Seleccionar la cámara y cargar timeline
-        for i in range(self.playback_view.cmb_camera.count()):
-            if self.playback_view.cmb_camera.itemData(i) == camera_id:
-                self.playback_view.cmb_camera.setCurrentIndex(i)
-                QTimer.singleShot(200, self.playback_view._load_timeline)
-                break
+        # Deferir un poco para que la vista esté visible antes de cargar/seek.
+        QTimer.singleShot(
+            200, lambda: self.playback_view.jump_to_time(camera_id, timestamp)
+        )
 
     def _on_api_error(self, error: str):
         self.statusbar.showMessage(f"Error: {error}", 5000)

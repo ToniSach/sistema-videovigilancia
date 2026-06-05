@@ -33,7 +33,6 @@ data class DeviceRegisterRequest(
     @SerializedName("device_uuid") val deviceUuid: String,
     @SerializedName("device_name") val deviceName: String,
     val platform: String = "android",
-    @SerializedName("fcm_token")   val fcmToken: String? = null,
 )
 
 data class DeviceRegisterUser(
@@ -88,6 +87,22 @@ data class NotificationsHistoryResponse(
     val pagination: NotificationsHistoryPagination? = null,
 )
 
+// ── Estado de la IA ───────────────────────────────────────────────────────────
+// Las notificaciones SOLO existen para la cámara con IA activa. La app consulta
+// esto para gatear la personalización de notificaciones.
+data class AiActiveCamera(
+    @SerializedName("camera_id") val cameraId: Int? = null,
+    val lens: String? = null,
+)
+data class AiStatusData(
+    val active: List<AiActiveCamera> = emptyList(),
+    @SerializedName("active_count") val activeCount: Int = 0,
+)
+data class AiStatusResponse(
+    val success: Boolean = false,
+    val data: AiStatusData? = null,
+)
+
 // ── Preferencias de notificación (CRUD) ──────────────────────────────────────
 
 data class NotificationPreferenceDto(
@@ -95,7 +110,7 @@ data class NotificationPreferenceDto(
     @SerializedName("event_type") val eventType: String,
     @SerializedName("camera_id")  val cameraId: Int? = null,
     val enabled: Boolean = true,
-    val channels: List<String> = emptyList(),     // "push" | "telegram"
+    val channels: List<String> = emptyList(),     // "app" | "telegram"
     val days: List<Int> = emptyList(),            // 0..6 (0=domingo)
     @SerializedName("schedule_start") val scheduleStart: String? = null,  // "HH:MM"
     @SerializedName("schedule_end")   val scheduleEnd: String? = null,    // "HH:MM"

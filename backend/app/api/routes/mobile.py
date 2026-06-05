@@ -74,14 +74,11 @@ def get_dashboard():
             worker = camera_manager.get_worker(cam_id)
             metrics = metrics_collector.get_camera_metrics(cam_id)
             
-            # FIX F2.2: Preparar URLs de streaming según tipo de dispositivo
+            # El directo se sirve por go2rtc (HLS/WebRTC). Aquí devolvemos el
+            # endpoint HLS como referencia; el cliente usa la stream_url real
+            # que entrega /cameras. (MJPEG eliminado.)
             is_mobile = is_mobile_request()
-            
-            if is_mobile:
-                # Para móvil: intentar HLS primero, fallback a MJPEG token
-                stream_url = f"/api/v1/cameras/{cam_id}/stream.m3u8"  # HLS endpoint
-            else:
-                stream_url = f"/api/v1/cameras/{cam_id}/stream?token={request.headers.get('Authorization', '').replace('Bearer ', '')}"
+            stream_url = f"/api/v1/cameras/{cam_id}/stream.m3u8"  # HLS
             
             cameras_data.append({
                 "id": cam_id,

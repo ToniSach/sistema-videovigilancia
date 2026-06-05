@@ -236,25 +236,28 @@ class Recording(Base):
             "end_time": self.end_time.isoformat() if self.end_time else None,
             "file_path": self.file_path,
             "file_size_bytes": self.file_size_bytes,
-            "duration_seconds": self.duration_seconds
+            # duration_seconds es Float en BD; la app móvil lo espera como Int
+            # (Gson revienta con un decimal en un campo Int). Lo devolvemos como
+            # entero para que lista/detalle/timeline parseen bien en el móvil.
+            "duration_seconds": int(self.duration_seconds or 0),
         }
 
 
 class MobileDevice(Base):
     """
-    Dispositivos móviles registrados para notificaciones push.
+    Dispositivos móviles registrados (autenticación por refresh token).
+
+    Las notificaciones llegan al móvil por WebSocket en la LAN mientras la
+    app está conectada (sin FCM/Firebase, que fue eliminado del proyecto).
     """
     __tablename__ = "mobile_devices"
-    
+
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     device_uuid: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     device_name: Mapped[str] = mapped_column(String(100))
     platform: Mapped[str] = mapped_column(String(20))  # ios/android
-    
-    fcm_token: Mapped[str] = mapped_column(Text)
-    fcm_token_updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

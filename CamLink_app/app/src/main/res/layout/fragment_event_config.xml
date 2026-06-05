@@ -25,6 +25,20 @@
             android:textColor="@color/text_secondary"
             android:textSize="12sp" />
 
+        <!-- Aviso cuando la IA no esta activa: sin IA no hay notificaciones que
+             personalizar. Se oculta cuando hay al menos una camara con IA. -->
+        <TextView
+            android:id="@+id/tvAiNotice"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:padding="12dp"
+            android:background="@drawable/bg_badge_event"
+            android:textColor="@color/text_primary"
+            android:textSize="13sp"
+            android:visibility="gone"
+            android:text="@string/pref_ai_inactive" />
+
         <ProgressBar
             android:id="@+id/loading"
             android:layout_width="wrap_content"

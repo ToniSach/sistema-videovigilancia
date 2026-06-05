@@ -33,6 +33,19 @@ class PlaybackView(QWidget):
         self.current_camera_id: Optional[int] = None
         self.current_date: Optional[str] = None
         self.segments: list = []
+        # Índice del segmento que se está reproduciendo (para encadenar el
+        # siguiente al terminar y para que Play arranque por el primero del día).
+        self._current_segment_index: int = -1
+        # Altura COMPLETA del vídeo combinado (sin recorte). Se cachea la
+        # primera vez que se mide en pleno (full); el recorte de lente se
+        # calcula SIEMPRE sobre esta altura, no sobre el tamaño ya recortado
+        # (si no, recortaría "la mitad de la mitad").
+        self._full_h: int = 0
+        # Seek pendiente (segundos dentro del segmento) a aplicar cuando el
+        # vídeo termine de cargar. Usado para "ver en playback" desde un evento.
+        self._pending_seek: float = 0.0
+        # Instante (datetime) al que saltar tras cargar el timeline (evento).
+        self._pending_jump_dt: Optional[datetime] = None
         # id_cámara -> bool (es dual-lens). La grabación es el stream COMBINADO
         # (ambos lentes apilados verticalmente, -c copy nativo). El selector de
         # lente recorta en VLC (sin doble coste de grabación). Geometría coherente
@@ -268,7 +281,7 @@ class PlaybackView(QWidget):
         player.error.connect(self._on_player_error)
         
         # Controles
-        self.btn_play.clicked.connect(lambda: playback_service.player.player.play())
+        self.btn_play.clicked.connect(self._on_play_clicked)
         self.btn_pause.clicked.connect(lambda: playback_service.player.player.pause())
         self.btn_stop.clicked.connect(lambda: playback_service.stop())
         self.slider_pos.sliderReleased.connect(self._on_seek)
@@ -290,45 +303,35 @@ class PlaybackView(QWidget):
     def _on_camera_combo_change(self, *args):
         """Muestra el selector de lente solo si la cámara es dual-lens."""
         cam_id = self.cmb_camera.currentData()
+        self._full_h = 0  # otra cámara → re-medir la altura completa
         is_dual = self._cam_dual.get(cam_id, False)
         self.lbl_lens.setVisible(is_dual)
         self.cmb_lens.setVisible(is_dual)
         if not is_dual:
-            # Cámara mono: sin recorte y reset del selector.
+            # Cámara mono: vista completa y reset del selector.
             self._lens = "full"
             self.cmb_lens.blockSignals(True)
             self.cmb_lens.setCurrentIndex(0)
             self.cmb_lens.blockSignals(False)
-            playback_service.player.set_crop(None)
+
+    def _lens_param(self) -> Optional[str]:
+        """Lente a pedir al backend ('l1'/'l2'), o None para el combinado."""
+        return self._lens if self._lens in ("l1", "l2") else None
 
     def _on_lens_change(self, *args):
-        """Cambia el lente visualizado aplicando un recorte de VLC."""
+        """Cambia el lente: vuelve a pedir el segmento actual al servidor, que
+        recorta y envía SOLO ese lente (opción B, recorte server-side). Conserva
+        la posición de reproducción."""
         self._lens = self.cmb_lens.currentData() or "full"
-        self._apply_lens_crop()
-
-    def _apply_lens_crop(self):
-        """Aplica el recorte del lente sobre la grabación combinada.
-
-        La grabación dual contiene los dos lentes apilados verticalmente. El
-        recorte se calcula a partir del tamaño real del vídeo (video_get_size),
-        por lo que es independiente de la resolución nativa de la cámara.
-        l2 = mitad superior, l1 = mitad inferior (coherente con el split en vivo).
-        """
-        if self._lens == "full":
-            playback_service.player.set_crop(None)
-            return
-        w, h = playback_service.player.get_video_size()
-        if not w or not h:
-            # El vídeo aún no ha cargado; reintentar en breve.
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(300, self._apply_lens_crop)
-            return
-        half = h // 2
-        if self._lens == "l2":      # mitad superior
-            geom = f"{w}x{half}+0+0"
-        else:                        # l1 → mitad inferior
-            geom = f"{w}x{half}+0+{half}"
-        playback_service.player.set_crop(geom)
+        if self._current_segment_index < 0:
+            return  # nada reproduciéndose aún; se aplicará al pulsar Play
+        # Reproducir el mismo segmento desde la posición actual con el lente nuevo.
+        pos_s = 0.0
+        try:
+            pos_s = float(playback_service.player.get_time())  # segundos
+        except Exception:
+            pos_s = 0.0
+        self._play_segment_index(self._current_segment_index, seek_seconds=pos_s)
     
     def _load_timeline(self):
         """Carga timeline desde backend."""
@@ -357,8 +360,20 @@ class PlaybackView(QWidget):
                     ) for s in segments_data
                 ]
                 
+                # Orden cronológico para que la reproducción continua avance
+                # del segmento más antiguo al más reciente.
+                self.segments.sort(key=lambda s: s.start)
+                self._current_segment_index = -1  # reset al recargar timeline
+
                 self.timeline.set_segments(self.segments)
-                self.lbl_status.setText(f"{len(self.segments)} segmentos encontrados")
+                self.lbl_status.setText(
+                    f"{len(self.segments)} segmentos. Pulsa Play para reproducir el día."
+                )
+
+                # Si venimos de "ver en playback" de un evento, saltar al
+                # segmento que contiene ese instante y al segundo exacto.
+                if self._pending_jump_dt is not None and self.segments:
+                    self._seek_to_pending_event()
             else:
                 self.lbl_status.setText(f"Error: {response.error}")
 
@@ -390,16 +405,97 @@ class PlaybackView(QWidget):
                                                      "camera_id": camera_id})
     
     def _on_segment_click(self, recording_id: int, offset_seconds: int):
-        """Click en segmento del timeline."""
-        self.lbl_status.setText(f"Cargando grabación {recording_id}...")
+        """Click en segmento del timeline → reproduce ese segmento (y desde él
+        seguirá encadenando los siguientes al terminar)."""
+        idx = next(
+            (i for i, s in enumerate(self.segments) if s.recording_id == recording_id),
+            -1,
+        )
+        if idx >= 0:
+            self._play_segment_index(idx)
+        else:
+            # Fallback: reproducir por id aunque no esté en la lista.
+            self._current_segment_index = -1
+            self.lbl_status.setText(f"Cargando grabación {recording_id}...")
+            self.progress_download.setVisible(True)
+            self.progress_download.setValue(0)
+            token = api_client.get_stream_token() or ""
+            playback_service.play_recording(
+                recording_id, config.API_BASE_URL, token, lens=self._lens_param()
+            )
+
+    def _seek_to_pending_event(self):
+        """Localiza el segmento que contiene `self._pending_jump_dt` y lo
+        reproduce saltando al segundo del evento. Si ninguno lo contiene
+        exactamente, usa el más cercano que empiece antes del evento."""
+        when = self._pending_jump_dt
+        self._pending_jump_dt = None
+        if when is None:
+            return
+        # Normalizar a naive (los start/end del timeline son naive locales).
+        try:
+            if when.tzinfo is not None:
+                when = when.replace(tzinfo=None)
+        except Exception:
+            pass
+
+        target_idx = -1
+        for i, s in enumerate(self.segments):
+            start = s.start
+            end = s.end or start
+            if start <= when <= end:
+                target_idx = i
+                break
+            if start <= when:
+                target_idx = i  # último que empieza antes → candidato
+        if target_idx < 0:
+            target_idx = 0  # evento antes del primer segmento → primero
+
+        seg = self.segments[target_idx]
+        offset = 0.0
+        try:
+            offset = max(0.0, (when - seg.start).total_seconds())
+            # No pasar del final del segmento.
+            if seg.duration_seconds:
+                offset = min(offset, max(0.0, seg.duration_seconds - 1))
+        except Exception:
+            offset = 0.0
+        self._play_segment_index(target_idx, seek_seconds=offset)
+
+    def _play_segment_index(self, idx: int, seek_seconds: float = 0.0):
+        """Reproduce el segmento `idx` de self.segments (descarga + play).
+        seek_seconds: posición a la que saltar al cargar (para eventos)."""
+        if not (0 <= idx < len(self.segments)):
+            return
+        self._current_segment_index = idx
+        self._pending_seek = max(0.0, seek_seconds)
+        seg = self.segments[idx]
         self.progress_download.setVisible(True)
         self.progress_download.setValue(0)
-        
-        # Obtener token
+        lens_txt = {"l1": " · Lente 1", "l2": " · Lente 2"}.get(self._lens, "")
+        self.lbl_status.setText(
+            f"Reproduciendo segmento {idx + 1}/{len(self.segments)}{lens_txt}…"
+        )
         token = api_client.get_stream_token() or ""
-        api_url = config.API_BASE_URL
-        
-        playback_service.play_recording(recording_id, api_url, token)
+        playback_service.play_recording(
+            seg.recording_id, config.API_BASE_URL, token, lens=self._lens_param()
+        )
+
+    def _on_play_clicked(self):
+        """
+        Play: si no hay nada reproduciéndose aún, arranca por el PRIMER segmento
+        del día; si ya hay un segmento cargado (pausado), reanuda.
+        """
+        if self._current_segment_index < 0:
+            if self.segments:
+                self._play_segment_index(0)
+            else:
+                self.lbl_status.setText("Carga el timeline: no hay grabaciones.")
+            return
+        try:
+            playback_service.player.player.play()
+        except Exception:
+            pass
     
     def _on_download_progress(self, progress: int):
         """Actualiza progreso de descarga."""
@@ -408,11 +504,42 @@ class PlaybackView(QWidget):
     def _on_download_finished(self, path: str):
         """Archivo descargado."""
         self.progress_download.setVisible(False)
-        self.lbl_status.setText(f"Reproduciendo: {path}")
-        # Reaplicar el recorte del lente cuando el vídeo ya tenga tamaño válido.
-        if self._lens != "full":
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(600, self._apply_lens_crop)
+        from PySide6.QtCore import QTimer
+        # El recorte del lente lo hace el SERVIDOR (la URL ya pidió ?lens=), así
+        # que aquí no se recorta nada en el cliente.
+        # Si hay un seek pendiente (evento), saltar a ese segundo una vez que
+        # el vídeo es seekable (pequeño defer para que VLC cargue la duración).
+        if self._pending_seek > 0:
+            secs = self._pending_seek
+            self._pending_seek = 0.0
+            self.lbl_status.setText(f"Saltando al momento del evento ({int(secs)}s)…")
+            QTimer.singleShot(700, lambda: playback_service.player.seek_time(int(secs)))
+        else:
+            self.lbl_status.setText("Reproduciendo…")
+
+    def jump_to_time(self, camera_id: int, when: datetime):
+        """
+        "Ver en playback" desde un evento: selecciona la cámara, carga el
+        timeline de ESE día y reproduce el segmento que contiene el instante
+        `when`, saltando al segundo exacto del evento.
+        """
+        # Seleccionar cámara
+        for i in range(self.cmb_camera.count()):
+            if self.cmb_camera.itemData(i) == camera_id:
+                self.cmb_camera.blockSignals(True)
+                self.cmb_camera.setCurrentIndex(i)
+                self.cmb_camera.blockSignals(False)
+                self._on_camera_combo_change()
+                break
+        # Fijar la fecha del evento
+        try:
+            self.date_edit.setDate(QDate(when.year, when.month, when.day))
+        except Exception:
+            pass
+        # Recordar el instante y cargar el timeline; al llegar los segmentos
+        # se localiza el que contiene `when` y se reproduce con seek.
+        self._pending_jump_dt = when
+        self._load_timeline()
     
     def _on_download_error(self, error: str):
         """Error en descarga."""
@@ -461,8 +588,17 @@ class PlaybackView(QWidget):
         playback_service.player.set_speed(speed)
     
     def _on_playback_ended(self):
-        """Fin de reproducción."""
-        self.lbl_status.setText("Reproducción finalizada")
+        """
+        Fin de un segmento → encadena automáticamente el SIGUIENTE segmento del
+        día (reproducción continua). Si era el último, termina.
+        """
+        next_idx = self._current_segment_index + 1
+        if 0 <= self._current_segment_index and next_idx < len(self.segments):
+            # Pequeño defer para no recrear el player dentro de su propio callback.
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(150, lambda: self._play_segment_index(next_idx))
+        else:
+            self.lbl_status.setText("Reproducción finalizada (fin del día)")
     
     def _on_player_error(self, error: str):
         """Error del player."""

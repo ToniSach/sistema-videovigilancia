@@ -53,12 +53,10 @@ class Config:
     VLC_OPTIONS: list = None
     STREAM_BUFFER_SIZE: int = 1024 * 1024
 
-    # Directo por go2rtc (RTSP de baja latencia con VLC) en vez de MJPEG.
-    # Default TRUE: el desktop NO lee el .env del backend, así que el switch
-    # real es la PRESENCIA de stream_url en /cameras (solo la manda el backend
-    # cuando GO2RTC_ENABLED=true). Si no hay stream_url → cae a MJPEG solo.
-    # Pon USE_GO2RTC_LIVE=false como variable de entorno para forzar MJPEG.
-    USE_GO2RTC_LIVE: bool = os.getenv("USE_GO2RTC_LIVE", "true").lower() == "true"
+    # El directo se reproduce SIEMPRE por go2rtc (RTSP de baja latencia con
+    # VLC). El "switch" real es la PRESENCIA de stream_url en /cameras (solo la
+    # manda el backend cuando GO2RTC_ENABLED=true); si falta, el panel muestra
+    # "Sin stream disponible".
 
     # (Opcional) Sync con backend para debug/preview
     FFMPEG_WIDTH: int = int(os.getenv("FFMPEG_WIDTH", "1280"))

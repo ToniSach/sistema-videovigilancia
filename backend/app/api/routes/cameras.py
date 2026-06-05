@@ -20,8 +20,8 @@ cameras_bp = Blueprint("cameras", __name__, url_prefix="/api/v1/cameras")
 def _enrich_live_fields(cam: dict) -> dict:
     """
     Enriquece el dict de una cámara con campos de "en vivo" cuando go2rtc está
-    activo. Aditivo: si go2rtc está desactivado, devuelve el dict tal cual y los
-    clientes siguen usando `rtsp_url` / MJPEG como hoy.
+    activo. Aditivo: si go2rtc está desactivado, devuelve el dict tal cual (el
+    cliente mostrará "sin stream disponible").
 
       - stream_url: URL RTSP del restream de go2rtc (desktop/móvil la consumen
                     con ExoPlayer/VLC, una sola conexión a la cámara).

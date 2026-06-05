@@ -112,6 +112,10 @@ interface ApiService {
     @PATCH("events/{id}/acknowledge")
     suspend fun acknowledgeEvent(@Path("id") id: Int): Response<Unit>
 
+    // ── Estado de la IA (para gatear la personalización de notificaciones) ────
+    @GET("ai/status")
+    suspend fun getAiStatus(): Response<AiStatusResponse>
+
     // ── Preferencias de notificación (CRUD) ──────────────────────────────────
 
     @GET("notifications/preferences")

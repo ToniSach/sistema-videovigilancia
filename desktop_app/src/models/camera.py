@@ -23,7 +23,7 @@ class Camera:
     ip_address: str
     rtsp_url: str = ""
     # URL del restream de go2rtc (la añade el backend si GO2RTC_ENABLED).
-    # Si está presente y USE_GO2RTC_LIVE=true, el live se reproduce por RTSP/VLC.
+    # Si está presente, el live se reproduce por RTSP/VLC vía go2rtc.
     stream_url: Optional[str] = None
     # Para cámaras dual-lens: una URL por lente (sub-streams recortados de go2rtc).
     stream_url_l1: Optional[str] = None

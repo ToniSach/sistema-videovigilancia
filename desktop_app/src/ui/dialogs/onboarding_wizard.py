@@ -33,87 +33,113 @@ STEPS: List[Step] = [
         title="Bienvenido al NVR",
         body=(
             "Este sistema te permite ver, grabar y recibir alertas de tus "
-            "cámaras IP — todo desde una red local, sin enviar nada a "
-            "internet salvo las notificaciones que tú configures.\n\n"
-            "Este pequeño tutorial te muestra lo esencial en menos de un "
-            "minuto. Puedes saltarlo y volver a abrirlo cuando quieras "
-            "desde el botón «Tutorial» del menú lateral."
+            "cámaras IP — todo en tu red local, sin enviar nada a internet "
+            "salvo Telegram (opcional).\n\n"
+            "Este tutorial te muestra lo esencial en menos de un minuto. "
+            "Puedes reabrirlo cuando quieras desde el botón «Tutorial» del "
+            "menú lateral."
         ),
     ),
     Step(
         icon="",
-        title="1. Añadir tus cámaras",
+        title="1. Tu cuenta de administrador",
         body=(
-            "Ve a la sección «Cámaras» y pulsa «Descubrir Cámaras». "
-            "El sistema buscará automáticamente cámaras ONVIF en tu red.\n\n"
-            "Si tu cámara no aparece, puedes añadirla manualmente con su URL "
-            "RTSP. Si tu cámara tiene dos lentes (panorámica), márcala como "
-            "«dual-lens» y verás los dos por separado."
+            "La primera vez que abriste la app creaste el usuario "
+            "administrador. Con él puedes crear más usuarios en «Usuarios» "
+            "y compartir cámaras concretas con cada uno desde «Permisos».\n\n"
+            "Cada usuario ve solo las cámaras que le compartes y configura "
+            "sus propias notificaciones."
+        ),
+        hint="Los usuarios también pueden entrar desde el móvil escaneando "
+             "el QR o con el código de vinculación."
+    ),
+    Step(
+        icon="",
+        title="2. Añadir tus cámaras",
+        body=(
+            "Ve a «Cámaras» y pulsa «Descubrir Cámaras»: el sistema buscará "
+            "automáticamente cámaras ONVIF en tu red.\n\n"
+            "Si no aparece, añádela manualmente con su IP (los enlaces RTSP/"
+            "ONVIF se autocompletan). Si es de dos lentes, márcala como "
+            "«dual-lens» y verás cada lente por separado."
         ),
         hint="Las cámaras se conectan solas en cuanto las añades."
     ),
     Step(
         icon="",
-        title="2. Verlas en vivo",
+        title="3. Verlas en vivo",
         body=(
             "Ve a «En vivo» para ver los streams. Cambia la disposición "
-            "(1×1 / 2×2 / 3×3) según cuántas cámaras quieras ver a la vez.\n\n"
-            "Si tienes más cámaras que cuadros, usa los botones «◀ Anterior "
-            "/ Siguiente ▶» o las teclas PageUp/PageDown para navegar entre "
-            "páginas."
+            "(1×1 / 2×2 / 3×3) y navega entre páginas con «◀ / ▶» o "
+            "PageUp/PageDown.\n\n"
+            "Doble clic maximiza una cámara. En el panel de cada cámara "
+            "tienes PTZ, captura, y los botones de audio «Escuchar» y "
+            "«Hablar»."
         ),
-        hint="Doble clic en una cámara para maximizarla. Clic derecho "
-             "para PTZ, captura o configuración."
+        hint="«Escuchar» reproduce el audio de la cámara por tus "
+             "auriculares; ajústalo con el control de volumen."
     ),
     Step(
         icon="",
-        title="3. Configurar Telegram",
+        title="4. Activa la IA (para las alertas)",
         body=(
-            "Para recibir alertas en tu teléfono, ve a «Notificaciones» y "
-            "pulsa «Vincular nuevo chat».\n\n"
-            "El sistema te dará un código de 6 caracteres. Abre Telegram, "
-            "busca el bot del NVR y envíale ese código. ¡Y listo, queda "
-            "vinculado automáticamente!"
+            "Las notificaciones se generan a partir de lo que DETECTA la IA "
+            "(personas, vehículos…). Por eso, primero activa la IA en una "
+            "cámara: abre su panel en «En vivo» y pulsa «Activar IA».\n\n"
+            "Mientras no haya una cámara con IA activa, no se pueden crear "
+            "preferencias de notificación (te lo avisa la propia pantalla)."
         ),
-        hint="ℹ Por reglas de Telegram, eres tú quien debe enviar el primer "
-             "mensaje al bot. El sistema lo detecta y te avisa."
+        hint="Solo una cámara usa IA a la vez. Las alertas son de esa cámara."
     ),
     Step(
         icon="",
-        title="4. Vincular tu celular",
+        title="5. Notificaciones: escritorio vs. móvil",
         body=(
-            "Pulsa «Vincular móvil» en el menú lateral. Aparecerá un QR; "
-            "escanéalo desde la app móvil del NVR (en la misma red WiFi) "
-            "y tu teléfono quedará autenticado.\n\n"
-            "Desde el móvil podrás ver streams, recibir alertas push, ver "
-            "grabaciones y controlar las cámaras."
+            "En «Notificaciones → Mis preferencias» eliges qué eventos te "
+            "interesan, en qué horario y días.\n\n"
+            "• En el ESCRITORIO las alertas se ven aquí mismo, en la app.\n"
+            "• Para recibirlas en TELEGRAM o en el MÓVIL, hazlo desde la "
+            "app móvil (allí vinculas Telegram y eliges esos canales)."
         ),
-        hint="Solo funciona en la misma red WiFi. Para acceso remoto, "
-             "monta un túnel privado (Tailscale, WireGuard) — fuera del "
-             "alcance de este tutorial."
+        hint="El administrador configura el bot de Telegram una sola vez "
+             "en «Notificaciones → Configurar bot»."
     ),
     Step(
         icon="",
-        title="5. Reglas de notificación",
+        title="6. Vincular tu celular",
         body=(
-            "En «Notificaciones → Mis preferencias» creas reglas tipo:\n\n"
-            "    «Persona en cámara puerta, por Telegram, 22:00 a 07:00»\n\n"
-            "Cuantas reglas quieras. Sin reglas no recibes nada (las "
-            "cámaras siguen grabando, sólo silencias los avisos)."
+            "Pulsa «Vincular móvil» en el menú lateral: aparece un QR. "
+            "Escanéalo desde la app móvil (en la misma red WiFi) y el "
+            "teléfono queda autenticado.\n\n"
+            "Desde el móvil ves los streams, recibes alertas en la app "
+            "(funciona en LAN sin internet), revisas grabaciones y mueves "
+            "las cámaras."
         ),
-        hint="Usa el que hay en cada vista para más detalles."
+        hint="Las alertas al móvil llegan por la red local; no usan "
+             "Firebase ni necesitan internet."
+    ),
+    Step(
+        icon="",
+        title="7. Almacenamiento",
+        body=(
+            "En «Ajustes» defines la carpeta de grabaciones y la cuota máxima "
+            "de disco (GB). Al superarse la cuota, el sistema borra "
+            "automáticamente lo más antiguo.\n\n"
+            "Los cambios se aplican al momento, sin reiniciar el servidor."
+        ),
+        hint="En «Sistema» ves el espacio usado y los días de grabación "
+             "que te quedan."
     ),
     Step(
         icon="",
         title="¡Todo listo!",
         body=(
             "Ya tienes lo esencial. Recuerda:\n\n"
-            "• Cualquier vista tiene un botón con ayuda específica.\n"
-            "• Este tutorial se puede reabrir en cualquier momento desde "
-            "el botón «Tutorial» del menú lateral.\n"
-            "• En «Sistema» puedes ver el estado real del servidor.\n\n"
-            "Si algo no funciona como esperas, revisa el log del servidor "
-            "o consulta la ayuda de la sección correspondiente."
+            "• Cada vista tiene un botón de ayuda específica.\n"
+            "• Este tutorial se reabre desde «Tutorial» en el menú lateral.\n"
+            "• En «Sistema» ves el estado real del servidor.\n\n"
+            "Si algo no funciona como esperas, revisa el log del servidor o "
+            "la ayuda de la sección."
         ),
     ),
 ]

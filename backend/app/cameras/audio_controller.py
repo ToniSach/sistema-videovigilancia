@@ -46,7 +46,11 @@ def list_input_audio_devices() -> list[str]:
             result = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-list_devices", "true",
                  "-f", "dshow", "-i", "dummy"],
-                capture_output=True, text=True, timeout=10,
+                # ffmpeg emite el listado en UTF-8. Si dejamos que Python lo
+                # decodifique con la cp local (cp1252 en Windows ES), nombres
+                # con caracteres como "®" salen corruptos ("Â®") y luego NO
+                # coinciden con el device dshow → "Could not find audio device".
+                capture_output=True, encoding="utf-8", errors="replace", timeout=10,
             )
             stderr = result.stderr or ""
             # Formato: [dshow @ 0x...] "Nombre del Mic" (audio)
@@ -103,7 +107,8 @@ class AudioController:
         self._camera = camera
         self._cam: Optional[ONVIFCamera] = None
         self._connected = False
-        self._audio_supported = False
+        self._audio_supported = False      # mic de la cámara (para ESCUCHAR)
+        self._audio_out_supported = False  # altavoz de la cámara (para HABLAR)
         self._process: Optional[subprocess.Popen] = None
         self._running = False
         self._lock = threading.Lock()
@@ -142,16 +147,19 @@ class AudioController:
                 logger.warning(f"[AUDIO] cam={self._camera.id} sin perfiles")
                 return
 
-            has_audio = False
+            has_audio_in = False   # encoder = micro de la cámara (escuchar)
+            has_audio_out = False  # output  = altavoz de la cámara (hablar)
             for p in profiles:
                 if getattr(p, "AudioEncoderConfiguration", None):
-                    has_audio = True
-                    break
-            self._audio_supported = has_audio
-            if not has_audio:
-                logger.info(f"[AUDIO] cam={self._camera.id}: la cámara no expone audio encoder")
-            else:
-                logger.info(f"[AUDIO] cam={self._camera.id}: audio soportado ✓")
+                    has_audio_in = True
+                if getattr(p, "AudioOutputConfiguration", None):
+                    has_audio_out = True
+            self._audio_supported = has_audio_in
+            self._audio_out_supported = has_audio_out
+            logger.info(
+                f"[AUDIO] cam={self._camera.id}: micro(escuchar)={has_audio_in} "
+                f"altavoz(hablar)={has_audio_out}"
+            )
 
             self._cam = cam
             self._connected = True
@@ -163,7 +171,18 @@ class AudioController:
     # API
     # ------------------------------------------------------------------
     def is_supported(self) -> bool:
+        """Soporte para ESCUCHAR (la cámara tiene micro/encoder de audio)."""
         return self._connected and self._audio_supported
+
+    def is_talk_supported(self) -> bool:
+        """
+        Soporte para HABLAR. Es best-effort: muchas cámaras NO anuncian su
+        AudioOutputConfiguration por ONVIF aunque tengan altavoz y acepten el
+        backchannel. Por eso basta con que ONVIF responda (self._connected);
+        si además anuncia salida, mejor. Bloquear por la ausencia del config
+        impediría hablar en cámaras que sí funcionan.
+        """
+        return self._connected
 
     def is_active(self) -> bool:
         return self._running and self._process is not None and self._process.poll() is None
@@ -173,18 +192,50 @@ class AudioController:
         Empieza a transmitir el micrófono local hacia la cámara vía RTP.
         mic_device: nombre del dispositivo (Windows: 'Microphone'; Linux: 'default').
         """
-        if not self.is_supported():
-            logger.warning(f"[AUDIO] cam={self._camera.id}: talk no soportado")
+        if not self.is_talk_supported():
+            logger.warning(
+                f"[AUDIO] cam={self._camera.id}: talk no disponible "
+                f"(ONVIF no respondió; no se puede ubicar la cámara)"
+            )
             return False
+        if not self._audio_out_supported:
+            # No bloqueamos, pero avisamos: es probable que la cámara no tenga
+            # altavoz o no acepte backchannel ONVIF estándar.
+            logger.info(
+                f"[AUDIO] cam={self._camera.id}: la cámara no anuncia salida de "
+                f"audio; intento talk de todas formas (best-effort)."
+            )
         with self._lock:
             if self._running and self._process and self._process.poll() is None:
                 logger.info(f"[AUDIO] cam={self._camera.id}: ya está hablando")
                 return True
 
+            # Resolver el micrófono: si el cliente no especificó uno (o mandó el
+            # genérico), auto-detectamos el PRIMER dispositivo real del sistema.
+            # En Windows NO existe un device llamado "Microphone" por defecto —
+            # hay que usar el nombre EXACTO que reporta dshow (p.ej. "Micrófono
+            # (Realtek...)"), o ffmpeg falla con "Could not find audio device".
+            if not mic_device or mic_device.strip().lower() in ("", "default", "microphone"):
+                try:
+                    devices = list_input_audio_devices()
+                except Exception:
+                    devices = []
+                # En Windows descartamos "default" (no es un device dshow válido).
+                real = [d for d in devices if d and d.lower() != "default"]
+                if real:
+                    mic_device = real[0]
+                    logger.info(f"[AUDIO] cam={self._camera.id}: micro auto = '{mic_device}'")
+
             system = platform.system()
             if system == "Windows":
-                device = mic_device or "Microphone"
-                in_args = ["-f", "dshow", "-i", f"audio={device}"]
+                if not mic_device or mic_device.strip().lower() in ("", "default", "microphone"):
+                    logger.error(
+                        f"[AUDIO] cam={self._camera.id}: no se detectó ningún "
+                        f"micrófono en el sistema (dshow). Conecta uno o elígelo "
+                        f"en el selector 'Mic'."
+                    )
+                    return False
+                in_args = ["-f", "dshow", "-i", f"audio={mic_device}"]
             elif system == "Linux":
                 device = mic_device or "default"
                 in_args = ["-f", "alsa", "-i", device, "-thread_queue_size", "4096"]
@@ -283,14 +334,24 @@ class AudioController:
         with self._lock:
             if not self._listen_process:
                 return False
+            proc = self._listen_process
+            pid = proc.pid
             try:
-                logger.info(f"[AUDIO] cam={self._camera.id} LISTEN STOP")
-                self._listen_process.terminate()
+                logger.info(f"[AUDIO] cam={self._camera.id} LISTEN STOP (pid={pid})")
+                proc.kill()  # forzado (en Windows = TerminateProcess)
                 try:
-                    self._listen_process.wait(timeout=2)
+                    proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    self._listen_process.kill()
-                    self._listen_process.wait()
+                    pass
+                # Garantía extra en Windows: matar el árbol por si quedó vivo.
+                if platform.system() == "Windows" and proc.poll() is None:
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(pid)],
+                            capture_output=True, timeout=5,
+                        )
+                    except Exception:
+                        pass
             finally:
                 self._listen_process = None
             return True
@@ -354,5 +415,27 @@ class AudioManager:
                 except Exception:
                     pass
 
+    def stop_all(self) -> None:
+        """Detiene escucha y talk de TODAS las cámaras. Se llama al apagar el
+        backend (atexit) para no dejar procesos ffplay/ffmpeg huérfanos que
+        sigan sonando tras cerrar/reiniciar el servidor."""
+        with self._lock:
+            ctrls = list(self._controllers.values())
+        for ctrl in ctrls:
+            try:
+                ctrl.stop_listen()
+            except Exception:
+                pass
+            try:
+                ctrl.stop_talk()
+            except Exception:
+                pass
+
 
 audio_manager = AudioManager()
+
+# Al cerrar el proceso (Ctrl+C / exit), matar cualquier ffplay/ffmpeg de audio
+# vivo para que no quede sonando en background (orígenes de "sigo escuchando
+# después de parar"). atexit no corre en kill -9, pero sí en Ctrl+C normal.
+import atexit as _atexit
+_atexit.register(audio_manager.stop_all)

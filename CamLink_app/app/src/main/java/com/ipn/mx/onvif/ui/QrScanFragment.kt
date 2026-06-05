@@ -280,7 +280,6 @@ class QrScanFragment : Fragment() {
             deviceUuid = DeviceIdentity.getOrCreateUuid(requireContext()),
             deviceName = DeviceIdentity.friendlyDeviceName(),
             platform   = "android",
-            fcmToken   = null,
         )
 
         viewLifecycleOwner.lifecycleScope.launch {

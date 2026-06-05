@@ -316,7 +316,10 @@ def get_timeline():
                 "end": rec.end_time.isoformat() if rec.end_time else (
                     rec.start_time.isoformat() if rec.start_time else None
                 ),
-                "duration_seconds": rec.duration_seconds or 0,
+                # duration_seconds es Float en BD, pero la app móvil lo espera
+                # como entero (Gson revienta al parsear un decimal en un Int →
+                # "No se pudo cargar el timeline"). Lo devolvemos como int.
+                "duration_seconds": int(rec.duration_seconds or 0),
                 "file_size_mb": round((rec.file_size_bytes or 0) / (1024*1024), 2),
                 "has_clip": True,  # todas las grabaciones tienen archivo
                 "type": "event" if is_event_clip else "continuous",
@@ -336,11 +339,88 @@ def get_timeline():
         return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
+def _lens_cropped_path(src_path: str, recording_id: int, lens: str) -> "str | None":
+    """
+    Devuelve la ruta de un MP4 que contiene SOLO el lente pedido, recortado del
+    vídeo combinado (dual-lens apilado arriba/abajo) y transcodificado+escalado
+    a 720p (rápido y ligero). Se CACHEA por (recording_id, lens) para que las
+    re-reproducciones sean instantáneas.
+      - l1 = mitad inferior (crop=iw:ih/2:0:ih/2)
+      - l2 = mitad superior (crop=iw:ih/2:0:0)
+    NO se rota (el lente inferior sale boca abajo, decisión del usuario).
+    Devuelve None si falla (el caller sirve el combinado).
+    """
+    if lens not in ("l1", "l2"):
+        return None
+    import tempfile
+    import subprocess
+    cache_dir = os.path.join(tempfile.gettempdir(), "nvr_lens_cache")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        return None
+    out = os.path.join(cache_dir, f"rec{recording_id}_{lens}.mp4")
+    # Cache válido si existe, no está vacío y es más nuevo que el origen.
+    try:
+        if (os.path.exists(out) and os.path.getsize(out) > 1024
+                and os.path.getmtime(out) >= os.path.getmtime(src_path)):
+            return out
+    except OSError:
+        pass
+    crop = "crop=iw:ih/2:0:ih/2" if lens == "l1" else "crop=iw:ih/2:0:0"
+    vf = f"{crop},scale=-2:720"  # recorte + escala a 720p para encode veloz
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", src_path,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+        "-an", "-movflags", "+faststart",
+        out,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=180)
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024:
+            _prune_lens_cache(cache_dir, max_files=40)
+            return out
+        logger.warning(
+            f"[PLAY] recorte lente {lens} rec={recording_id} falló: "
+            f"{(r.stderr or b'')[:200]!r}"
+        )
+    except Exception as e:
+        logger.warning(f"[PLAY] recorte lente {lens} rec={recording_id} error: {e}")
+    return None
+
+
+def _prune_lens_cache(cache_dir: str, max_files: int = 40) -> None:
+    """Mantiene el caché de lentes recortados acotado: deja como mucho
+    `max_files` (los más recientes) y borra los más antiguos. Evita que el
+    tempdir crezca sin límite si se reproducen muchos segmentos×lentes."""
+    try:
+        files = [
+            os.path.join(cache_dir, f) for f in os.listdir(cache_dir)
+            if f.endswith(".mp4")
+        ]
+        if len(files) <= max_files:
+            return
+        files.sort(key=lambda p: os.path.getmtime(p))  # más antiguo primero
+        for p in files[:len(files) - max_files]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 @recordings_bp.route("/play/<int:recording_id>", methods=["GET"])
 @jwt_required()
 def play_recording(recording_id):
     """
     Streaming de video con soporte Range Requests (seek).
+
+    Query opcional `?lens=l1|l2`: para cámaras dual-lens, sirve SOLO ese lente
+    recortado del combinado (transcodificado y cacheado). Sin `lens` (o full)
+    sirve el archivo combinado tal cual.
     """
     try:
         user_id = int(get_jwt_identity())
@@ -374,6 +454,16 @@ def play_recording(recording_id):
                 "error": "Archivo no encontrado en disco",
                 "file_path_db": recording.file_path,
             }), 404
+
+        # Recorte de lente server-side (opción B): si se pide ?lens=l1|l2,
+        # servir SOLO ese lente recortado del combinado. El desktop solo lo
+        # pide para cámaras dual-lens. Cacheado para re-reproducciones.
+        lens = (request.args.get("lens") or "").strip().lower()
+        if lens in ("l1", "l2"):
+            cropped = _lens_cropped_path(file_path, recording_id, lens)
+            if cropped:
+                file_path = cropped
+                mimetypes.add_type("video/mp4", ".mp4")
 
         file_size = os.path.getsize(file_path)
         if file_size < 1024:

@@ -23,12 +23,17 @@ class LoginView(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        
+
+        self._setup_mode = False  # True = crear primer admin
+
         self._setup_ui()
         self._setup_styles()
-        
+
         # Conectar señales API
         api_client.auth_error.connect(self._on_auth_error)
+
+        # Detectar primer arranque (sin usuarios) → modo "Crear administrador".
+        self._check_setup()
     
     def _setup_ui(self):
         """Construye interfaz."""
@@ -73,7 +78,16 @@ class LoginView(QWidget):
         self.txt_password.setMinimumHeight(36)
         self.txt_password.returnPressed.connect(self._on_login)
         card_layout.addWidget(self.txt_password)
-        
+
+        # Confirmar contraseña (solo visible en modo "crear administrador")
+        self.txt_password2 = QLineEdit()
+        self.txt_password2.setPlaceholderText("Repite la contraseña")
+        self.txt_password2.setEchoMode(QLineEdit.Password)
+        self.txt_password2.setMinimumHeight(36)
+        self.txt_password2.returnPressed.connect(self._on_login)
+        self.txt_password2.setVisible(False)
+        card_layout.addWidget(self.txt_password2)
+
         # Recordar sesión
         self.chk_remember = QCheckBox("Recordar sesión")
         card_layout.addWidget(self.chk_remember)
@@ -153,39 +167,100 @@ class LoginView(QWidget):
             }}
         """)
     
+    def _check_setup(self):
+        """Consulta si hay que crear el primer admin (sistema sin usuarios)."""
+        def on_status(response):
+            if response.success and (response.data or {}).get("needs_setup"):
+                self._enter_setup_mode()
+        api_client.check_setup_status(on_status)
+
+    def _enter_setup_mode(self):
+        """Convierte la pantalla en 'Crear administrador' (primer arranque)."""
+        self._setup_mode = True
+        self.lbl_title.setText("Crear administrador")
+        self.lbl_subtitle.setText(
+            "Primer uso: crea la cuenta de administrador del sistema"
+        )
+        self.txt_username.setPlaceholderText("Nuevo usuario admin")
+        self.txt_password.setPlaceholderText("Contraseña (mín. 6 caracteres)")
+        self.txt_password2.setVisible(True)
+        self.chk_remember.setVisible(False)
+        self.btn_login.setText("Crear administrador")
+        self.lbl_status.setText(
+            "Aún no hay usuarios. Crea el administrador para empezar."
+        )
+
     def _on_login(self):
-        """Intenta autenticar."""
+        """Inicia sesión o, en primer arranque, crea el admin."""
         username = self.txt_username.text().strip()
         password = self.txt_password.text()
-        
+
         if not username or not password:
             self.lbl_status.setText("Complete todos los campos")
             return
-        
+
+        if self._setup_mode:
+            self._do_create_admin(username, password)
+            return
+
         self.lbl_status.setText("Autenticando...")
         self.btn_login.setEnabled(False)
-        
+
         def on_response(response):
             self.btn_login.setEnabled(True)
-            
+
             if response.success:
-                # Guardar tokens
-                from desktop_app.src.models.user import AuthTokens
-                tokens = AuthTokens(
-                    access_token=response.data.get("access_token"),
-                    refresh_token=response.data.get("refresh_token")
-                )
-                api_client.set_tokens(tokens)
-                
-                # Emitir éxito
-                self.login_successful.emit(response.data.get("user", {}))
-                self.lbl_status.setText("")
+                self._apply_login_success(response.data)
             else:
                 error_msg = response.error or "Error de autenticación"
                 self.lbl_status.setText(f"Error: {error_msg}")
                 logger.warning(f"Login fallido: {error_msg}")
-        
+
         api_client.login(username, password, on_response)
+
+    def _do_create_admin(self, username: str, password: str):
+        """Valida y crea el primer administrador, luego entra automáticamente."""
+        if len(password) < 6:
+            self.lbl_status.setText("La contraseña debe tener al menos 6 caracteres")
+            return
+        if password != self.txt_password2.text():
+            self.lbl_status.setText("Las contraseñas no coinciden")
+            return
+
+        self.lbl_status.setText("Creando administrador...")
+        self.btn_login.setEnabled(False)
+
+        def on_response(response):
+            self.btn_login.setEnabled(True)
+            if response.success and response.data:
+                # El backend ya devuelve tokens → entrar directo.
+                self._setup_mode = False
+                self._apply_login_success(response.data)
+            elif response.success:
+                # Creado pero sin auto-login: volver a modo login.
+                self._setup_mode = False
+                self.txt_password2.setVisible(False)
+                self.chk_remember.setVisible(True)
+                self.lbl_title.setText("NVR VMS")
+                self.lbl_subtitle.setText("Sistema de Videovigilancia")
+                self.btn_login.setText("Iniciar Sesión")
+                self.lbl_status.setText("Administrador creado. Inicia sesión.")
+            else:
+                self.lbl_status.setText(f"Error: {response.error or 'No se pudo crear'}")
+
+        api_client.setup_admin(username, password, on_response)
+
+    def _apply_login_success(self, data: dict):
+        """Guarda tokens y emite el éxito de login."""
+        from desktop_app.src.models.user import AuthTokens
+        data = data or {}
+        tokens = AuthTokens(
+            access_token=data.get("access_token"),
+            refresh_token=data.get("refresh_token"),
+        )
+        api_client.set_tokens(tokens)
+        self.login_successful.emit(data.get("user", {}))
+        self.lbl_status.setText("")
     
     def _on_auth_error(self):
         """Maneja error de autenticación."""

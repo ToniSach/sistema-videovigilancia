@@ -269,6 +269,31 @@ def create_app(config_name='default'):
         logger.critical(f"Error inicializando DB: {e}")
         raise
 
+    # Reconciliación de esquema: FCM/Firebase fue eliminado, pero una BD antigua
+    # puede conservar las columnas mobile_devices.fcm_token / fcm_token_updated_at
+    # como NOT NULL. create_all() NO altera tablas existentes, así que el INSERT
+    # de un móvil nuevo (ya sin fcm_token) violaba la restricción NOT NULL → 500
+    # al vincular el celular. Las quitamos si existen (idempotente, PostgreSQL).
+    try:
+        from sqlalchemy import text as _sql_text
+        with db_manager.get_session() as _schema_s:
+            _schema_s.execute(_sql_text(
+                "ALTER TABLE mobile_devices DROP COLUMN IF EXISTS fcm_token"
+            ))
+            _schema_s.execute(_sql_text(
+                "ALTER TABLE mobile_devices DROP COLUMN IF EXISTS fcm_token_updated_at"
+            ))
+        logger.info("Esquema reconciliado: columnas FCM legadas eliminadas si existían")
+    except Exception as e:
+        logger.warning(f"No se pudieron limpiar columnas legadas FCM: {e}")
+
+    # Aplicar overrides de almacenamiento persistidos (ruta/cuota cambiados
+    # desde la app de escritorio) para que sobrevivan a reinicios.
+    try:
+        settings.reload_storage_from_db()
+    except Exception as e:
+        logger.warning(f"No se pudieron cargar overrides de almacenamiento: {e}")
+
     # Rehidratar JWT blocklist desde BD (si la tabla existe). Si no existe,
     # se ignora silenciosamente y la blocklist queda sólo en memoria.
     try:
@@ -375,9 +400,10 @@ def create_app(config_name='default'):
         except Exception as e:
             logger.error(f"Error iniciando monitor de cámaras congeladas: {e}")
 
-        # ================== go2rtc (capa de medios, OPCIONAL) ==================
-        # Solo arranca si GO2RTC_ENABLED=true. Aditivo: si está desactivado
-        # (default) no hace nada y el sistema sigue con MJPEG/HLS como hoy.
+        # ================== go2rtc (capa de medios) ==================
+        # Sirve el directo (WebRTC/RTSP/HLS) directo al cliente. Solo arranca
+        # si GO2RTC_ENABLED=true; si está desactivado no hay directo (los
+        # clientes mostrarán "sin stream disponible").
         try:
             from backend.app.streaming.go2rtc_manager import Go2RtcManager
             from backend.app.database.repositories.camera_repository import CameraRepository
@@ -510,37 +536,25 @@ if __name__ == "__main__":
 
         logger.info(f"Iniciando servidor en {settings.SERVER_HOST}:{settings.SERVER_PORT}")
 
-        # ===== Patch crítico para baja latencia en streaming MJPEG =====
+        # ===== Patch de baja latencia para la API HTTP =====
         # Por defecto los sockets TCP usan el algoritmo Nagle: agrupan chunks
-        # pequeños hasta llenar un paquete o esperar 40ms. En MJPEG cada
-        # boundary frame es relativamente pequeño y la espera de Nagle
-        # añadía ~40ms de latencia por frame. Desactivando Nagle (TCP_NODELAY)
-        # cada chunk se envía inmediatamente.
+        # pequeños hasta llenar un paquete o esperar ~40ms. Para respuestas
+        # JSON pequeñas (la mayoría de la API) eso añade latencia perceptible.
+        # Desactivando Nagle (TCP_NODELAY) cada respuesta se envía al instante.
         #
-        # Sin esto, ningún otro fix de baja latencia sirve completamente.
+        # NOTA: el vídeo en vivo NO pasa por Flask (lo sirve go2rtc directo),
+        # así que aquí NO limitamos SO_SNDBUF — hacerlo frenaría las descargas
+        # grandes (grabaciones, snapshots) que sí pasan por este servidor.
         import socket as _socket
         from werkzeug.serving import WSGIRequestHandler
 
         class _LowLatencyHandler(WSGIRequestHandler):
-            """WSGIRequestHandler optimizado para streaming MJPEG.
-
-            Aplica dos opciones críticas en cada conexión:
-              - TCP_NODELAY: desactiva Nagle → cada chunk va al instante.
-              - SO_SNDBUF=64 KB: limita el send buffer del kernel para que
-                la backpressure por TCP window se active rápido cuando el
-                cliente lee lento. Sin esto, Windows auto-tunea SO_SNDBUF
-                hasta varios MB y la pila acumula 5-10 s de JPEGs antes
-                de que la app sienta presión (cola maxsize=1 con
-                drop-oldest no protege porque el JPEG ya está en el socket).
-            """
+            """WSGIRequestHandler con TCP_NODELAY para baja latencia de API."""
             def setup(self):
                 try:
                     self.connection = self.request
                     self.connection.setsockopt(
                         _socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1
-                    )
-                    self.connection.setsockopt(
-                        _socket.SOL_SOCKET, _socket.SO_SNDBUF, 64 * 1024
                     )
                 except Exception:
                     pass

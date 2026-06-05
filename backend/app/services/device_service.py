@@ -15,16 +15,21 @@ logger = logging.getLogger(__name__)
 
 
 class DeviceService:
-    """Gestiona dispositivos móviles y tokens FCM."""
-    
+    """Gestiona dispositivos móviles (autenticación por refresh token).
+
+    NOTA: las notificaciones push por FCM/Firebase fueron eliminadas del
+    proyecto. El móvil recibe alertas en tiempo real por WebSocket en la LAN
+    (NotificationWebSocketService) mientras esté conectado.
+    """
+
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-    
+
     def register_device(self, user_id: int, device_uuid: str, device_name: str,
-                       platform: str, fcm_token: str) -> tuple[MobileDevice, str, str]:
+                       platform: str) -> tuple[MobileDevice, str, str]:
         """
         Registra un nuevo dispositivo o actualiza uno existente.
-        
+
         Returns:
             Tupla (device, access_token, refresh_token)
         """
@@ -32,12 +37,10 @@ class DeviceService:
             with db_manager.get_session() as session:
                 # Buscar dispositivo existente
                 device = session.query(MobileDevice).filter_by(device_uuid=device_uuid).first()
-                
+
                 if device:
                     # Actualizar
                     device.user_id = user_id
-                    device.fcm_token = fcm_token
-                    device.fcm_token_updated_at = datetime.utcnow()
                     device.is_active = True
                     device.last_seen_at = datetime.utcnow()
                 else:
@@ -47,7 +50,6 @@ class DeviceService:
                         device_uuid=device_uuid,
                         device_name=device_name,
                         platform=platform,
-                        fcm_token=fcm_token,
                         is_active=True
                     )
                     session.add(device)
@@ -93,20 +95,6 @@ class DeviceService:
         except Exception as e:
             self.logger.error(f"Error validando refresh token: {e}")
             return None
-    
-    def update_fcm_token(self, device_id: int, fcm_token: str) -> bool:
-        """Actualiza token FCM."""
-        try:
-            with db_manager.get_session() as session:
-                device = session.get(MobileDevice, device_id)
-                if device:
-                    device.fcm_token = fcm_token
-                    device.fcm_token_updated_at = datetime.utcnow()
-                    return True
-                return False
-        except Exception as e:
-            self.logger.error(f"Error actualizando FCM token: {e}")
-            raise
     
     def deactivate_device(self, device_id: int) -> bool:
         """Desactiva dispositivo."""

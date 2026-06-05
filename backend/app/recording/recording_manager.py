@@ -28,11 +28,17 @@ class RecordingManager:
     SPLICE_PRE_SECONDS = 10
     SPLICE_POST_SECONDS = 10  # = EVENT_RECORDING_DURATION para consistencia
 
+    @property
+    def _recordings_dir(self) -> str:
+        """Carpeta de grabaciones, leída EN CALIENTE desde settings: si el admin
+        cambia la ruta desde la app de escritorio, las grabaciones NUEVAS van a
+        la ruta nueva sin reiniciar el backend."""
+        return settings.RECORDINGS_PATH
+
     def __init__(self, recording_repo: RecordingRepository, event_repo: Optional[EventRepository] = None):
         self._recording_repo = recording_repo
         self._event_repo = event_repo
-        self._recordings_dir = settings.RECORDINGS_PATH
-        os.makedirs(self._recordings_dir, exist_ok=True)
+        os.makedirs(settings.RECORDINGS_PATH, exist_ok=True)
 
         self._pre_buffers: Dict[int, collections.deque] = {}
         self._pre_buffer_lock = threading.Lock()
@@ -64,9 +70,7 @@ class RecordingManager:
         # antes de meter el frame en la deque (necesario porque retiene la
         # referencia mucho tiempo). Tener needs_copy=True aquí causaba
         # DOBLE memcpy por frame (~5.5 MB en dual-lens). En cámara a 15 fps
-        # eso eran 82 MB/s de memcpy desperdiciado compitiendo con el
-        # encoder MJPEG por ancho de banda de memoria → contribuía al lag
-        # acumulativo en live preview.
+        # eso eran 82 MB/s de memcpy desperdiciado en ancho de banda de memoria.
         frame_distributor.register_consumer(
             consumer_name,
             lambda fd: self._update_pre_buffer(camera_id, fd),

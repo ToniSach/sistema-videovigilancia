@@ -96,16 +96,28 @@ class TelegramLinkService:
                 
                 # Marcar como usado
                 verification.used = True
-                
-                # Crear vinculación
-                chat = UserTelegramChat(
+
+                # Vinculación IDEMPOTENTE: si ya existe un registro para este
+                # (usuario, chat) lo reactivamos en vez de crear un duplicado.
+                # Antes cada re-vinculación (frecuente al probar) acumulaba
+                # filas UserTelegramChat → notificaciones repetidas y tabla sucia.
+                existing = session.query(UserTelegramChat).filter_by(
                     user_id=verification.user_id,
                     telegram_chat_id=str(telegram_chat_id),
-                    telegram_username=telegram_username,
-                    is_active=True
-                )
-                session.add(chat)
-                
+                ).first()
+
+                if existing:
+                    existing.is_active = True
+                    existing.telegram_username = telegram_username or existing.telegram_username
+                    existing.linked_at = datetime.utcnow()
+                else:
+                    session.add(UserTelegramChat(
+                        user_id=verification.user_id,
+                        telegram_chat_id=str(telegram_chat_id),
+                        telegram_username=telegram_username,
+                        is_active=True
+                    ))
+
                 self.logger.info(
                     f"Usuario {verification.user_id} vinculado con Telegram "
                     f"chat {telegram_chat_id}"

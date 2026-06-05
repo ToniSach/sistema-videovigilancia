@@ -36,8 +36,8 @@ class FFmpegWorker:
     #   - RESOLUCIÓN ORIGINAL: lo que la cámara emite por RTSP (la configuras
     #     en su panel web). No la cambiamos.
     #   - ESCALADO: filtro `-vf scale=W:H` que reduce cada frame ANTES de
-    #     entregarlo a los consumidores (MJPEG encoder, YOLO, grabación,
-    #     buffer circular). Ahorra CPU/RAM proporcionalmente a los píxeles.
+    #     entregarlo a los consumidores (YOLO, grabación, buffer
+    #     circular). Ahorra CPU/RAM proporcionalmente a los píxeles.
     #
     # Si la cámara ya emite <= target, NO escalamos (saltarse el filtro
     # ahorra ~5-15% de CPU y evita degradación innecesaria por reescalado).
@@ -368,7 +368,6 @@ class FFmpegWorker:
         #
         # NOTA: NO usar `fps=N` aquí. Combina mal con vsync passthrough +
         # nobuffer + probesize 32 (PTS RTSP inestables → cap a 1 fps).
-        # El throttle real está en MJPEGStreamer.update_frame (wall clock).
         vf_filter = (
             f"scale={self.target_width}:{self.target_height}"
             f":force_original_aspect_ratio=disable"

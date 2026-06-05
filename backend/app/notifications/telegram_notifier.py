@@ -56,8 +56,8 @@ class TelegramNotifier:
 
         # POOL DEDICADO para HTTP a Telegram. Aislado de GlobalExecutor.
         # Motivo: cada send_event_notification hace 1-2 requests HTTP con
-        # timeout 10-30s. Si compartiéramos GlobalExecutor con MJPEG, la
-        # encoder de la live se quedaría en cola detrás de Telegrams.
+        # timeout 10-30s. Si compartiéramos GlobalExecutor con la grabación
+        # y la IA, esas tareas se quedarían en cola detrás de los Telegrams.
         # 2 workers = máx 2 envíos simultáneos por proceso → suficiente
         # para alertas (con cooldown=30s) y no satura red de salida.
         # Cualquier exceso se encola en el pool (no en global_executor).
@@ -153,7 +153,7 @@ class TelegramNotifier:
             f"de cam {event_data.camera_id} a {len(self._chat_ids)} chat(s)"
         )
         # Pool DEDICADO de Telegram (no global_executor) → los HTTP lentos
-        # NO bloquean al encoder MJPEG ni al frame distributor. Si los 2
+        # NO bloquean al frame distributor ni a la grabación. Si los 2
         # workers están ocupados, la tarea se encola en el pool de Telegram,
         # NO en el del resto del sistema.
         try:

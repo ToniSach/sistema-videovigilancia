@@ -45,7 +45,11 @@ class _APIWorker(QThread):
 
     def run(self):
         try:
-            token = (api_client.tokens or {}).get("access_token", "")
+            # api_client.tokens es un objeto AuthTokens (no un dict): hay que
+            # leer .access_token, no .get(...). Antes esto lanzaba
+            # "'AuthTokens' object has no attribute 'get'" al generar el código.
+            _tok = getattr(api_client, "tokens", None)
+            token = getattr(_tok, "access_token", "") if _tok else ""
             url = f"{config.API_BASE_URL.rstrip('/')}{self._path}"
             headers = {"Authorization": f"Bearer {token}"}
             r = requests.request(
