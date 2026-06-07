@@ -3,9 +3,42 @@ import logging
 
 from ..database.models import Camera
 from ..database.repositories.camera_repository import CameraRepository
-from ..streaming.frame_buffer import CircularFrameBuffer, FrameData
-from ..streaming.frame_distributor import FrameDistributor
-from ..workers.ffmpeg_worker import FFmpegWorker, WorkerStatus
+
+# El directo, la grabación (-c copy) y la IA (AIFrameSource) van TODOS por go2rtc.
+# El antiguo pipeline de decode local (FFmpegWorker → CircularFrameBuffer →
+# FrameDistributor → DualLensSplitter) se ELIMINÓ: decodificaba para nadie y
+# competía por la única conexión RTSP de la cámara (causaba "No se pudo leer el
+# primer frame" + inestabilidad de go2rtc). CameraManager ahora solo registra la
+# cámara como activa y delega grabación/IA (que usan go2rtc).
+
+
+class _Go2RtcCameraHandle:
+    """Marcador de cámara activa cuando todo el flujo (directo/grabación/IA) va
+    por go2rtc y NO se necesita decode local. Mantiene la interfaz mínima que el
+    ciclo de vida usa (stop/get_status) sin procesar frames."""
+
+    def __init__(self, camera_id: int, name: str = ""):
+        self.camera_id = camera_id
+        self.name = name
+
+    def stop(self) -> None:
+        pass
+
+    def set_permanent_failure_callback(self, cb) -> None:
+        pass
+
+    def get_status(self) -> dict:
+        # "status": "running" = WorkerStatus.RUNNING.value, para que el health
+        # check de cameras.py (worker_status["status"] == ...) dé "ok". El resto
+        # los clientes los leen con .get() (ausentes = None, seguro).
+        return {
+            "camera_id": self.camera_id,
+            "status": "running",
+            "source": "go2rtc",
+            "reconnect_attempts": 0,
+            "seconds_since_last_frame": 0,
+            "frames_processed": 0,
+        }
 
 
 class CameraManager:
@@ -32,13 +65,12 @@ class CameraManager:
         if hasattr(self, '_initialized'):
             return
 
-        self._workers: dict[int, FFmpegWorker] = {}
-        self._buffers: dict = {}
-        self._distributors: dict = {}
-        # Para cámaras dual-lens: buffers/distributors por lente
-        # Clave: (camera_id, "l1" | "l2")
-        self._lens_buffers: dict[tuple, CircularFrameBuffer] = {}
-        self._lens_distributors: dict[tuple, FrameDistributor] = {}
+        self._workers: dict = {}          # camera_id -> _Go2RtcCameraHandle
+        self._buffers: dict = {}          # (legacy, sin uso; queda vacío)
+        self._distributors: dict = {}     # (legacy, sin uso; queda vacío)
+        # (legacy dual-lens: ya no se usan; el split lo hace go2rtc)
+        self._lens_buffers: dict = {}
+        self._lens_distributors: dict = {}
         # RLock (reentrante) en vez de Lock porque restart_camera adquiere el
         # lock y dentro llama a stop_camera que también lo adquiere. Con Lock
         # plano eso era un deadlock garantizado: PUT /cameras/{id} se quedaba
@@ -209,56 +241,21 @@ class CameraManager:
             if camera.id in self._workers:
                 self._logger.warning(f"Cámara {camera.id} ya está activa")
                 return False
-
             try:
-                # maxsize=2 → mínima latencia. get_latest() siempre devuelve el
-                # más reciente, así que un buffer mayor no aporta nada (los
-                # frames intermedios se descartan igualmente). Antes era 3,
-                # ahora bajamos a 2 = 1 leyendo + 1 escribiendo en pico.
-                buffer = CircularFrameBuffer(camera_id=camera.id, maxsize=2)
-                distributor = FrameDistributor(camera_id=camera.id)
-                # Import local: el modelo de settings se inyecta solo en este
-                # método (no estaba a nivel de módulo y rompía cámaras mono).
-                from backend.app.config import settings as _settings
-                # Cámaras de 1 sola conexión RTSP: leer del restream de go2rtc
-                # (si GO2RTC_AS_SOURCE) para que go2rtc sea el único consumidor
-                # de la cámara y no haya contención con la grabación/otros.
-                _src = self._go2rtc_source_url(camera.id)
-                # El restream de go2rtc SOLO acepta RTSP sobre TCP (UDP →
-                # "461 Unsupported transport"). RTSP_TRANSPORT del .env aplica
-                # a la cámara; cuando leemos de go2rtc forzamos tcp.
-                _transport = "tcp" if _src else getattr(_settings, "RTSP_TRANSPORT", "tcp")
-                worker = FFmpegWorker(
-                    camera=camera,
-                    frame_buffer=buffer,
-                    rtsp_transport=_transport,
-                    source_url=_src,
-                )
-                worker.set_permanent_failure_callback(self._on_permanent_failure)
-
-                distributor.start(buffer)
-                worker.start()
-
-                self._workers[camera.id] = worker
-                self._buffers[camera.id] = buffer
-                self._distributors[camera.id] = distributor
-
-                # El directo se sirve por go2rtc (WebRTC/RTSP/HLS) directo al
-                # cliente; el backend solo procesa frames para IA y grabación.
-                self._wire_recording_manager(camera.id, distributor)
+                # SOLO go2rtc: el directo (WebRTC/RTSP/HLS), la grabación (-c copy)
+                # y la IA (AIFrameSource) consumen go2rtc directamente. NO se crea
+                # pipeline de decode local (FFmpegWorker/buffer/distributor).
+                self._workers[camera.id] = _Go2RtcCameraHandle(camera.id, camera.name)
+                self._wire_recording_manager(camera.id, None)
                 self._maybe_sync_time(camera)
-
-                self._logger.info(f"Cámara {camera.id} ({camera.name}) iniciada correctamente")
+                self._logger.info(f"Cámara {camera.id} ({camera.name}) iniciada (go2rtc)")
                 return True
-
             except Exception as e:
                 self._logger.error(f"Error al iniciar cámara {camera.id}: {e}")
+                self._workers.pop(camera.id, None)
                 return False
 
     def start_dual_lens_camera(self, parent_camera: Camera) -> bool:
-        from ..cameras.dual_lens_splitter import DualLensSplitter
-        from backend.app.config import settings
-
         # Reset del flag de auto-desactivación: si la estamos re-arrancando es
         # porque el usuario corrigió la config.
         self.clear_auto_disabled(parent_camera.id)
@@ -267,94 +264,22 @@ class CameraManager:
             if parent_camera.id in self._workers:
                 self._logger.warning(f"Cámara dual {parent_camera.id} ya está activa")
                 return False
-
             try:
-                self._logger.info(f"Iniciando cámara DUAL LENS {parent_camera.id}")
-
-                # FIX: Buffer raw con resolución COMPLETA (no la default 720p)
-                # Buffer raw del stream completo dual-lens (antes del split).
-                # maxsize=2 = mínima latencia; el splitter es el único consumer
-                # y procesa síncronamente, no necesita colchón.
-                raw_buffer = CircularFrameBuffer(camera_id=parent_camera.id, maxsize=2)
-                raw_distributor = FrameDistributor(camera_id=parent_camera.id)
-
-                # FIX: Pasar target_resolution forzando las dimensiones duales
-                dual_width = settings.FFMPEG_DUAL_LENS_WIDTH   # 1280
-                dual_height = settings.FFMPEG_DUAL_LENS_HEIGHT # 1440
-
-                _dual_src = self._go2rtc_source_url(parent_camera.id)
-                _dual_transport = "tcp" if _dual_src else settings.RTSP_TRANSPORT
-                worker = FFmpegWorker(
-                    camera=parent_camera,
-                    frame_buffer=raw_buffer,
-                    target_resolution=(dual_width, dual_height),
-                    rtsp_transport=_dual_transport,
-                    source_url=_dual_src,
-                )
-                worker.set_permanent_failure_callback(self._on_permanent_failure)
-
-                raw_distributor.start(raw_buffer)
-                worker.start()
-
-                self._workers[parent_camera.id] = worker
-                self._buffers[parent_camera.id] = raw_buffer
-                self._distributors[parent_camera.id] = raw_distributor
-
-                # Configurar el splitter
-                splitter = DualLensSplitter(parent_camera.id, split_mode="vertical")  # o "horizontal"
-
-                # Buffers y distributors por lente para que AI/recording puedan
-                # suscribirse a un solo lente (l1 o l2) en lugar del frame raw.
-                lens_buf_l1 = CircularFrameBuffer(camera_id=parent_camera.id, maxsize=2)
-                lens_buf_l2 = CircularFrameBuffer(camera_id=parent_camera.id, maxsize=2)
-                lens_dist_l1 = FrameDistributor(camera_id=parent_camera.id)
-                lens_dist_l2 = FrameDistributor(camera_id=parent_camera.id)
-                lens_dist_l1.start(lens_buf_l1)
-                lens_dist_l2.start(lens_buf_l2)
-
-                self._lens_buffers[(parent_camera.id, "l1")] = lens_buf_l1
-                self._lens_buffers[(parent_camera.id, "l2")] = lens_buf_l2
-                self._lens_distributors[(parent_camera.id, "l1")] = lens_dist_l1
-                self._lens_distributors[(parent_camera.id, "l2")] = lens_dist_l2
-
-                # El directo por lente se sirve por go2rtc (cam_X_l1/l2). Los
-                # distribuidores de lente quedan únicamente para la IA.
-
-                def split_and_distribute(frame_data: FrameData):
-                    # splitter.split() retorna VIEWS (no copia) del frame.
-                    # Es seguro porque FFmpegWorker crea un ndarray fresco
-                    # por cada read del pipe → los views permanecen válidos
-                    # mientras alguien tenga referencia (Python GC).
-                    left, right = splitter.split(frame_data.frame)
-
-                    if left is not None and left.size > 0:
-                        lens_buf_l1.put(left)
-                    if right is not None and right.size > 0:
-                        lens_buf_l2.put(right)
-
-                # needs_copy=False: splitter solo lee (slices) y los views
-                # quedan en lens_buf. Antes con needs_copy=True se hacía un
-                # memcpy de ~5.5 MB del frame combinado por cada cuadro,
-                # malgastando ancho de banda de memoria.
-                raw_distributor.register_consumer(
-                    "dual_lens_splitter",
-                    split_and_distribute,
-                    needs_copy=False
-                )
-
-                # En dual-lens registramos el pre-buffer de grabación contra l1
-                # (asumimos l1 como lente "principal" del par).
-                self._wire_recording_manager(parent_camera.id, lens_dist_l1)
+                # SOLO go2rtc: el split en lentes lo hace go2rtc (cam_X_l1/l2 por
+                # hardware QSV). El backend ya NO decodifica ni divide localmente.
+                self._workers[parent_camera.id] = _Go2RtcCameraHandle(
+                    parent_camera.id, parent_camera.name)
+                self._wire_recording_manager(parent_camera.id, None)
                 self._maybe_sync_time(parent_camera)
-
-                self._logger.info(f"✅ Cámara dual {parent_camera.id} iniciada: "
-                                f"{dual_width}x{dual_height} → l1/l2")
+                self._logger.info(
+                    f"✅ Cámara dual {parent_camera.id} iniciada (go2rtc l1/l2)")
                 return True
-
             except Exception as e:
-                self._logger.error(f"Error iniciando cámara dual {parent_camera.id}: {e}", exc_info=True)
+                self._logger.error(
+                    f"Error iniciando cámara dual {parent_camera.id}: {e}", exc_info=True)
+                self._workers.pop(parent_camera.id, None)
                 return False
-        
+
     def stop_camera(self, camera_id: int) -> bool:
         with self._lifecycle_lock:
             if camera_id in self._workers:
@@ -456,7 +381,7 @@ class CameraManager:
             return None
         return self._buffers.get(camera_id)
 
-    def get_worker(self, camera_id: int) -> FFmpegWorker | None:
+    def get_worker(self, camera_id: int):
         return self._workers.get(camera_id)
 
     def _wire_recording_manager(self, camera_id: int, distributor) -> None:
@@ -476,8 +401,11 @@ class CameraManager:
             if rec_mgr is None:
                 return
 
-            # 1) Registrar buffer pre-evento (instantáneo)
-            rec_mgr.register_camera_buffer(camera_id, distributor)
+            # 1) Buffer pre-evento ELIMINADO. Los clips de evento se generan por
+            # SPLICE (-c copy) de la grabación continua (_record_event_splice),
+            # sin pre-buffer en RAM ni copia por frame. Requiere continua activa
+            # (AUTO_START_RECORDING). Ya NO se registra un consumidor en el
+            # distributor para esto → menos RAM y menos trabajo por frame.
 
             # 2) Auto-start de grabación continua si está habilitado
             if getattr(settings, "AUTO_START_RECORDING", True):

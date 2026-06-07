@@ -5,14 +5,26 @@ rtsp:
 webrtc:
   listen: :8555
   candidates:
-  - 192.168.0.102:8555
+  - 192.168.0.101:8555
 streams:
   cam_9: rtsp://admin:admin@192.168.0.100:554/user=admin_password=tlJwpbo6_channel=0_stream=0&onvif=0.sdp?real_stream
-  cam_9_l1: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:ih/2
-  cam_9_l1_medium: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:ih/2,scale=-2:480
-  cam_9_l1_low: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:ih/2,scale=-2:360
-  cam_9_l2: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:0
-  cam_9_l2_medium: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:0,scale=-2:480
-  cam_9_l2_low: ffmpeg:cam_9#video=h264#raw=-vf crop=iw:ih/2:0:0,scale=-2:360
+  cam_9_l1: exec:ffmpeg -hide_banner -loglevel error -c:v hevc_qsv -rtsp_transport
+    tcp -i rtsp://127.0.0.1:8554/cam_9 -vf crop=iw:ih/2:0:ih/2 -c:v h264_qsv -g 30
+    -bf 0 -an -rtsp_transport tcp -f rtsp {output}
+  cam_9_l1_medium: exec:ffmpeg -hide_banner -loglevel error -c:v hevc_qsv -rtsp_transport
+    tcp -i rtsp://127.0.0.1:8554/cam_9 -vf crop=iw:ih/2:0:ih/2,scale=-2:480 -c:v h264_qsv
+    -g 30 -bf 0 -an -rtsp_transport tcp -f rtsp {output}
+  cam_9_l1_low: exec:ffmpeg -hide_banner -loglevel error -c:v hevc_qsv -rtsp_transport
+    tcp -i rtsp://127.0.0.1:8554/cam_9 -vf crop=iw:ih/2:0:ih/2,scale=-2:360 -c:v h264_qsv
+    -g 30 -bf 0 -an -rtsp_transport tcp -f rtsp {output}
+  cam_9_l2: exec:ffmpeg -hide_banner -loglevel error -c:v hevc_qsv -rtsp_transport
+    tcp -i rtsp://127.0.0.1:8554/cam_9 -vf crop=iw:ih/2:0:0 -c:v h264_qsv -g 30 -bf
+    0 -an -rtsp_transport tcp -f rtsp {output}
+  cam_9_l2_medium: exec:ffmpeg -hide_banner -loglevel error -c:v hevc_qsv -rtsp_transport
+    tcp -i rtsp://127.0.0.1:8554/cam_9 -vf crop=iw:ih/2:0:0,scale=-2:480 -c:v h264_qsv
+    -g 30 -bf 0 -an -rtsp_transport tcp -f rtsp {output}
+  cam_9_l2_low: exec:ffmpeg -hide_banner -loglevel error -c:v hevc_qsv -rtsp_transport
+    tcp -i rtsp://127.0.0.1:8554/cam_9 -vf crop=iw:ih/2:0:0,scale=-2:360 -c:v h264_qsv
+    -g 30 -bf 0 -an -rtsp_transport tcp -f rtsp {output}
 log:
   level: info

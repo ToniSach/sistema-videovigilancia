@@ -80,8 +80,19 @@ interface ApiService {
 
     // ── Grabaciones (lista/playback) ──────────────────────────────────────────
 
+    /**
+     * Lista de grabaciones. Sin parámetros = últimas de las cámaras accesibles.
+     * Con `cameraId` + `date` (YYYY-MM-DD) = todas las del día de esa cámara,
+     * con `playback_url` firmada y `type` (event|continuous) — la pantalla de
+     * Grabaciones lo usa para las pestañas Por lente / Eventos y para reproducir
+     * en cadena (timeline).
+     */
     @GET("recordings/")
-    suspend fun getRecordings(): RecordingListResponse
+    suspend fun getRecordings(
+        @Query("camera_id") cameraId: Int? = null,
+        @Query("date") date: String? = null,
+        @Query("limit") limit: Int = 200,
+    ): RecordingListResponse
 
     @GET("recordings/{id}")
     suspend fun getRecording(@Path("id") id: String): RecordingDetailResponse

@@ -49,8 +49,6 @@ class EventConfigFragment : BaseMenuFragment() {
             "vehicle"            to R.string.pref_event_vehicle,
             "motion"             to R.string.pref_event_motion,
             "camera_offline"    to R.string.pref_event_camera_offline,
-            "camera_reconnected" to R.string.pref_event_camera_reconnected,
-            "tampering"          to R.string.pref_event_tampering,
         )
         private const val DEBOUNCE_MS = 400L
     }

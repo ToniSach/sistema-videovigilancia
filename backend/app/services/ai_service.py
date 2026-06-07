@@ -5,6 +5,7 @@ from typing import Callable, Optional, Dict, Tuple
 
 from ..cameras.camera_manager import CameraManager
 from ..processing.ai.ai_scheduler import AIScheduler
+from ..processing.ai.ai_frame_source import AIFrameSource
 from ..events.event_manager import event_manager, EventData
 from ..config import settings
 
@@ -24,6 +25,9 @@ class AIService:
     def __init__(self, camera_manager: CameraManager):
         self._camera_manager = camera_manager
         self._schedulers: Dict[Tuple[int, str], AIScheduler] = {}
+        # Fuente dedicada por (camera_id, lens): cada IA tiene su AIFrameSource
+        # (un ffmpeg ligero que lee el substream bajo de go2rtc → slot-1).
+        self._sources: Dict[Tuple[int, str], AIFrameSource] = {}
         self._lock = threading.Lock()
         self._event_callback: Optional[
             Callable[[int, str, str, float, dict], None]
@@ -213,43 +217,55 @@ class AIService:
             if not self._can_activate_more_ai() and key not in self._schedulers:
                 return False
 
-        distributor = self._camera_manager.get_distributor(camera_id, lens)
-        if distributor is None:
-            logger.error(
-                f"No hay distributor para cámara {camera_id} lens={lens}. "
-                f"¿La cámara está activa? ¿Es dual-lens si pediste l1/l2?"
-            )
+        # La IA YA NO depende del FrameDistributor del CameraManager: crea su
+        # PROPIA fuente (AIFrameSource) que lee el substream bajo del lente desde
+        # go2rtc. Así funciona aunque la cámara no esté "activa" en CameraManager,
+        # y sin las capas Buffer/Distributor/Queue/Splitter.
+        camera = None
+        try:
+            camera = self._camera_manager.get_camera_by_id(camera_id)
+        except Exception:
+            pass
+        is_dual = bool(getattr(camera, "is_dual_lens", False)) if camera else (lens in ("l1", "l2"))
+        if lens in ("l1", "l2") and not is_dual:
+            logger.error(f"Cámara {camera_id} no es dual-lens; lens={lens} inválido")
             return False
 
+        src_lens = None if lens == "main" else lens
+        ai_w = int(getattr(settings, "AI_SOURCE_WIDTH", 640))
+        ai_h = int(getattr(settings, "AI_SOURCE_HEIGHT", 384))
+        ai_fps = int(getattr(settings, "AI_SOURCE_FPS", 6))
+        ai_q = getattr(settings, "AI_SOURCE_QUALITY", "low")
+
         with self._lock:
+            # Reactivación: parar scheduler + fuente anteriores de este lente.
             if key in self._schedulers:
                 logger.warning(f"Reactivando IA cámara={camera_id} lens={lens}")
                 old = self._schedulers.pop(key)
                 try:
-                    old.stop(distributor)
+                    old.stop()
                 except Exception as e:
                     logger.error(f"Error deteniendo scheduler previo: {e}")
+            old_src = self._sources.pop(key, None)
+            if old_src:
+                try:
+                    old_src.stop()
+                except Exception:
+                    pass
 
-            # Cooldown configurable vía .env (AI_EVENT_COOLDOWN_SECONDS).
-            # Default 30s en producción. Bajar a 0 SOLO para tests rápidos
-            # — con 0s el flood de eventos satura GlobalExecutor (Telegram
-            # + snapshot + splice), retrasando grabación e IA.
-            # Ver settings.AI_EVENT_COOLDOWN_SECONDS.
+            source = AIFrameSource(camera_id, lens=src_lens, width=ai_w,
+                                   height=ai_h, fps=ai_fps, quality=ai_q)
+            source.start()
+
+            # Cooldown configurable (AI_EVENT_COOLDOWN_SECONDS, default 30s).
             cooldown_s = getattr(settings, "AI_EVENT_COOLDOWN_SECONDS", 30)
             scheduler = AIScheduler(camera_id, mode, cooldown_seconds=cooldown_s)
-            # BUG FIX CRÍTICO: el callback DEBE registrarse SIEMPRE.
-            # _detection_callback → _handle_detection → event_manager.emit(...)
-            # → EventService persiste a BD + RecordingManager graba clip +
-            #   NotificationRouter y TelegramNotifier mandan al usuario.
-            #
-            # Antes esto estaba envuelto en `if self._event_callback:` —
-            # condicional erróneo porque `_event_callback` es para callbacks
-            # externos OPCIONALES (que ahora invocamos dentro de
-            # _handle_detection si está seteado). El flujo principal nunca
-            # debió depender de ese flag → ningún evento llegaba a Telegram.
+            # El callback se registra SIEMPRE: _detection_callback →
+            # _handle_detection → event_manager.emit() → BD + clip + Telegram/WS.
             scheduler.set_detection_callback(self._detection_callback)
+            scheduler.start(source)
 
-            scheduler.start(distributor)
+            self._sources[key] = source
             self._schedulers[key] = scheduler
 
         # Precargar el modelo YA (en segundo plano) para que la primera
@@ -266,6 +282,18 @@ class AIService:
         logger.info(f"IA activada | cámara={camera_id} | lens={lens} | modo={mode}")
         # Persistir has_ai=True para reactivar en el próximo arranque del backend
         self._persist_has_ai(camera_id, True)
+
+        # La IA SIEMPRE debe ir acompañada de grabación continua: el clip del
+        # evento detectado se extrae por splice del archivo continuo. Si no está
+        # activa, la iniciamos (start_continuous_recording es idempotente).
+        try:
+            from backend.app.container import get_container
+            rm = get_container().get("recording_manager")
+            if rm and not rm.is_recording_continuous(camera_id):
+                rm.start_continuous_recording(camera_id)
+                logger.info(f"[IA→REC] Grabación continua iniciada para cámara {camera_id}")
+        except Exception as e:
+            logger.warning(f"[IA→REC] No se pudo iniciar grabación continua cam={camera_id}: {e}")
         return True
 
     def _persist_has_ai(self, camera_id: int, has_ai: bool) -> None:
@@ -287,17 +315,21 @@ class AIService:
 
         with self._lock:
             scheduler = self._schedulers.pop(key, None)
+            source = self._sources.pop(key, None)
 
         if not scheduler:
             logger.warning(f"No hay IA activa cámara={camera_id} lens={lens}")
             return False
 
-        distributor = self._camera_manager.get_distributor(camera_id, lens)
-        if distributor:
+        try:
+            scheduler.stop()
+        except Exception as e:
+            logger.error(f"Error deteniendo scheduler: {e}")
+        if source:
             try:
-                scheduler.stop(distributor)
+                source.stop()
             except Exception as e:
-                logger.error(f"Error deteniendo scheduler: {e}")
+                logger.error(f"Error deteniendo fuente IA: {e}")
 
         logger.info(f"IA desactivada | cámara={camera_id} | lens={lens}")
         # Solo desmarcar has_ai si no queda OTRO lente con IA activa
@@ -351,14 +383,19 @@ class AIService:
     # ------------------------------------------------------------------
     def stop_all(self) -> None:
         with self._lock:
-            snapshot = dict(self._schedulers)
+            sched_snap = dict(self._schedulers)
+            src_snap = dict(self._sources)
             self._schedulers.clear()
+            self._sources.clear()
 
-        for (cam_id, lens), scheduler in snapshot.items():
-            distributor = self._camera_manager.get_distributor(cam_id, lens)
-            if distributor:
-                try:
-                    scheduler.stop(distributor)
-                except Exception as e:
-                    logger.error(f"Error deteniendo IA {cam_id}/{lens}: {e}")
+        for (cam_id, lens), scheduler in sched_snap.items():
+            try:
+                scheduler.stop()
+            except Exception as e:
+                logger.error(f"Error deteniendo IA {cam_id}/{lens}: {e}")
+        for src in src_snap.values():
+            try:
+                src.stop()
+            except Exception:
+                pass
         logger.info("Todos los schedulers de IA detenidos")

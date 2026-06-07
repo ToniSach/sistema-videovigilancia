@@ -121,22 +121,27 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {}
     }
 
-    /** Si el intent trae openCameraId (de una notificación push), abre el
-     *  timeline de grabaciones de esa cámara en la fecha del evento. */
+    /** Si el intent trae openCameraId (de una notificación push), abre la
+     *  grabación del evento de esa cámara/fecha y la reproduce en cadena. */
     private fun handleNotificationIntent(navController: androidx.navigation.NavController) {
         val camId = intent?.getIntExtra("openCameraId", -1) ?: -1
         if (camId <= 0) return
-        // Consumir el extra para no re-navegar en rotaciones.
+        // Consumir los extras para no re-navegar en rotaciones.
         intent.removeExtra("openCameraId")
-        val date = intent.getStringExtra("openDate")  // YYYY-MM-DD, opcional
+        val date = intent.getStringExtra("openDate")    // YYYY-MM-DD, opcional
+        val time = intent.getStringExtra("openTime")    // ISO, opcional
+        intent.removeExtra("openTime")
+        if (date.isNullOrBlank()) return
         val args = Bundle().apply {
             putInt("cameraId", camId)
-            if (!date.isNullOrBlank()) putString("date", date)
+            putString("date", date)
+            putString("mode", "event")
+            if (!time.isNullOrBlank()) putString("targetTime", time)
         }
         try {
-            navController.navigate(R.id.timelineFragment, args)
+            navController.navigate(R.id.playbackFragment, args)
         } catch (e: Exception) {
-            android.util.Log.w("MainActivity", "No pude abrir timeline desde notif: ${e.message}")
+            android.util.Log.w("MainActivity", "No pude abrir grabación desde notif: ${e.message}")
         }
     }
 

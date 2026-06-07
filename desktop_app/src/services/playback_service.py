@@ -46,6 +46,7 @@ class VLCPlayer(QObject):
     time_changed = Signal(int)  # segundos
     ended = Signal()
     error = Signal(str)
+    first_frame = Signal()  # emitido cuando aparece el primer frame de video (vout)
 
     def __init__(self, config_options: list = None):
         super().__init__()
@@ -80,6 +81,14 @@ class VLCPlayer(QObject):
         # cambios de calidad solapados llamen stop()/play() a la vez).
         self._swap_lock = threading.Lock()
         self._swap_thread: Optional[threading.Thread] = None
+        # True mientras play_url_async hace stop()+play() en el hilo de fondo.
+        # libVLC player.stop() retiene un mutex interno; si el hilo de UI llama
+        # a video_set_aspect_ratio()/audio_* en ese momento, SE BLOQUEA esperando
+        # ese mutex → la app "no responde". Los widgets deben consultar
+        # is_swapping() antes de tocar el player y reintentar luego.
+        self._swapping = False
+        self._vout_attached = False
+        self._last_play_t = 0.0
 
     def _ensure_timer(self):
         """Crea el QTimer en el primer uso (con QApplication ya viva)."""
@@ -102,7 +111,11 @@ class VLCPlayer(QObject):
     def _do_play(self, url: str):
         """Núcleo de reproducción (stop+set_media+play). Lo comparten play_url
         y play_url_async. OJO: player.stop() es BLOQUEANTE en libVLC 3."""
+        import time as _time
+        import vlc as _vlc
+        _t0 = _time.perf_counter()
         self.player.stop()
+        _stop_ms = (_time.perf_counter() - _t0) * 1000.0
         media = self.instance.media_new(url)
         # Opciones a nivel de media (por reproductor). Si no se especificó
         # network-caching, usar 300ms por defecto (VOD).
@@ -112,11 +125,31 @@ class VLCPlayer(QObject):
             media.add_option(f":{o}")
         self.player.set_media(media)
         self._current_media = media
+        # DEBUG TTFF: registra cuándo aparece el primer frame (evento Vout) para
+        # ver dónde se van los segundos (stop vs arranque del transcoder/keyframe).
+        # Se engancha UNA sola vez por player (evita acumular handlers).
+        if not self._vout_attached:
+            try:
+                _em = self.player.event_manager()
+
+                def _on_vout(_ev):
+                    dt = (_time.perf_counter() - self._last_play_t) * 1000.0
+                    logger.info(f"[TTFF] primer frame en {dt:.0f}ms")
+                    try:
+                        self.first_frame.emit()
+                    except Exception:
+                        pass
+
+                _em.event_attach(_vlc.EventType.MediaPlayerVout, _on_vout)
+                self._vout_attached = True
+            except Exception:
+                pass
+        self._last_play_t = _time.perf_counter()
         result = self.player.play()
         if result == -1:
             self.error.emit("No se pudo iniciar reproducción")
         else:
-            logger.info(f"Reproduciendo: {url}")
+            logger.info(f"Reproduciendo: {url} (stop previo={_stop_ms:.0f}ms)")
 
     def play_url_async(self, url: str):
         """
@@ -129,15 +162,24 @@ class VLCPlayer(QObject):
         """
         def _worker():
             with self._swap_lock:
+                self._swapping = True
                 try:
                     self._do_play(url)
                 except Exception as e:
                     logger.error(f"play_url_async: {e}")
                     self.error.emit(str(e))
+                finally:
+                    self._swapping = False
         self._swap_thread = threading.Thread(
             target=_worker, name="VLCSwap", daemon=True
         )
         self._swap_thread.start()
+
+    def is_swapping(self) -> bool:
+        """True si hay un stop()+play() en curso en el hilo de fondo. Los widgets
+        deben evitar llamar métodos del player (aspect ratio, audio) mientras sea
+        True para no bloquear el hilo de UI en el mutex interno de libVLC."""
+        return self._swapping
     
     def play_file(self, file_path: str):
         """Reproduce archivo local."""
@@ -298,34 +340,73 @@ class PlaybackService(QObject):
         self._temp_dir = tempfile.gettempdir()
         self._current_recording_id: Optional[int] = None
     
-    def play_recording(self, recording_id: int, api_url: str, token: str, 
-                      local_file: Optional[str] = None):
+    def play_recording(self, recording_id: int, api_url: str, token: str,
+                      local_file: Optional[str] = None, lens: Optional[str] = None):
         """
         Reproduce grabación.
-        
+
         Si local_file existe, reproduce local.
         Si no, descarga y luego reproduce.
+
+        lens: "l1"/"l2" para recortar un lente de una grabación dual-lens (la
+        grabación es el frame completo); None/"main" = sin recorte.
         """
         self._current_recording_id = recording_id
-        
+        self._pending_lens = lens  # se aplica el recorte tras cargar el vídeo
+
         if local_file and os.path.exists(local_file):
             self.player.play_file(local_file)
+            self._schedule_lens_crop()
         else:
             # Descargar primero
             url = f"{api_url}/recordings/play/{recording_id}"
             output_path = os.path.join(self._temp_dir, f"recording_{recording_id}.mp4")
-            
+
             headers = {"Authorization": f"Bearer {token}"}
-            
+
             self._download_thread = DownloadThread(url, output_path, headers)
             self._download_thread.progress.connect(self.download_progress.emit)
             self._download_thread.finished_download.connect(self._on_download_finished)
             self._download_thread.error.connect(self.download_error.emit)
             self._download_thread.start()
-    
+
+    def set_lens(self, lens: Optional[str]):
+        """Cambia el lente recortado SIN re-descargar ni reiniciar el vídeo.
+        El recorte es del lado CLIENTE (VLC video_set_crop_geometry), así que
+        basta re-aplicarlo al vídeo en curso. Re-pedir el segmento completo al
+        cambiar de lente durante la reproducción congelaba el reproductor."""
+        self._pending_lens = lens
+        self._apply_lens_crop()
+
+    def _schedule_lens_crop(self):
+        """Programa la aplicación del recorte de lente cuando el vídeo cargue."""
+        QTimer.singleShot(600, self._apply_lens_crop)
+
+    def _apply_lens_crop(self, _tries: int = 0):
+        """Recorta el lente (l1=mitad inferior, l2=mitad superior) en grabaciones
+        dual-lens. Necesita el tamaño del vídeo, que tarda en estar disponible →
+        reintenta unas pocas veces. lens None/main → quita el recorte."""
+        lens = getattr(self, "_pending_lens", None)
+        try:
+            if not lens or lens not in ("l1", "l2"):
+                self.set_crop(None)
+                return
+            w, h = self.get_video_size()
+            if not w or not h:
+                if _tries < 10:
+                    QTimer.singleShot(300, lambda: self._apply_lens_crop(_tries + 1))
+                return
+            half = h // 2
+            # l1 = mitad inferior (offset y=half), l2 = mitad superior (y=0).
+            top = 0 if lens == "l2" else half
+            self.set_crop(f"{w}x{half}+0+{top}")
+        except Exception as e:
+            logger.debug(f"_apply_lens_crop: {e}")
+
     def _on_download_finished(self, path: str):
         self.download_finished.emit(path)
         self.player.play_file(path)
+        self._schedule_lens_crop()
     
     def play_local_file(self, file_path: str):
         """Reproduce archivo local directamente."""

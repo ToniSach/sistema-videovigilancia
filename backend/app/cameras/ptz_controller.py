@@ -246,7 +246,12 @@ class PTZController:
             req.ProfileToken = self._profile_token
             req.PresetName = name
             resp = self._ptz.SetPreset(req)
-            return resp.PresetToken
+            # Según la cámara, SetPreset devuelve el token como STRING directo
+            # (XiongMai y muchas baratas) o como objeto con .PresetToken (perfil
+            # ONVIF estricto). Soportamos ambos para no romper con un AttributeError.
+            if isinstance(resp, str):
+                return resp
+            return getattr(resp, "PresetToken", None) or (str(resp) if resp else None)
         except Exception as e:
             logger.error(f"Error guardando preset cam {self._camera.id}: {e}")
             return None

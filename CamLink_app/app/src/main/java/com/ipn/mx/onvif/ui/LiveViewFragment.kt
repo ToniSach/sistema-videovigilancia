@@ -2,12 +2,19 @@ package com.ipn.mx.onvif.ui
 
 import android.annotation.SuppressLint
 import android.content.pm.ActivityInfo
+import android.graphics.Color
+import android.net.Uri
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.Toast
@@ -25,52 +32,63 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.navigation.fragment.findNavController
-import com.google.android.material.button.MaterialButton
 import com.ipn.mx.onvif.R
 import com.ipn.mx.onvif.model.CameraResponse
 import com.ipn.mx.onvif.network.RetrofitClient
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 class LiveViewFragment : BaseMenuFragment() {
 
     // ── Estado: "feeds" ───────────────────────────────────────────────────────
     // Una cámara mono = 1 feed; una dual-lens = 2 feeds (L1 y L2). La navegación
-    // prev/next cicla por feeds, así cada lente se ve por separado por WebRTC/RTSP
+    // prev/next cicla por feeds, así cada lente se ve por separado por WebRTC/HLS
     // (go2rtc) sin tocar el layout.
     private data class Feed(
         val camera: CameraResponse,
         val lens: String?,        // null (mono) | "l1" | "l2"
-        val url: String,          // URL preferida (HLS si existe)
-        val fallbackUrl: String?, // RTSP de respaldo si el HLS falla
+        // URL HLS de go2rtc (http://IP:PORT/api/stream.m3u8?src=cam_X). De aquí se
+        // DERIVA la URL WebRTC (mismo host:puerto + src) y también es el primario
+        // de ExoPlayer si WebRTC no está disponible/falla.
+        val hlsUrl: String?,
+        val rtspUrl: String?,     // restream RTSP de go2rtc — último fallback de ExoPlayer
         val label: String,
     )
     private var feeds: List<Feed> = emptyList()
     private var currentFeedIndex = 0
     private val currentFeed get() = feeds.getOrNull(currentFeedIndex)
     private val currentCamera get() = currentFeed?.camera
-    // Para no entrar en bucle de fallback HLS→RTSP→HLS por feed.
+    // Para no entrar en bucle de fallback HLS→RTSP→HLS por feed en ExoPlayer.
     private var triedFallback = false
 
-    /** Construye la lista de feeds: dual-lens → 2 (L1/L2); mono → 1.
-     *  Prefiere HLS (fiable en ExoPlayer); RTSP queda como fallback. */
+    /** Construye la lista de feeds: dual-lens → 2 (L1/L2); mono → 1. */
     private fun buildFeeds(cams: List<CameraResponse>): List<Feed> {
         val out = mutableListOf<Feed>()
         for (c in cams) {
             if (c.isDualLens && !c.streamUrlL1.isNullOrBlank() && !c.streamUrlL2.isNullOrBlank()) {
-                val urlL1 = c.hlsUrlL1?.takeIf { it.isNotBlank() } ?: c.streamUrlL1!!
-                val urlL2 = c.hlsUrlL2?.takeIf { it.isNotBlank() } ?: c.streamUrlL2!!
-                out.add(Feed(c, "l1", urlL1, c.streamUrlL1, "${c.name} · L1"))
-                out.add(Feed(c, "l2", urlL2, c.streamUrlL2, "${c.name} · L2"))
+                out.add(Feed(c, "l1", c.hlsUrlL1?.takeIf { it.isNotBlank() }, c.streamUrlL1, "${c.name} · L1"))
+                out.add(Feed(c, "l2", c.hlsUrlL2?.takeIf { it.isNotBlank() }, c.streamUrlL2, "${c.name} · L2"))
             } else {
-                val url = c.liveHlsUrl ?: c.liveUrl
-                out.add(Feed(c, null, url, c.liveUrl, c.name))
+                out.add(Feed(c, null, c.liveHlsUrl, c.liveUrl, c.name))
             }
         }
         return out
     }
 
-    // ── ExoPlayer ─────────────────────────────────────────────────────────────
+    // ── Reproductores ─────────────────────────────────────────────────────────
+    // Primario: WebRTC en un WebView (baja latencia, ~sub-segundo). go2rtc reusa
+    // el H264 ya ingerido, sin transcode ni disco extra (mismo coste de servidor
+    // que el HLS, pero sin sus 5-7s de buffer). Fallback: ExoPlayer (HLS→RTSP).
     private var player: ExoPlayer? = null
+    private var webView: WebView? = null
+    private var surfaceViewRef: SurfaceView? = null
+
+    // Estado de la sesión WebRTC en curso.
+    private var usingWebRtc = false       // el WebView es el reproductor activo
+    private var webRtcPlaying = false     // ya llegó el primer frame
+    private var webRtcFellBack = false    // ya caímos a ExoPlayer para este feed
+    private var pendingWsUrl: String? = null   // URL a inyectar tras onPageFinished
+    private var webRtcWatchdog: Runnable? = null  // dispara fallback si no arranca
 
     // ── Referencias a vistas (para ocultar controles no soportados + fullscreen)
     private var rootLayout: ConstraintLayout? = null
@@ -87,14 +105,22 @@ class LiveViewFragment : BaseMenuFragment() {
     private var micOn       = false
     private var nightOn     = false
     private var lastPtzDir: String? = null   // última dirección PTZ enviada
-    // Selector de calidad (HLS): high = nativo, medium = 480p, low = 360p.
-    private val qualities = listOf("high", "medium", "low")
-    private val qualityLabels = mapOf("high" to "Alta", "medium" to "Media", "low" to "Baja")
-    // Arranca en "Media" (índice 1) para aligerar CPU/red, igual que el escritorio.
-    private var qualityIndex = 1
-    private val currentQuality get() = qualities[qualityIndex]
+    // Calidad fija "media" (transcode 480p h264 ligero en go2rtc) en toda la app:
+    // se quitó el selector Alta/Baja para una experiencia uniforme y un único
+    // substream que mantener caliente.
+    private val currentQuality = "medium"
+
+    // Feed a abrir al entrar (desde la lista de cámaras): cámara + lente tocados.
+    private var argCameraId: Int = -1
+    private var argLens: String? = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        argCameraId = arguments?.getString("cameraId")?.toIntOrNull() ?: -1
+        argLens = arguments?.getString("lens")
+    }
 
     override fun onCreateView(
         inflater: LayoutInflater, container: ViewGroup?,
@@ -102,7 +128,7 @@ class LiveViewFragment : BaseMenuFragment() {
     ): View = inflater.inflate(R.layout.fragment_live_view, container, false)
 
     @OptIn(UnstableApi::class)
-    @SuppressLint("ClickableViewAccessibility")
+    @SuppressLint("ClickableViewAccessibility", "SetJavaScriptEnabled")
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
@@ -130,28 +156,35 @@ class LiveViewFragment : BaseMenuFragment() {
         btnMicRef        = btnMic
         btnFullscreenRef = btnFullscreen
 
-        // Preparar el SurfaceView para ExoPlayer dentro del FrameLayout
+        // ── Vistas de vídeo (ambas hijas del FrameLayout; se alternan por
+        // visibilidad). Se insertan en índice 0 para quedar DETRÁS de los botones
+        // superpuestos (flechas, calidad, cerrar) que el XML añade primero.
         val surfaceView = SurfaceView(requireContext()).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
+            visibility = View.GONE
         }
+        val wv = createWebRtcWebView()
         cameraFeed.addView(surfaceView, 0)
+        cameraFeed.addView(wv, 0)
+        surfaceViewRef = surfaceView
+        webView = wv
 
         // Cargar lista de cámaras del servidor
-        loadCameras(surfaceView)
+        loadCameras()
 
         // ── Navegación entre cámaras ─────────────────────────────────────────
         btnPrevFeed.setOnClickListener {
             if (feeds.isEmpty()) return@setOnClickListener
             currentFeedIndex = (currentFeedIndex - 1 + feeds.size) % feeds.size
-            playCurrentCamera(surfaceView)
+            playCurrentCamera()
         }
         btnNextFeed.setOnClickListener {
             if (feeds.isEmpty()) return@setOnClickListener
             currentFeedIndex = (currentFeedIndex + 1) % feeds.size
-            playCurrentCamera(surfaceView)
+            playCurrentCamera()
         }
 
         // ── Joystick PTZ ─────────────────────────────────────────────────────
@@ -312,16 +345,6 @@ class LiveViewFragment : BaseMenuFragment() {
             findNavController().navigate(R.id.action_liveView_to_cameraList)
         }
         btnFullscreen.setOnClickListener { toggleFullscreen() }
-
-        // ── Selector de calidad (cicla Alta → Media → Baja) ──────────────────
-        val btnQuality = view.findViewById<MaterialButton>(R.id.btnQuality)
-        btnQuality.text = qualityLabels[currentQuality]
-        btnQuality.setOnClickListener {
-            qualityIndex = (qualityIndex + 1) % qualities.size
-            btnQuality.text = qualityLabels[currentQuality]
-            Toast.makeText(requireContext(), "Calidad: ${qualityLabels[currentQuality]}", Toast.LENGTH_SHORT).show()
-            playCurrentCamera(surfaceView)  // recargar con la nueva calidad
-        }
     }
 
     /** Aplica la calidad al stream: high = url tal cual; medium/low → añade el
@@ -413,7 +436,7 @@ class LiveViewFragment : BaseMenuFragment() {
 
     // ── Red: cargar cámaras ───────────────────────────────────────────────────
 
-    private fun loadCameras(surfaceView: SurfaceView) {
+    private fun loadCameras() {
         val baseUrl = RetrofitClient.buildBaseUrl(requireContext()) ?: return
         val api     = RetrofitClient.create(baseUrl, requireContext())
 
@@ -424,8 +447,8 @@ class LiveViewFragment : BaseMenuFragment() {
                     val cams = response.body()?.data ?: emptyList()
                     feeds = buildFeeds(cams)
                     if (feeds.isNotEmpty()) {
-                        currentFeedIndex = 0
-                        playCurrentCamera(surfaceView)
+                        currentFeedIndex = pickInitialFeedIndex()
+                        playCurrentCamera()
                     } else {
                         Toast.makeText(requireContext(), "No hay cámaras registradas", Toast.LENGTH_LONG).show()
                     }
@@ -444,10 +467,171 @@ class LiveViewFragment : BaseMenuFragment() {
         }
     }
 
-    // ── ExoPlayer: reproducir RTSP ────────────────────────────────────────────
+    /** Feed inicial: el (cámara, lente) que se tocó en la lista; si no, el 0. */
+    private fun pickInitialFeedIndex(): Int {
+        if (argCameraId <= 0) return 0
+        val exact = feeds.indexOfFirst {
+            it.camera.id == argCameraId && (argLens == null || it.lens == argLens)
+        }
+        if (exact >= 0) return exact
+        val byCam = feeds.indexOfFirst { it.camera.id == argCameraId }
+        return if (byCam >= 0) byCam else 0
+    }
 
-    private fun playCurrentCamera(surfaceView: SurfaceView) {
+    // ── Reproducción: WebRTC primario, ExoPlayer (HLS→RTSP) de fallback ───────
+
+    /** Punto de entrada: intenta WebRTC; si no hay URL derivable, va a ExoPlayer. */
+    private fun playCurrentCamera() {
         val feed = currentFeed ?: return
+        val wsUrl = webRtcWsUrl(feed, currentQuality)
+        if (wsUrl != null && webView != null) {
+            startWebRtc(wsUrl, feed)
+        } else {
+            startExoPlayer(feed)
+        }
+        Toast.makeText(requireContext(), feed.label, Toast.LENGTH_SHORT).show()
+    }
+
+    /** Deriva la URL de signaling WebRTC de go2rtc a partir del HLS:
+     *  http://IP:PORT/api/stream.m3u8?src=cam_X  →  ws://IP:PORT/api/ws?src=cam_X
+     *  Aplica la calidad al nombre del stream (cam_X → cam_X_low). */
+    private fun webRtcWsUrl(feed: Feed, quality: String): String? {
+        val hls = feed.hlsUrl?.takeIf { it.isNotBlank() } ?: return null
+        val uri = runCatching { Uri.parse(hls) }.getOrNull() ?: return null
+        val host = uri.host ?: return null
+        val port = if (uri.port != -1) uri.port else 1984
+        var src = uri.getQueryParameter("src")?.takeIf { it.isNotBlank() } ?: return null
+        if (quality != "high") src = "${src}_$quality"
+        return "ws://$host:$port/api/ws?src=$src"
+    }
+
+    /** Arranca (o reinicia) la sesión WebRTC en el WebView. */
+    private fun startWebRtc(wsUrl: String, feed: Feed) {
+        val wv = webView ?: return startExoPlayer(feed)
+        // Liberar ExoPlayer y mostrar el WebView.
+        player?.release(); player = null
+        surfaceViewRef?.visibility = View.GONE
+        wv.visibility = View.VISIBLE
+
+        usingWebRtc = true
+        webRtcPlaying = false
+        webRtcFellBack = false
+        pendingWsUrl = wsUrl
+        // CLAVE: cargar la página con baseUrl http://host:1984 (mismo origen que el
+        // ws://). Si se cargara con file://, Chromium la trata como "secure context"
+        // y BLOQUEA el WebSocket ws:// inseguro como mixed-content (setMixedContentMode
+        // no cubre WebSockets) → WebRTC nunca conecta y caía a HLS (los 7s de delay).
+        // Con origen http el ws:// es mismo-origen inseguro → permitido.
+        val origin = runCatching {
+            val u = Uri.parse(wsUrl)
+            "http://${u.host}:${if (u.port != -1) u.port else 1984}"
+        }.getOrNull() ?: "http://127.0.0.1:1984"
+        // start() se inyecta en onPageFinished (resetea el estado JS en cada carga).
+        wv.loadDataWithBaseURL(origin, webRtcHtml(), "text/html", "utf-8", null)
+
+        // Watchdog: si WebRTC no entrega frame en 7s, caer a HLS (ExoPlayer).
+        cancelWebRtcWatchdog()
+        webRtcWatchdog = Runnable {
+            if (usingWebRtc && !webRtcPlaying) {
+                android.util.Log.w("LiveView", "WebRTC no arrancó en 7s; fallback a HLS")
+                fallbackToExo(feed)
+            }
+        }.also { wv.postDelayed(it, 7000) }
+
+        updateControlsForCamera(feed.camera)
+    }
+
+    /** Crea y configura el WebView que aloja el reproductor WebRTC. */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createWebRtcWebView(): WebView = WebView(requireContext()).apply {
+        layoutParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        )
+        setBackgroundColor(Color.BLACK)
+        visibility = View.GONE
+        with(settings) {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            // Imprescindible para autoplay del <video> sin gesto del usuario.
+            mediaPlaybackRequiresUserGesture = false
+            // La página es file:// y el ws:// va a la LAN por HTTP plano.
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        }
+        addJavascriptInterface(WebRtcBridge(), "AndroidBridge")
+        // Reenviar console.log/error del reproductor a logcat (tag LiveViewJS) para
+        // diagnosticar la negociación WebRTC desde el host.
+        webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(cm: android.webkit.ConsoleMessage): Boolean {
+                android.util.Log.d("LiveViewJS", "${cm.message()} @${cm.lineNumber()}")
+                return true
+            }
+        }
+        webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) {
+                val ws = pendingWsUrl ?: return
+                // JSONObject.quote escapa comillas/barras para inyectar la URL segura.
+                view.evaluateJavascript("start(${JSONObject.quote(ws)})", null)
+            }
+        }
+    }
+
+    // HTML del reproductor WebRTC (asset), cacheado tras la primera lectura.
+    private var webRtcHtmlCache: String? = null
+    private fun webRtcHtml(): String {
+        webRtcHtmlCache?.let { return it }
+        val html = requireContext().assets.open("go2rtc_webrtc.html")
+            .bufferedReader().use { it.readText() }
+        webRtcHtmlCache = html
+        return html
+    }
+
+    /** Puente JS→Kotlin: la página reporta 'playing' / 'error'. Las llamadas
+     *  llegan en un hilo binder → se marshalean a UI con view.post. */
+    private inner class WebRtcBridge {
+        @JavascriptInterface
+        fun onState(state: String) {
+            webView?.post { handleWebRtcState(state) }
+        }
+    }
+
+    private fun handleWebRtcState(state: String) {
+        if (!usingWebRtc) return
+        when (state) {
+            "playing" -> {
+                webRtcPlaying = true
+                cancelWebRtcWatchdog()
+            }
+            "error" -> {
+                // Fallar a HLS una sola vez por feed (evita parpadeo HLS↔WebRTC).
+                if (!webRtcFellBack) currentFeed?.let { fallbackToExo(it) }
+            }
+        }
+    }
+
+    /** Demota la reproducción de WebRTC a ExoPlayer (HLS→RTSP) para este feed. */
+    private fun fallbackToExo(feed: Feed) {
+        webRtcFellBack = true
+        usingWebRtc = false
+        cancelWebRtcWatchdog()
+        webView?.let {
+            it.evaluateJavascript("stop()", null)
+            it.visibility = View.GONE
+        }
+        surfaceViewRef?.visibility = View.VISIBLE
+        startExoPlayer(feed)
+    }
+
+    private fun cancelWebRtcWatchdog() {
+        webRtcWatchdog?.let { webView?.removeCallbacks(it) }
+        webRtcWatchdog = null
+    }
+
+    /** Reproduce con ExoPlayer: HLS preferido, RTSP como respaldo. */
+    @OptIn(UnstableApi::class)
+    private fun startExoPlayer(feed: Feed) {
+        val surfaceView = surfaceViewRef ?: return
+        surfaceView.visibility = View.VISIBLE
 
         // Liberar instancia anterior
         player?.release()
@@ -455,8 +639,9 @@ class LiveViewFragment : BaseMenuFragment() {
 
         // Aplicar la calidad elegida (high/medium/low) a la URL preferida y a la
         // de respaldo (go2rtc tiene substreams cam_X[_lY]_low/_medium).
-        val primaryUrl = applyQuality(feed.url, currentQuality) ?: feed.url
-        val fallbackUrl = applyQuality(feed.fallbackUrl, currentQuality)
+        val primaryUrl = applyQuality(feed.hlsUrl ?: feed.rtspUrl, currentQuality)
+            ?: feed.rtspUrl ?: return
+        val fallbackUrl = applyQuality(feed.rtspUrl, currentQuality)
 
         player = ExoPlayer.Builder(requireContext()).build().also { exo ->
             exo.setVideoSurfaceView(surfaceView)
@@ -485,9 +670,7 @@ class LiveViewFragment : BaseMenuFragment() {
             exo.playWhenReady = true
         }
 
-        // Ajustar qué controles se muestran según las capacidades de la cámara.
         updateControlsForCamera(feed.camera)
-        Toast.makeText(requireContext(), feed.label, Toast.LENGTH_SHORT).show()
     }
 
     // ── PTZ ───────────────────────────────────────────────────────────────────
@@ -564,17 +747,38 @@ class LiveViewFragment : BaseMenuFragment() {
     override fun onPause() {
         super.onPause()
         player?.pause()
+        // Cortar la sesión WebRTC y pausar el WebView (libera CPU/red en 2º plano).
+        webView?.let {
+            it.evaluateJavascript("stop()", null)
+            it.onPause()
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        player?.play()
+        webView?.onResume()
+        // Reestablecer el directo al volver (evita mostrar un frame congelado y
+        // re-negocia WebRTC, que no sobrevive a un onPause/stop()).
+        if (feeds.isNotEmpty()) {
+            playCurrentCamera()
+        } else {
+            player?.play()
+        }
     }
 
     override fun onDestroyView() {
         super.onDestroyView()
+        cancelWebRtcWatchdog()
         player?.release()
         player = null
+        webView?.let {
+            it.evaluateJavascript("stop()", null)
+            it.stopLoading()
+            (it.parent as? ViewGroup)?.removeView(it)
+            it.destroy()
+        }
+        webView = null
+        surfaceViewRef = null
         // Si salimos estando en pantalla completa, restaurar el chrome del
         // sistema y la orientación para no dejar la app "rota" en otras pantallas.
         if (isFullscreen) {

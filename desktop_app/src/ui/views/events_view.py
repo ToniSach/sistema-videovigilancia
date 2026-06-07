@@ -33,7 +33,6 @@ EVENT_TYPES = {
     "vehicle": ("Vehículo", "#f59e0b"),
     "motion": ("Movimiento", "#38bdf8"),
     "camera_offline": ("Cámara offline", "#fa6"),
-    "tampering": ("Sabotaje", "#ef4444"),
 }
 
 
@@ -78,7 +77,10 @@ class EventsView(QWidget):
         super().__init__(parent)
         self._events: List[dict] = []
         self._cameras: List[dict] = []
-        self._snapshot_thread: Optional[SnapshotLoaderThread] = None
+        # Hilos de descarga de snapshot EN VUELO. Se conservan aquí para que no
+        # los recolecte el GC mientras corren (causa de "QThread destroyed while
+        # running"); se autoeliminan al terminar vía _discard_snapshot_thread.
+        self._snapshot_threads: List[SnapshotLoaderThread] = []
         self._setup_ui()
 
         # Auto-refresh cada 10s (los eventos no son críticos en tiempo real)
@@ -557,15 +559,30 @@ class EventsView(QWidget):
         token = api_client.get_stream_token() or ""
         url = f"{config.API_BASE_URL}/events/{event_id}/snapshot"
 
-        # Detener thread anterior si existe
-        if self._snapshot_thread and self._snapshot_thread.isRunning():
-            self._snapshot_thread.quit()
-            self._snapshot_thread.wait(500)
+        # NO usar quit()/wait(): SnapshotLoaderThread sobreescribe run() (sin
+        # event loop), así que quit() no hace nada y wait(500) puede expirar con
+        # la descarga aún en curso; al reasignar se perdía la referencia al hilo
+        # en ejecución → "QThread: Destroyed while thread is still running".
+        # En su lugar dejamos terminar los hilos en vuelo (los handlers ya
+        # ignoran resultados que no son del evento seleccionado) y los liberamos
+        # al finalizar.
+        thread = SnapshotLoaderThread(event_id, url, token)
+        thread.loaded.connect(self._on_snapshot_loaded)
+        thread.failed.connect(self._on_snapshot_failed)
+        thread.finished.connect(lambda t=thread: self._discard_snapshot_thread(t))
+        self._snapshot_threads.append(thread)
+        thread.start()
 
-        self._snapshot_thread = SnapshotLoaderThread(event_id, url, token)
-        self._snapshot_thread.loaded.connect(self._on_snapshot_loaded)
-        self._snapshot_thread.failed.connect(self._on_snapshot_failed)
-        self._snapshot_thread.start()
+    def _discard_snapshot_thread(self, thread: "SnapshotLoaderThread"):
+        """Quita el hilo terminado de la lista y lo marca para borrado seguro."""
+        try:
+            self._snapshot_threads.remove(thread)
+        except ValueError:
+            pass
+        try:
+            thread.deleteLater()
+        except Exception:
+            pass
 
     def _on_snapshot_loaded(self, event_id: int, pix: QPixmap):
         # Verificar que aún es el evento seleccionado

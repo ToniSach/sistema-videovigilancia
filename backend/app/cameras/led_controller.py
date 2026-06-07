@@ -119,10 +119,77 @@ class LEDController:
                 logger.error(f"[LED] cam={self._camera.id} error set_ir_cut: {e}")
                 return False
 
+    def set_white_light(self, on: bool) -> bool:
+        """
+        BEST-EFFORT: enciende/apaga la LUZ BLANCA de la cámara.
+
+        OJO: la luz blanca NO es estándar ONVIF. Las cámaras XiongMai/iCSee la
+        controlan con comandos auxiliares propietarios (o el protocolo binario
+        del puerto 34567). Probamos varios tokens de SendAuxiliaryCommand vía
+        PTZ y device-mgmt; si la cámara los acepta, la luz responde. Si ninguno
+        funciona en TU cámara, hay que mirar el log y, en el peor caso, usar el
+        protocolo propietario (tarea aparte). Devuelve True si algún comando se
+        envió sin error (no garantiza que la luz físicamente encendiera).
+        """
+        if not self._connected or self._cam is None:
+            return False
+        st = "On" if on else "Off"
+        candidates = [
+            f"tt:WhiteLight|{st}", f"WhiteLight|{st}",
+            f"tt:FloodLight|{st}", f"FloodLight|{st}",
+            f"tt:IRLamp|{st}", f"LightControl|{st}", f"tt:Wiper|{st}",
+        ]
+        # 1) PTZ.SendAuxiliaryCommand (necesita ProfileToken)
+        try:
+            ptz = self._cam.create_ptz_service()
+            media = self._cam.create_media_service()
+            profs = media.GetProfiles()
+            ptoken = profs[0].token if profs else None
+            for cmd in candidates:
+                try:
+                    req = ptz.create_type("SendAuxiliaryCommand")
+                    req.ProfileToken = ptoken
+                    req.AuxiliaryData = cmd
+                    ptz.SendAuxiliaryCommand(req)
+                    logger.info(f"[LED] cam={self._camera.id} luz blanca via PTZ aux '{cmd}'")
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # 2) DeviceMgmt.SendAuxiliaryCommand (algunas cámaras lo exponen aquí)
+        try:
+            dev = self._cam.create_devicemgmt_service()
+            for cmd in candidates:
+                try:
+                    dev.SendAuxiliaryCommand({"AuxiliaryCommand": cmd})
+                    logger.info(f"[LED] cam={self._camera.id} luz blanca via Device aux '{cmd}'")
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        logger.info(
+            f"[LED] cam={self._camera.id}: luz blanca no respondió por ONVIF "
+            f"(probados {len(candidates)} comandos aux). Puede requerir protocolo propietario."
+        )
+        return False
+
     def turn_on(self) -> bool:
-        return self.set_ir_cut_filter("OFF")  # IR-Cut OFF = ver IR → LEDs IR encendidos
+        # Comportamiento previo (IR-cut OFF) SE MANTIENE para no perder el modo
+        # noche que ya funcionaba, y ADEMÁS se intenta encender la luz blanca.
+        ok = self.set_ir_cut_filter("OFF")
+        try:
+            self.set_white_light(True)
+        except Exception:
+            pass
+        return ok
 
     def turn_off(self) -> bool:
+        try:
+            self.set_white_light(False)
+        except Exception:
+            pass
         return self.set_ir_cut_filter("ON")
 
     def set_auto(self) -> bool:

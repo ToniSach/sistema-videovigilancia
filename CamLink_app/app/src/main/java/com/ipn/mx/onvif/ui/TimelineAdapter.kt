@@ -32,7 +32,10 @@ class TimelineAdapter(
         holder.time.text = formatHour(seg.start)
         val mins = seg.durationSeconds / 60
         val secs = seg.durationSeconds % 60
-        holder.sub.text = "%d:%02d · %.1f MB".format(mins, secs, seg.fileSizeMb)
+        holder.sub.text = if (seg.fileSizeMb > 0)
+            "%d:%02d · %.1f MB".format(mins, secs, seg.fileSizeMb)
+        else
+            "%d:%02d".format(mins, secs)
 
         if (seg.type == "event") {
             holder.badge.visibility = View.VISIBLE

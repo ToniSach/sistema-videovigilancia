@@ -136,7 +136,8 @@ class PlaybackView(QWidget):
         # combinada en reproducción → "Lente 1" / "Lente 2" / "Completa".
         self.lbl_lens = QLabel("Lente:")
         self.cmb_lens = QComboBox()
-        self.cmb_lens.addItem("Completa", "full")
+        # "Completa" (vídeo con ambos lentes apilados) se quitó a propósito:
+        # en dual-lens solo tiene sentido ver un lente a la vez.
         self.cmb_lens.addItem("Lente 1", "l1")
         self.cmb_lens.addItem("Lente 2", "l2")
         self.cmb_lens.setStyleSheet(self.cmb_camera.styleSheet())
@@ -308,30 +309,26 @@ class PlaybackView(QWidget):
         self.lbl_lens.setVisible(is_dual)
         self.cmb_lens.setVisible(is_dual)
         if not is_dual:
-            # Cámara mono: vista completa y reset del selector.
+            # Cámara mono: vista completa (sin recorte) — no hay lentes.
             self._lens = "full"
+        else:
+            # Dual-lens: ya no existe "Completa"; arrancar en Lente 1.
             self.cmb_lens.blockSignals(True)
             self.cmb_lens.setCurrentIndex(0)
             self.cmb_lens.blockSignals(False)
+            self._lens = self.cmb_lens.currentData() or "l1"
 
     def _lens_param(self) -> Optional[str]:
         """Lente a pedir al backend ('l1'/'l2'), o None para el combinado."""
         return self._lens if self._lens in ("l1", "l2") else None
 
     def _on_lens_change(self, *args):
-        """Cambia el lente: vuelve a pedir el segmento actual al servidor, que
-        recorta y envía SOLO ese lente (opción B, recorte server-side). Conserva
-        la posición de reproducción."""
+        """Cambia el lente recortando en el reproductor (lado CLIENTE, VLC) SIN
+        re-descargar ni reiniciar el segmento. Antes se re-pedía el segmento
+        entero al servidor, lo que CONGELABA la reproducción al cambiar de lente.
+        El recorte se aplica al instante sobre el vídeo en curso."""
         self._lens = self.cmb_lens.currentData() or "full"
-        if self._current_segment_index < 0:
-            return  # nada reproduciéndose aún; se aplicará al pulsar Play
-        # Reproducir el mismo segmento desde la posición actual con el lente nuevo.
-        pos_s = 0.0
-        try:
-            pos_s = float(playback_service.player.get_time())  # segundos
-        except Exception:
-            pos_s = 0.0
-        self._play_segment_index(self._current_segment_index, seek_seconds=pos_s)
+        playback_service.set_lens(self._lens_param())
     
     def _load_timeline(self):
         """Carga timeline desde backend."""

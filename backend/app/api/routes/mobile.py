@@ -218,7 +218,6 @@ def get_camera_thumbnail(camera_id: int):
             return jsonify({"success": False, "error": "Permiso denegado"}), 403
         
         # FIX F2.3: Obtener último frame y generar thumbnail
-        from backend.app.streaming.frame_buffer import CircularFrameBuffer
         from backend.app.cameras.camera_manager import CameraManager
         
         # Intentar obtener frame del buffer

@@ -52,19 +52,28 @@ class NotificationsPanelFragment : BaseMenuFragment() {
     private lateinit var btnOpenConfig: ImageButton
 
     private val adapter = NotificationAdapter { item ->
-        // Click en una notificación → abrir el TIMELINE de grabaciones de esa
-        // cámara en la fecha del evento (para ver la grabación del momento).
+        // Click en una alerta → abrir directamente la grabación del momento
+        // (pestaña Eventos) y reproducir EN CADENA desde ahí. PlaybackFragment
+        // resuelve qué clip cubre el instante de la alerta (targetTime) y, si la
+        // cámara es dual, recorta por lente automáticamente.
         markLatestAsSeen()
         val date = dateFromIso(item.createdAt)
+        if (item.cameraId <= 0 || date == null) {
+            Toast.makeText(requireContext(),
+                "Esta alerta no tiene grabación asociada", Toast.LENGTH_SHORT).show()
+            return@NotificationAdapter
+        }
         val args = Bundle().apply {
             putInt("cameraId", item.cameraId)
-            if (date != null) putString("date", date)
+            putString("date", date)
+            putString("mode", "event")
+            putString("targetTime", item.createdAt)
         }
         try {
-            findNavController().navigate(R.id.timelineFragment, args)
+            findNavController().navigate(R.id.playbackFragment, args)
         } catch (e: Exception) {
             Toast.makeText(requireContext(),
-                "No se pudo abrir grabaciones: ${e.message}", Toast.LENGTH_SHORT).show()
+                "No se pudo abrir la grabación: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -88,6 +97,8 @@ class NotificationsPanelFragment : BaseMenuFragment() {
                 createdAt = isoFromEpochSec(
                     intent.getDoubleExtra(NotificationWebSocketService.EXTRA_TIMESTAMP, 0.0)),
             )
+            // Tipos retirados: no mostrar 'cámara reconectada' ni 'manipulación'.
+            if (item.eventType in listOf("camera_reconnected", "tampering")) return
             adapter.prependLive(item)
             updateUnreadBadge()
             emptyState.visibility = View.GONE
@@ -165,7 +176,8 @@ class NotificationsPanelFragment : BaseMenuFragment() {
             try {
                 val resp = api.getNotificationsHistory(limit = 50)
                 if (resp.isSuccessful) {
-                    val items = resp.body()?.data ?: emptyList()
+                    val items = (resp.body()?.data ?: emptyList())
+                        .filter { it.eventType !in listOf("camera_reconnected", "tampering") }
                     adapter.submitList(items)
                     emptyState.visibility = if (items.isEmpty()) View.VISIBLE
                                             else View.GONE

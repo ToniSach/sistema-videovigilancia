@@ -12,7 +12,30 @@
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:background="@drawable/bg_camera_feed" />
+        android:background="@drawable/bg_camera_feed">
+
+        <!-- Selector de lente (solo dual-lens). Recorta el vídeo combinado al
+             lente elegido en el cliente (sin re-descarga ni transcode). -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnLensToggle"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|end"
+            android:layout_margin="8dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:text="Lente 1"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp"
+            android:visibility="gone"
+            app:backgroundTint="#66000000"
+            app:cornerRadius="14dp" />
+    </FrameLayout>
 
     <!-- ── CONTROLES (glass card) ── -->
     <com.google.android.material.card.MaterialCardView

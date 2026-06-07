@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required
 from ...cameras.camera_manager import CameraManager
 import logging
+import os
 import time
 import psutil
 import weakref
@@ -49,13 +50,31 @@ def health_check():
     try:
         health_data = metrics_collector.get_health_status()
         camera_manager = CameraManager()
+        # El directo ahora lo sirve go2rtc, así que el MetricsCollector ya no
+        # recibe frames (no hay FrameDistributor) y su lista de cámaras queda
+        # vacía → la UI marcaba "0 cámaras activas". Construimos el estado real
+        # desde el CameraManager (handles go2rtc) y conservamos las métricas de
+        # frames si existieran.
+        metrics_by_id = {c.get("id"): c for c in health_data.get("cameras", [])}
+        cam_status = camera_manager.get_all_status()
+        cameras = []
+        for cid, st in (cam_status or {}).items():
+            raw = (st or {}).get("status", "unknown")
+            # 'running' (handle go2rtc) → 'healthy' para la tarjeta del desktop.
+            status = "healthy" if raw in ("running", "healthy") else raw
+            entry = dict(metrics_by_id.get(cid, {}))
+            entry.update({"id": cid, "status": status})
+            cameras.append(entry)
+        health_data["cameras"] = cameras
         # health_data ya viene con la forma {system: {...}, cameras: [...]}
         health_data["version"] = "1.0.0"
         health_data["timestamp"] = time.time()
-        health_data["cameras_active"] = len(camera_manager._workers)
+        health_data["cameras_active"] = sum(
+            1 for c in cameras if c.get("status") == "healthy"
+        )
         health_data["cameras_total"] = (
             len(camera_manager._camera_repo.get_all())
-            if hasattr(camera_manager, '_camera_repo') else 0
+            if hasattr(camera_manager, '_camera_repo') else len(cameras)
         )
         return jsonify({"success": True, "data": health_data}), 200
     except Exception as e:
@@ -117,6 +136,43 @@ def update_config():
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "error": "No se proporcionaron datos"}), 400
+
+        # Validar la cuota contra el espacio REAL del disco: no dejar que el
+        # usuario "prometa" más GB de los que físicamente caben.
+        if "max_storage_gb" in data:
+            try:
+                requested_gb = float(data.get("max_storage_gb"))
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "error": "max_storage_gb inválido"}), 400
+            try:
+                import shutil
+                from ...config import settings
+                path = data.get("recordings_path") or settings.RECORDINGS_PATH
+                probe = path if os.path.exists(path) else (
+                    os.path.splitdrive(os.path.abspath(path))[0] + os.sep or os.sep)
+                _total, _used, free = shutil.disk_usage(probe)
+                # Lo que las grabaciones ya ocupan también es reutilizable.
+                rec_used = 0
+                base = settings.RECORDINGS_PATH
+                if os.path.isdir(base):
+                    for dp, _dn, fs in os.walk(base):
+                        for f in fs:
+                            fp = os.path.join(dp, f)
+                            if os.path.exists(fp) and not os.path.islink(fp):
+                                rec_used += os.path.getsize(fp)
+                available_gb = (free + rec_used) / (1024 ** 3)
+                if requested_gb > available_gb:
+                    return jsonify({
+                        "success": False,
+                        "error": (
+                            f"No hay {requested_gb:.0f} GB disponibles. El disco solo "
+                            f"permite ~{available_gb:.1f} GB para grabaciones "
+                            f"(libres {free / (1024**3):.1f} GB + {rec_used / (1024**3):.1f} GB "
+                            f"ya usados por grabaciones)."
+                        ),
+                    }), 400
+            except Exception as _e:
+                logger.warning(f"No se pudo validar cuota vs disco: {_e}")
 
         from ...database.connection import db_manager
         from ...database.models import SystemConfig

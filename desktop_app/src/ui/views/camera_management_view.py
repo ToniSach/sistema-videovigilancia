@@ -149,42 +149,19 @@ class CameraEditDialog(QDialog):
         
         form_layout.addRow(capabilities_group)
         
-        # Resolución y FPS — AVANZADO/colapsable: se detectan automáticamente
-        # al descubrir/probar la cámara, así que normalmente no hace falta tocarlo.
-        res_group = QGroupBox("Resolución y FPS (avanzado)")
-        res_group.setCheckable(True)
-        res_group.setChecked(False)
-        res_layout = QFormLayout(res_group)
+        # Resolución y FPS: se DETECTAN automáticamente al probar/descubrir la
+        # cámara, así que se quitó el control manual del formulario (confundía y
+        # casi nunca había que tocarlo). Se conservan los valores actuales (al
+        # editar) o defaults (al agregar) para enviarlos al backend sin perderlos.
+        self._res_w = 1920
+        self._res_h = 1080
+        self._fps = 15
 
-        self.spin_width = QSpinBox()
-        self.spin_width.setRange(640, 3840)
-        self.spin_width.setValue(1920)
-        res_layout.addRow("Ancho (px):", self.spin_width)
-
-        self.spin_height = QSpinBox()
-        self.spin_height.setRange(480, 2160)
-        self.spin_height.setValue(1080)
-        res_layout.addRow("Alto (px):", self.spin_height)
-
-        self.spin_fps = QSpinBox()
-        self.spin_fps.setRange(1, 60)
-        self.spin_fps.setValue(15)
-        res_layout.addRow("FPS:", self.spin_fps)
-
-        def _toggle_res(on):
-            for w in (self.spin_width, self.spin_height, self.spin_fps):
-                w.setVisible(on)
-            for lbl in res_group.findChildren(QLabel):
-                lbl.setVisible(on)
-        res_group.toggled.connect(_toggle_res)
-        _toggle_res(False)
-        form_layout.addRow(res_group)
-        
-        # Configuración IA
-        ai_group = QGroupBox("Inteligencia Artificial")
+        # ── Detección IA y notificaciones ──────────────────────────────────
+        ai_group = QGroupBox("Detección IA y notificaciones")
         ai_layout = QVBoxLayout(ai_group)
-        
-        self.chk_ai = QCheckBox("Habilitar detección de objetos")
+
+        self.chk_ai = QCheckBox("Habilitar detección de objetos (IA)")
         self.chk_ai.stateChanged.connect(self._on_ai_changed)
         ai_layout.addWidget(self.chk_ai)
 
@@ -201,16 +178,24 @@ class CameraEditDialog(QDialog):
         self.cmb_ai_mode.setEnabled(False)
         ai_layout.addWidget(QLabel("Modo:"))
         ai_layout.addWidget(self.cmb_ai_mode)
-        
-        self.chk_notify_person = QCheckBox("Notificar Personas")
-        self.chk_notify_person.setChecked(True)
+
+        # Qué notificar para ESTA cámara. Persona/Vehículo dependen de la IA
+        # (son detecciones del modelo); "desconexión" es independiente (no
+        # necesita IA). Se guardan como preferencias de notificación del usuario.
+        ai_layout.addWidget(QLabel("Notificarme cuando detecte:"))
+
+        self.chk_notify_person = QCheckBox("Personas")
         self.chk_notify_person.setEnabled(False)
         ai_layout.addWidget(self.chk_notify_person)
-        
-        self.chk_notify_vehicle = QCheckBox("Notificar Vehículos")
+
+        self.chk_notify_vehicle = QCheckBox("Vehículos")
         self.chk_notify_vehicle.setEnabled(False)
         ai_layout.addWidget(self.chk_notify_vehicle)
-        
+
+        self.chk_notify_offline = QCheckBox("Desconexión de la cámara")
+        # Independiente de la IA: la caída de la cámara se detecta sin modelo.
+        ai_layout.addWidget(self.chk_notify_offline)
+
         form_layout.addRow(ai_group)
         
         # Settear el widget al scroll
@@ -261,7 +246,29 @@ class CameraEditDialog(QDialog):
             "password": self.txt_password.text() or None,
         }
 
+        # Popup modal "cargando" (barra indeterminada): el sondeo ONVIF puede
+        # tardar varios segundos y antes solo había un label fácil de no ver.
+        self._test_progress = QProgressDialog(
+            f"Probando conexión con {ip}…\n\n"
+            "Sondeo ONVIF + autenticación (puede tardar unos segundos).",
+            None, 0, 0, self,   # botón None = sin cancelar; min=max=0 = indeterminada
+        )
+        self._test_progress.setWindowTitle("Probar conexión")
+        self._test_progress.setWindowModality(Qt.WindowModal)
+        self._test_progress.setMinimumWidth(360)
+        self._test_progress.setMinimumDuration(0)
+        self._test_progress.setCancelButton(None)
+        self._test_progress.show()
+        QApplication.processEvents()
+
+        def _close_test_progress():
+            dlg = getattr(self, "_test_progress", None)
+            if dlg is not None:
+                dlg.close()
+                self._test_progress = None
+
         def on_result(response):
+            _close_test_progress()
             self.btn_test.setEnabled(True)
             if not response.success:
                 self.lbl_test_result.setText(f"Error: {response.error or 'sin respuesta'}")
@@ -373,11 +380,16 @@ class CameraEditDialog(QDialog):
         self.chk_audio.setChecked(getattr(self.camera, 'has_audio', False))
         self.chk_dual_lens.setChecked(getattr(self.camera, 'is_dual_lens', False))
         
-        self.spin_width.setValue(getattr(self.camera, 'resolution_width', 1920))
-        self.spin_height.setValue(getattr(self.camera, 'resolution_height', 1080))
-        self.spin_fps.setValue(getattr(self.camera, 'fps', 15))
-        
+        # Resolución/FPS ya no tienen control en el form; se conservan los del
+        # objeto para reenviarlos al backend sin perderlos (autodetectados).
+        self._res_w = getattr(self.camera, 'resolution_width', 1920) or 1920
+        self._res_h = getattr(self.camera, 'resolution_height', 1080) or 1080
+        self._fps = getattr(self.camera, 'fps', 15) or 15
+
         self.chk_ai.setChecked(getattr(self.camera, 'has_ai', False))
+        # Cargar (async) las preferencias de notificación ya existentes de esta
+        # cámara para reflejarlas en las casillas persona/vehículo/desconexión.
+        self._load_notification_prefs()
     
     def _autocomplete_urls(self):
         """Rellena RTSP/ONVIF a partir de la IP (formato XiongMai/iCSee).
@@ -427,12 +439,43 @@ class CameraEditDialog(QDialog):
             "has_leds": self.chk_leds.isChecked(),
             "has_audio": self.chk_audio.isChecked(),
             "is_dual_lens": self.chk_dual_lens.isChecked(),
-            "resolution_width": self.spin_width.value(),
-            "resolution_height": self.spin_height.value(),
-            "fps": self.spin_fps.value(),
+            "resolution_width": self._res_w,
+            "resolution_height": self._res_h,
+            "fps": self._fps,
             "is_active": True,
             "has_ai": self.chk_ai.isChecked()
         }
+
+    def get_notification_prefs(self) -> dict:
+        """Estado deseado de notificación por tipo de evento para esta cámara."""
+        return {
+            "person": self.chk_notify_person.isChecked(),
+            "vehicle": self.chk_notify_vehicle.isChecked(),
+            "camera_offline": self.chk_notify_offline.isChecked(),
+        }
+
+    def _load_notification_prefs(self):
+        """Marca las casillas según las preferencias existentes de la cámara."""
+        cam_id = getattr(self.camera, "id", None)
+        if not cam_id:
+            return
+
+        def on_prefs(resp):
+            if not getattr(resp, "success", False):
+                return
+            for p in (resp.data or []):
+                if p.get("camera_id") != cam_id:
+                    continue
+                et = p.get("event_type")
+                en = bool(p.get("enabled", True))
+                if et == "person":
+                    self.chk_notify_person.setChecked(en)
+                elif et == "vehicle":
+                    self.chk_notify_vehicle.setChecked(en)
+                elif et == "camera_offline":
+                    self.chk_notify_offline.setChecked(en)
+
+        api_client.get("notifications/preferences", on_prefs)
 
 
 class CameraDiscoveryThread(QThread):
@@ -888,15 +931,46 @@ class CameraManagementView(QWidget):
         dialog = CameraEditDialog(parent=self)
         if dialog.exec() == QDialog.Accepted:
             data = dialog.get_camera_data()
-            
+            desired = dialog.get_notification_prefs()
+
             def on_created(response):
                 if response.success:
+                    new_id = (response.data or {}).get("id")
+                    if new_id:
+                        self._sync_camera_notifications(int(new_id), desired)
                     self._load_cameras()
                     self.camera_updated.emit()
                 else:
                     QMessageBox.critical(self, "Error", f"No se pudo crear la cámara: {response.error}")
-            
+
             api_client.post("cameras/", on_created, data=data)
+
+    def _sync_camera_notifications(self, camera_id: int, desired: dict):
+        """Aplica las casillas persona/vehículo/desconexión del diálogo a las
+        preferencias de notificación del usuario para ESTA cámara. Best-effort:
+        no bloquea el guardado ni avisa si falla (la cámara ya se guardó)."""
+        def on_prefs(resp):
+            existing = {}
+            if getattr(resp, "success", False):
+                for p in (resp.data or []):
+                    if p.get("camera_id") == camera_id:
+                        existing[p.get("event_type")] = p
+            for et, want in desired.items():
+                pref = existing.get(et)
+                if pref is None:
+                    if want:  # no existía y se quiere → crear habilitada
+                        api_client.post(
+                            "notifications/preferences", lambda r: None,
+                            data={"event_type": et, "camera_id": camera_id, "enabled": True},
+                        )
+                elif bool(pref.get("enabled", True)) != want:
+                    # existe pero con estado distinto → solo cambiar 'enabled'
+                    # (conserva canales/horario configurados en Notificaciones).
+                    api_client.put(
+                        f"notifications/preferences/{pref['id']}", lambda r: None,
+                        data={"enabled": want},
+                    )
+        api_client.get("notifications/preferences", on_prefs)
     
     def _edit_selected(self):
         current = self.list_cameras.currentItem()
@@ -910,14 +984,16 @@ class CameraManagementView(QWidget):
             dialog = CameraEditDialog(camera=camera, parent=self)
             if dialog.exec() == QDialog.Accepted:
                 data = dialog.get_camera_data()
-                
+                desired = dialog.get_notification_prefs()
+
                 def on_updated(response):
                     if response.success:
+                        self._sync_camera_notifications(camera_id, desired)
                         self._load_cameras()
                         self.camera_updated.emit()
                     else:
                         QMessageBox.critical(self, "Error", f"No se pudo actualizar: {response.error}")
-                
+
                 api_client.put(f"cameras/{camera_id}", on_updated, data=data)
     
     def _delete_selected(self):

@@ -414,8 +414,82 @@ class MainWindow(QMainWindow):
             from desktop_app.src.ui.dialogs.onboarding_wizard import maybe_show_onboarding
             # Diferido para que la ventana principal ya esté pintada
             QTimer.singleShot(400, lambda: maybe_show_onboarding(parent=self))
+            # Tras el wizard, ofrecer elegir la carpeta de grabaciones (1ª vez).
+            QTimer.singleShot(600, self._maybe_prompt_recordings_path)
         except Exception as e:
             logger.warning(f"No se pudo mostrar onboarding: {e}")
+
+    def _maybe_prompt_recordings_path(self):
+        """Primer uso (solo admin): si la ruta de grabaciones aún no se ha
+        elegido, ofrecer elegir una carpeta ahora. Se pregunta como mucho UNA
+        vez por equipo (QSettings). Espera a que se cierre cualquier diálogo
+        modal (p.ej. el wizard de bienvenida) para no solaparse."""
+        from PySide6.QtCore import QSettings, QTimer
+        from PySide6.QtWidgets import QApplication
+
+        # Si hay un modal abierto (wizard), reintentar más tarde.
+        if QApplication.activeModalWidget() is not None:
+            QTimer.singleShot(800, self._maybe_prompt_recordings_path)
+            return
+
+        if not self.current_user or (self.current_user.role or "").lower() != "admin":
+            return
+        s = QSettings("NVR", "DesktopApp")
+        if bool(s.value("onboarding/recordings_path_prompted", False, type=bool)):
+            return
+
+        def on_config(response):
+            if not getattr(response, "success", False):
+                return
+            data = response.data or {}
+            if isinstance(data, list):
+                data = {item.get("key"): item.get("value") for item in data}
+            path = str(data.get("recordings_path") or "").strip()
+            # "Sin configurar" = vacío o un default relativo.
+            configured = path and path not in ("./recordings", "recordings", ".\\recordings")
+            if configured:
+                # Ya hay ruta real: no molestar, y no volver a preguntar.
+                s.setValue("onboarding/recordings_path_prompted", True)
+                return
+            self._ask_recordings_folder(s)
+
+        api_client.get("system/config", on_config)
+
+    def _ask_recordings_folder(self, settings):
+        """Diálogo de elección de carpeta de grabaciones + guardado en backend."""
+        from PySide6.QtWidgets import QMessageBox, QFileDialog
+        # Marcar como preguntado pase lo que pase (no insistir en cada login).
+        settings.setValue("onboarding/recordings_path_prompted", True)
+
+        ans = QMessageBox.question(
+            self, "Carpeta de grabaciones",
+            "¿Quieres elegir ahora dónde se guardarán las grabaciones?\n\n"
+            "Recomendado: una carpeta en un disco con espacio y FUERA de "
+            "OneDrive o carpetas sincronizadas (la sincronización corrompe los "
+            "vídeos). Podrás cambiarla luego en Ajustes → Almacenamiento.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        path = QFileDialog.getExistingDirectory(
+            self, "Seleccionar carpeta de grabaciones"
+        )
+        if not path:
+            return
+
+        def on_saved(response):
+            from PySide6.QtWidgets import QMessageBox as _MB
+            if getattr(response, "success", False):
+                _MB.information(
+                    self, "Listo", f"Las grabaciones se guardarán en:\n{path}"
+                )
+            else:
+                _MB.warning(
+                    self, "Error",
+                    f"No se pudo guardar la ruta: {getattr(response, 'error', '')}",
+                )
+
+        api_client.post("storage/config", on_saved, data={"path": path})
 
     def _open_tutorial(self):
         """Abre el wizard de bienvenida (manual desde sidebar)."""

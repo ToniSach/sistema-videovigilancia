@@ -52,6 +52,12 @@
             android:name="cameraId"
             app:argType="string"
             android:defaultValue="" />
+        <!-- Lente a abrir (l1|l2) cuando se entra desde la lista de cámaras. -->
+        <argument
+            android:name="lens"
+            app:argType="string"
+            app:nullable="true"
+            android:defaultValue="@null" />
     </fragment>
 
     <fragment
@@ -103,23 +109,13 @@
             app:popExitAnim="@anim/slide_out_right" />
     </fragment>
 
-    <!-- Timeline de grabaciones (cámara + fecha → segmentos). Es la pestaña
-         "Grabaciones" de la barra inferior. Acepta cameraId/date para abrir
-         directamente desde una notificación. -->
+    <!-- Pantalla "Grabaciones" de la barra inferior: pestañas Por lente /
+         Eventos sobre las grabaciones del día de la cámara elegida. -->
     <fragment
         android:id="@+id/timelineFragment"
-        android:name="com.ipn.mx.onvif.ui.TimelineFragment"
+        android:name="com.ipn.mx.onvif.ui.RecordingsHostFragment"
         android:label="Grabaciones"
-        tools:layout="@layout/fragment_timeline">
-        <argument
-            android:name="cameraId"
-            app:argType="integer"
-            android:defaultValue="-1" />
-        <argument
-            android:name="date"
-            app:argType="string"
-            app:nullable="true"
-            android:defaultValue="@null" />
+        tools:layout="@layout/fragment_recordings_host">
         <action
             android:id="@+id/action_timeline_to_playback"
             app:destination="@id/playbackFragment" />
@@ -130,10 +126,45 @@
         android:name="com.ipn.mx.onvif.ui.PlaybackFragment"
         android:label="Reproduccion"
         tools:layout="@layout/fragment_playback">
+        <!-- Modo 1 (legado): una sola grabación por id. -->
         <argument
             android:name="recordingId"
             app:argType="string"
             android:defaultValue="" />
+        <!-- Modo 2 (timeline): reproduce EN CADENA las grabaciones del día de la
+             cámara, del tipo `mode`, empezando en startRecordingId o en la que
+             cubra targetTime (link de alerta). lens/isDualLens → recorte cliente. -->
+        <argument
+            android:name="cameraId"
+            app:argType="integer"
+            android:defaultValue="-1" />
+        <argument
+            android:name="date"
+            app:argType="string"
+            app:nullable="true"
+            android:defaultValue="@null" />
+        <argument
+            android:name="mode"
+            app:argType="string"
+            android:defaultValue="all" />
+        <argument
+            android:name="startRecordingId"
+            app:argType="integer"
+            android:defaultValue="-1" />
+        <argument
+            android:name="targetTime"
+            app:argType="string"
+            app:nullable="true"
+            android:defaultValue="@null" />
+        <argument
+            android:name="lens"
+            app:argType="string"
+            app:nullable="true"
+            android:defaultValue="@null" />
+        <argument
+            android:name="isDualLens"
+            app:argType="boolean"
+            android:defaultValue="false" />
     </fragment>
 
     <fragment

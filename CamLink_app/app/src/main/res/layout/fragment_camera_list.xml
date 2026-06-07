@@ -157,7 +157,7 @@
         app:layout_constraintStart_toEndOf="@id/tvPageInfo"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <!-- ── BARRA INFERIOR: Toggle · Fullscreen ── -->
+    <!-- ── BARRA INFERIOR: Toggle vista ── -->
     <ImageButton
         android:id="@+id/btnVideoList"
         style="@style/Widget.CamLink.IconButton"
@@ -165,18 +165,7 @@
         android:contentDescription="@string/btn_video_list"
         android:src="@drawable/ic_video_library"
         app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toStartOf="@id/btnFullscreen"
-        app:layout_constraintHorizontal_chainStyle="spread"
-        app:layout_constraintStart_toStartOf="parent" />
-
-    <ImageButton
-        android:id="@+id/btnFullscreen"
-        style="@style/Widget.CamLink.IconButton"
-        android:layout_marginBottom="20dp"
-        android:contentDescription="@string/btn_fullscreen"
-        android:src="@drawable/ic_fullscreen"
-        app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintStart_toEndOf="@id/btnVideoList" />
+        app:layout_constraintStart_toStartOf="parent" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>

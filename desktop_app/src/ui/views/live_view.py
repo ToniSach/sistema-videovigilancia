@@ -58,6 +58,11 @@ class CameraWidget(QFrame):
         self._vlc = None
         self._rtsp_started = False
         self.is_maximized = False
+        # Relevo de calidad sin pantalla negra: reproductor + superficie
+        # secundarios que cargan la nueva calidad por detrás de la actual.
+        self._pending_player = None
+        self._pending_surface = None
+        self._pending_watchdog = None
 
         self.setMinimumSize(280, 200)
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
@@ -186,11 +191,16 @@ class CameraWidget(QFrame):
         try:
             from desktop_app.src.services.playback_service import VLCPlayer
             import os as _os
+            # NO usar --clock-jitter=0/--clock-synchro=0: desactivan el resync de
+            # VLC y la latencia CRECE sin parar (vídeo cada vez más retrasado aun
+            # con FPS correctos). Con resync activo + drop-late, VLC descarta
+            # frames tardíos y la latencia queda ACOTADA.
             opts = [
                 "--quiet", "--no-video-title-show",
-                "--network-caching=150",   # buffer mínimo (ms)
+                "--network-caching=150",   # colchón mínimo (ms)
                 "--rtsp-tcp",              # RTSP sobre TCP (robusto en WiFi)
-                "--clock-jitter=0", "--clock-synchro=0",
+                "--drop-late-frames",      # resync por descarte → no acumula
+                "--no-audio-time-stretch",
             ]
             self._vlc = VLCPlayer(config_options=opts)
             wid = int(self.lbl_video.winId())
@@ -244,6 +254,12 @@ class CameraWidget(QFrame):
         super().resizeEvent(event)
         if self._vlc is not None:
             self._apply_fill()
+        # Mantener la superficie de relevo alineada con el vídeo.
+        if self._pending_surface is not None:
+            try:
+                self._pending_surface.setGeometry(self.lbl_video.geometry())
+            except Exception:
+                pass
 
     def hideEvent(self, event):
         # Pausar el reloj cuando el widget no se ve (queda en cache de páginas):
@@ -260,23 +276,133 @@ class CameraWidget(QFrame):
 
     def set_live_url(self, url: str):
         """
-        Cambia la fuente del directo SIN recrear el player (evita el crash de
-        destruir/crear VLC). Reutiliza la misma ventana: VLC hace stop+play.
-        Usado por el selector de calidad.
+        Cambia la calidad del directo SIN cortar lo que se ve. La calidad actual
+        (p. ej. media) sigue mostrándose mientras la nueva (p. ej. alta) carga en
+        un reproductor secundario por DETRÁS. Solo cuando la nueva entrega su
+        primer frame se hace el relevo (sin pantalla negra). Si la nueva no llega
+        en ~12s, se descarta y se mantiene la actual (arregla el "tarda/nunca").
         """
         if self._vlc is None or not url:
             return
-        if url == self.stream_url:
+        if url == self.stream_url and self._pending_player is None:
             return
+        # Cancelar un relevo previo en curso (cambios rápidos de calidad).
+        self._cleanup_pending()
         self.stream_url = url
         try:
-            # ASÍNCRONO: player.stop() de libVLC es bloqueante (espera al decoder
-            # RTSP). En el hilo UI y para cada panel congelaba la app al cambiar
-            # calidad. play_url_async hace el swap en un hilo de fondo.
-            self._vlc.play_url_async(url)
-            QTimer.singleShot(800, self._apply_fill)
+            from desktop_app.src.services.playback_service import VLCPlayer
+            import os as _os
+            # Superficie secundaria: misma geometría que lbl_video pero DETRÁS,
+            # así la calidad actual se sigue viendo encima mientras la nueva carga.
+            surf = QLabel(self.lbl_video.parentWidget())
+            surf.setStyleSheet("background-color:#000;")
+            surf.setGeometry(self.lbl_video.geometry())
+            surf.show()
+            surf.lower()
+            self.lbl_video.raise_()
+            self._pending_surface = surf
+
+            player = VLCPlayer(config_options=[
+                "--quiet", "--no-video-title-show", "--network-caching=150",
+                "--rtsp-tcp", "--drop-late-frames", "--no-audio-time-stretch",
+            ])
+            wid = int(surf.winId())
+            if _os.name == "nt":
+                player.set_hwnd(wid)
+            else:
+                player.set_xwindow(wid)
+            player.first_frame.connect(self._on_pending_ready)
+            self._pending_player = player
+            player.play_url_async(url)
+
+            # Watchdog: si la nueva calidad no entrega frame en 12s, descartarla
+            # (la actual nunca se tocó, así que sigue viéndose).
+            self._pending_watchdog = QTimer(self)
+            self._pending_watchdog.setSingleShot(True)
+            self._pending_watchdog.timeout.connect(
+                lambda: self._cleanup_pending(log="nueva calidad no disponible (timeout 12s)")
+            )
+            self._pending_watchdog.start(12000)
         except Exception as e:
             logger.error(f"set_live_url cam {self.camera_id}: {e}")
+            self._cleanup_pending()
+
+    def _on_pending_ready(self):
+        """La nueva calidad ya entrega imagen: relevo sin pantalla negra."""
+        if self._pending_player is None:
+            return
+        try:
+            if self._pending_watchdog is not None:
+                self._pending_watchdog.stop()
+            # La superficie nueva (ya con imagen) al frente para tapar el cambio.
+            if self._pending_surface is not None:
+                self._pending_surface.raise_()
+            # Pasar el reproductor PRINCIPAL a la nueva URL (ya está CALIENTE, su
+            # arranque es casi inmediato); la superficie nueva cubre el micro-corte.
+            try:
+                self._vlc.first_frame.connect(self._finish_swap)
+            except Exception:
+                pass
+            self._vlc.play_url_async(self.stream_url)
+            # Fallback: aunque el principal no notifique vout, cerrar el relevo.
+            QTimer.singleShot(4000, self._finish_swap)
+        except Exception as e:
+            logger.error(f"_on_pending_ready cam {self.camera_id}: {e}")
+            self._cleanup_pending()
+
+    def _finish_swap(self):
+        """El principal ya muestra la nueva calidad: soltar el reproductor de relevo."""
+        try:
+            self._vlc.first_frame.disconnect(self._finish_swap)
+        except Exception:
+            pass
+        self._cleanup_pending()
+        QTimer.singleShot(200, self._apply_fill)
+
+    def _cleanup_pending(self, log: str = ""):
+        """Detiene y libera el reproductor/superficie de relevo (idempotente)."""
+        if log:
+            logger.info(f"Live cam {self.camera_id}: {log}; se mantiene la calidad actual")
+        p = self._pending_player
+        self._pending_player = None
+        if self._pending_watchdog is not None:
+            try:
+                self._pending_watchdog.stop()
+            except Exception:
+                pass
+            self._pending_watchdog = None
+        if p is not None:
+            # Desligar la ventana AQUÍ (operación rápida) para poder borrar la
+            # superficie sin que VLC pinte sobre una ventana liberada, y hacer el
+            # stop() —BLOQUEANTE en libVLC— en un HILO DE FONDO para NO congelar
+            # la UI. Llamar stop() en el hilo de UI era la causa de los "trabados"
+            # al cambiar de calidad.
+            try:
+                import os as _os
+                if _os.name == "nt":
+                    p.player.set_hwnd(0)
+                else:
+                    p.player.set_xwindow(0)
+            except Exception:
+                pass
+            import threading as _th
+
+            def _stop_async(pl):
+                try:
+                    pl.player.stop()
+                except Exception:
+                    pass
+
+            _th.Thread(target=_stop_async, args=(p,),
+                       name="VLCPendingStop", daemon=True).start()
+        surf = self._pending_surface
+        self._pending_surface = None
+        if surf is not None:
+            try:
+                surf.hide()
+                surf.deleteLater()
+            except Exception:
+                pass
 
     def stop_video(self):
         """
@@ -284,6 +410,10 @@ class CameraWidget(QFrame):
         antes de que el QLabel se destruya evita que VLC pinte sobre una ventana
         liberada (causa típica de crash nativo al cerrar/cambiar de vista).
         """
+        try:
+            self._cleanup_pending()
+        except Exception:
+            pass
         try:
             if self._vlc is None:
                 return
@@ -466,28 +596,9 @@ class LiveView(QWidget):
         """)
         header.addWidget(self.cmb_layout)
 
-        # Selector de CALIDAD del directo. "Auto" decide por CPU (una vez, sin
-        # monitoreo continuo). Solo afecta al directo (no a grabación/IA).
-        header.addWidget(QLabel("Calidad:"))
-        self.cmb_quality = QComboBox()
-        for text, val in [
-            ("Auto", "auto"), ("Alta", "high"), ("Media", "medium"), ("Baja", "low"),
-        ]:
-            self.cmb_quality.addItem(text, val)
-        self.cmb_quality.setCurrentIndex(2)  # "Media" por defecto (aligera)
-        self.cmb_quality.setToolTip(
-            "Alta = sin recodificar (más calidad). Media/Baja = transcode "
-            "(menos red/CPU del cliente). Auto = según los núcleos del equipo."
-        )
-        self.cmb_quality.currentIndexChanged.connect(self._on_quality_change)
-        self.cmb_quality.setStyleSheet("""
-            QComboBox {
-                background-color: #1e293b; color: #f1f5f9;
-                border: 1px solid rgba(255,255,255,0.15);
-                border-radius: 6px; padding: 6px 12px; min-width: 90px;
-            }
-        """)
-        header.addWidget(self.cmb_quality)
+        # La calidad del directo es SIEMPRE "media" (transcode 480p ligero en
+        # go2rtc). Se quitó el selector Auto/Alta/Baja: la app entera ve en media
+        # para una experiencia uniforme y un único stream que mantener caliente.
 
         # Separador
         sep = QFrame()
@@ -808,21 +919,6 @@ class LiveView(QWidget):
             or legacy
             or (getattr(cam, "stream_url", "") or "")
         )
-
-    def _on_quality_change(self, idx: int):
-        new_q = self.cmb_quality.itemData(idx)
-        if new_q == self._quality:
-            return
-        self._quality = new_q
-        q = self._effective_quality()
-        # IMPORTANTE: NO destruimos/recreamos widgets (eso crasheaba VLC). Solo
-        # le pedimos a cada player que reproduzca la nueva URL de calidad
-        # (VLC hace stop+set_media+play reutilizando la misma ventana).
-        for (cam_id, stream_type), widget in list(self._widget_cache.items()):
-            cam = next((c for c in self._camera_list if c.id == cam_id), None)
-            if cam is None:
-                continue
-            widget.set_live_url(self._pick_stream_url(cam, stream_type, q))
 
     # ------------------------------------------------------------------
     # Click handlers

@@ -111,16 +111,20 @@ class RecordingManager:
         # antiguo de re-encoding desde pre-buffer RAM). Si no hay continuous,
         # fallback al método antiguo usando pre-buffer en RAM.
         from backend.app.core.executor import global_executor
-        if self.is_recording_continuous(camera_id):
-            target = self._record_event_splice
-        else:
-            target = self._record_event_clip
-            logging.info(
-                f"Cámara {camera_id} sin continuous; usando pre-buffer RAM "
-                f"(fallback). Activa grabación continua para mejor performance."
+        # Clips de evento SIEMPRE por SPLICE de la grabación continua (-c copy):
+        # sin re-encode y sin pre-buffer en RAM. El fallback antiguo por pre-buffer
+        # (_record_event_clip) queda en desuso; la optimización exige continua activa.
+        if not self.is_recording_continuous(camera_id):
+            logging.warning(
+                f"Cámara {camera_id}: evento sin grabación continua activa → no se "
+                f"puede generar clip por splice. Activa la grabación continua "
+                f"(AUTO_START_RECORDING). Clip omitido."
             )
+            with self._event_recordings_lock:
+                self._event_recordings.pop(camera_id, None)
+            return
 
-        future = global_executor.submit(target, camera_id, event_data)
+        future = global_executor.submit(self._record_event_splice, camera_id, event_data)
         if future is None:
             # Executor lleno → liberar slot porque el clip no se va a grabar
             with self._event_recordings_lock:

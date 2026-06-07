@@ -437,8 +437,31 @@ class ONVIFDiscovery:
         try:
             logger.info("[DISCOVERY] Paso 1: lanzando WS-Discovery (multicast 239.255.255.250:3702)")
             self._wsd.start()
-            services = self._wsd.searchServices(timeout=timeout)
-            wsd_count = len(services) if services else 0
+            # Early-exit: en vez de un único searchServices(timeout) que BLOQUEA
+            # todo el tiempo aunque la cámara ya respondió en ~2s, sondeamos en
+            # tramos cortos y salimos en cuanto aparece un servicio ONVIF.
+            # Si no hay cámaras, agota el timeout igual (mismo comportamiento que antes).
+            slice_s = 3
+            services = []
+            seen_xaddrs: set[str] = set()
+            waited = 0
+            while waited < timeout:
+                this = min(slice_s, timeout - waited)
+                batch = self._wsd.searchServices(timeout=this) or []
+                waited += this
+                for s in batch:
+                    key = str(s.getXAddrs())
+                    if key in seen_xaddrs:
+                        continue
+                    seen_xaddrs.add(key)
+                    services.append(s)
+                if any("onvif" in str(t).lower()
+                       for s in batch for t in (s.getTypes() or [])):
+                    logger.info(
+                        f"[DISCOVERY] Servicio ONVIF detectado tras ~{waited}s; "
+                        f"saliendo temprano de WS-Discovery (timeout era {timeout}s)")
+                    break
+            wsd_count = len(services)
             logger.info(f"[DISCOVERY] WS-Discovery encontró {wsd_count} servicio(s)")
 
             for idx, service in enumerate(services or []):
@@ -696,8 +719,8 @@ class ONVIFDiscovery:
                     devices.append(d)
                 continue
 
-            logger.info(f"[DISCOVERY] Probando ONVIF en {ip} (modo quick)...")
-            d = self._try_onvif_robust(ip, quick=True)
+            logger.info(f"[DISCOVERY] Probando ONVIF en {ip} (modo quick, puertos={ports})...")
+            d = self._try_onvif_robust(ip, quick=True, onvif_ports=ports)
             if d:
                 devices.append(d)
                 continue
@@ -798,7 +821,8 @@ class ONVIFDiscovery:
             }
         return None
 
-    def _try_onvif_robust(self, ip: str, quick: bool = False) -> Optional[Dict]:
+    def _try_onvif_robust(self, ip: str, quick: bool = False,
+                          onvif_ports: Optional[list] = None) -> Optional[Dict]:
         """
         Args:
             quick: si True, prueba solo las ~6 credenciales más comunes y
@@ -806,9 +830,17 @@ class ONVIFDiscovery:
                 para no gastar minutos por IP no-cámara. Si la cámara real
                 tiene credenciales no estándar, el usuario la agregará desde
                 el diálogo con sus credenciales explícitas.
+            onvif_ports: si se proporciona (ej. desde el pre-filtro del subnet
+                scan que YA sabe qué puertos están abiertos), solo se prueban
+                esos puertos en vez de los 4 por defecto. Evita gastar
+                ~2s × 3 puertos cerrados por cada credencial.
         """
         if not ip or ':' in ip:
             return None
+
+        # Solo los puertos que sabemos abiertos (si nos los pasaron); si no,
+        # None → probe_ip_all_ports usa la lista completa por defecto.
+        ports_arg = [p for p in (onvif_ports or []) if p in ONVIF_PORTS] or None
 
         # Top credenciales (cubren el 90% de cámaras con defaults). En modo
         # quick se usa este subset; en modo completo se usan todas.
@@ -827,7 +859,7 @@ class ONVIFDiscovery:
         for user, pwd in creds_to_try:
             # timeout corto (2s) — si la cámara no responde tan rápido,
             # probablemente no es ONVIF; mejor pasar a la siguiente credencial.
-            result = probe_ip_all_ports(ip, user, pwd, timeout=2)
+            result = probe_ip_all_ports(ip, user, pwd, timeout=2, ports=ports_arg)
             if result is None:
                 continue
             if result.auth_ok and result.profiles and result.stream_uri:

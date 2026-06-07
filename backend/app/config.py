@@ -168,6 +168,34 @@ class Settings:
                 os.getenv("AI_MOTION_SENSITIVITY", "0.015")
             )
 
+            # Fuente DEDICADA de la IA (AIFrameSource): un ffmpeg ligero que lee
+            # el substream BAJO del lente desde go2rtc (cam_X[_lY]_low) y entrega
+            # frames pequeños a la IA en un slot-1, SIN el pipeline pesado
+            # (FFmpegWorker/CircularFrameBuffer/FrameDistributor/InferenceQueue/
+            # DualLensSplitter). Decode mínimo → "la IA no hace trabajo de más".
+            self.AI_SOURCE_WIDTH: int = int(os.getenv("AI_SOURCE_WIDTH", "640"))
+            self.AI_SOURCE_HEIGHT: int = int(os.getenv("AI_SOURCE_HEIGHT", "384"))
+            self.AI_SOURCE_FPS: int = int(os.getenv("AI_SOURCE_FPS", "6"))
+            # Calidad del substream de go2rtc que consume la IA: "low" (360p,
+            # recomendado, mínimo coste), "medium" (480p) o "high" (nativo).
+            self.AI_SOURCE_QUALITY: str = os.getenv("AI_SOURCE_QUALITY", "low").strip()
+
+            # Telemetría integrada: muestrea todos los módulos en uso y escribe a
+            # disco fila-a-fila (sobrevive crash/Ctrl-C). Default ON.
+            self.TELEMETRY_ENABLED: bool = (
+                os.getenv("TELEMETRY_ENABLED", "true").lower() == "true"
+            )
+            self.TELEMETRY_INTERVAL: float = float(os.getenv("TELEMETRY_INTERVAL", "2.0"))
+            # Carpeta de salida. Vacío = <repo>/telemetry. (Evita OneDrive si puedes.)
+            self.TELEMETRY_PATH: str = os.getenv("TELEMETRY_PATH", "").strip()
+
+            # Streams de go2rtc a mantener CALIENTES (consumidor -c copy ligero)
+            # para que cambiar a ellos sea instantáneo (sin arranque en frío).
+            # Coma-separado, ej: "cam_9_l1_medium,cam_9_l2_medium,cam_10_medium".
+            # OJO: cada uno mantiene su transcoder QSV corriendo → NO los pongas
+            # todos (satura la iGPU); solo los que de verdad usas. Vacío = off.
+            self.STREAM_KEEPALIVE: str = os.getenv("STREAM_KEEPALIVE", "").strip()
+
             # Cooldown entre alertas de la misma clase (segundos).
             # 30s es el default razonable para producción: una persona que
             # cruza el FOV genera 1 alerta, no decenas. Con cooldown=0
@@ -264,6 +292,14 @@ class Settings:
             # Candidatos ICE extra (coma-separados), ej. "stun:stun.l.google.com:19302"
             # o una IP pública/TURN para acceso remoto. Vacío = solo LAN (host).
             self.GO2RTC_WEBRTC_CANDIDATES: str = os.getenv("GO2RTC_WEBRTC_CANDIDATES", "")
+
+            # Aceleración por HARDWARE del transcode dual-lens en go2rtc.
+            # "" = software (libx264, ~1.5 cores). "qsv" = Intel QuickSync (iGPU),
+            # "cuda" = NVIDIA, "dxva2"/"vaapi" según plataforma. Hace el HEVC→H264
+            # + crop por GPU (~0.1-0.3 core). En este equipo se verificó que
+            # h264_qsv funciona (la iGPU Intel); nvenc requería driver 570+.
+            # Si el directo dual-lens se rompe tras activarlo, vuelve a "".
+            self.GO2RTC_HWACCEL: str = os.getenv("GO2RTC_HWACCEL", "qsv").strip()
 
             # WebRTC signaling (WHEP) en el backend. Requiere GO2RTC_ENABLED.
             self.WEBRTC_ENABLED: bool = (

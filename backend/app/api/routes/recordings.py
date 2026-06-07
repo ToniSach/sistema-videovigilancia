@@ -114,7 +114,19 @@ def get_recordings():
         if camera_id:
             if camera_id not in accessible_cameras:
                 return jsonify({"success": False, "error": "Cámara no accesible"}), 403
-            recordings = repo.get_by_camera(camera_id, limit=limit)
+            if date_str:
+                # Filtrar por día (la app móvil arma así el "timeline" de un día
+                # con URLs firmadas listas para reproducir en cadena). Antes este
+                # endpoint IGNORABA `date` y devolvía las últimas N de la cámara.
+                try:
+                    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                except ValueError:
+                    return jsonify({"success": False, "error": "Formato de fecha inválido (YYYY-MM-DD)"}), 400
+                start_dt = datetime.combine(target_date, datetime.min.time())
+                end_dt = start_dt + timedelta(days=1)
+                recordings = repo.get_by_date_range(camera_id, start_dt, end_dt)
+            else:
+                recordings = repo.get_by_camera(camera_id, limit=limit)
         else:
             # Obtener de todas las cámaras accesibles
             recordings = []
@@ -124,7 +136,9 @@ def get_recordings():
             recordings = sorted(recordings, key=lambda x: x.start_time, reverse=True)[:limit]
 
         # Enriquecer cada grabación con URLs FIRMADAS listas para reproductores
-        # nativos (no necesitan cabecera Authorization) + thumbnail si existe.
+        # nativos (no necesitan cabecera Authorization) + thumbnail si existe +
+        # `type` (event|continuous) para que el móvil separe las pestañas
+        # "Por lente" (continuas) y "Eventos" sin una llamada extra al timeline.
         data = []
         for r in recordings:
             d = r.to_dict()
@@ -133,6 +147,8 @@ def get_recordings():
                 d["playback_url"] = _signed_playback_url(rid)
                 if r.file_path and os.path.exists(_thumbnail_path_for(r.file_path)):
                     d["thumbnail_url"] = _signed_thumbnail_url(rid)
+            file_path_lower = (r.file_path or "").lower().replace("\\", "/")
+            d["type"] = "event" if "events" in file_path_lower.split("/") else "continuous"
             data.append(d)
 
         return jsonify({

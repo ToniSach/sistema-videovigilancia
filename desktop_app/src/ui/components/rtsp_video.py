@@ -19,11 +19,18 @@ from PySide6.QtWidgets import QFrame, QVBoxLayout, QLabel, QSizePolicy
 logger = logging.getLogger(__name__)
 
 # Flags de baja latencia para DIRECTO (no VOD). go2rtc solo sirve RTSP por TCP.
+# IMPORTANTE: NO usar --clock-jitter=0 / --clock-synchro=0. Desactivan la
+# resincronización de reloj de VLC: si el decoder se atrasa un poco, NUNCA
+# recupera y la latencia CRECE sin parar (el síntoma "el vídeo se va retrasando"
+# aunque los FPS sean correctos). Con el reloj activo, VLC DESCARTA frames
+# tardíos para mantenerse al día → latencia ACOTADA (a costa de algún frame
+# suelto, lo correcto en vigilancia). network-caching=150 fija el colchón mínimo.
 _LIVE_VLC_OPTS = [
     "--quiet", "--no-video-title-show",
-    "--network-caching=150",
-    "--rtsp-tcp",
-    "--clock-jitter=0", "--clock-synchro=0",
+    "--network-caching=150",   # colchón mínimo (ms)
+    "--rtsp-tcp",              # RTSP sobre TCP (robusto en WiFi)
+    "--drop-late-frames",      # descarta frames tardíos (resync) → no acumula
+    "--no-audio-time-stretch", # evita que el audio fuerce ralentizar el vídeo
 ]
 
 
@@ -138,6 +145,11 @@ class RtspVideoWidget(QFrame):
         try:
             if self._vlc is None:
                 return
+            # Durante un swap, audio_set_* se bloquea en el mutex de libVLC
+            # (stop en curso) y congela la UI → reintentar luego.
+            if self._vlc.is_swapping():
+                QTimer.singleShot(400, self._apply_audio)
+                return
             p = self._vlc.player
             p.audio_set_mute(not self._audio_enabled)
             p.audio_set_volume(int(self._volume))
@@ -165,6 +177,11 @@ class RtspVideoWidget(QFrame):
         """Estira el vídeo para llenar el panel (sin barras negras)."""
         try:
             if self._vlc is None:
+                return
+            # Durante un swap, video_set_aspect_ratio se bloquea en el mutex de
+            # libVLC (stop en curso) y congela la UI ("No responde") → reintentar.
+            if self._vlc.is_swapping():
+                QTimer.singleShot(400, self._apply_fill)
                 return
             w = max(1, self.width())
             h = max(1, self.height())

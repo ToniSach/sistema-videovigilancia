@@ -111,6 +111,11 @@ class AudioController:
         self._audio_out_supported = False  # altavoz de la cámara (para HABLAR)
         self._process: Optional[subprocess.Popen] = None
         self._running = False
+        # IMPORTANTE: proceso de escucha como atributo de INSTANCIA (no de clase).
+        # Antes era atributo de clase y se compartía entre controladores → al
+        # recrear el controlador, stop_listen no encontraba el ffplay correcto y
+        # el audio "seguía escuchándose para siempre".
+        self._listen_process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._detect_audio_support()
 
@@ -285,8 +290,6 @@ class AudioController:
     # ------------------------------------------------------------------
     # Listen: recibir el audio que la cámara captura (audio FROM cam)
     # ------------------------------------------------------------------
-    _listen_process: Optional[subprocess.Popen] = None
-
     def start_listen(self, rtsp_url: str) -> bool:
         """
         Reproduce el audio del RTSP en los altavoces locales.
@@ -400,7 +403,13 @@ class AudioManager:
     def get(self, camera: Camera) -> AudioController:
         with self._lock:
             ctrl = self._controllers.get(camera.id)
-            if ctrl is not None and ctrl.is_supported():
+            # Reusar SIEMPRE el controlador que esté EN USO (escuchando/hablando)
+            # para que stop_listen/stop_talk actúen sobre el MISMO proceso que se
+            # inició. Antes, recrearlo dejaba el ffplay/ffmpeg anterior huérfano
+            # ("seguía escuchando para siempre").
+            if ctrl is not None and (
+                ctrl.is_supported() or ctrl.is_listening() or ctrl.is_active()
+            ):
                 return ctrl
             ctrl = AudioController(camera)
             self._controllers[camera.id] = ctrl

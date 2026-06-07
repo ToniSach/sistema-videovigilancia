@@ -35,7 +35,13 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop">
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden">
+            <!-- configChanges: al entrar/salir de pantalla completa forzamos
+                 landscape/portrait. Sin esto Android RECREA la Activity en cada
+                 giro → el fragment se reconstruye en portrait y el fullscreen
+                 "rebota" solo (y se mataba la sesión WebRTC). Manejándolo aquí,
+                 el giro NO recrea: el estado de fullscreen y el vídeo persisten. -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 

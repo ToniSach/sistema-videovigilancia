@@ -372,6 +372,35 @@ def create_app(config_name='default'):
         from backend.app.infrastructure.metrics.collector import metrics_collector
         logger.info("MetricsCollector activo")
 
+        # ================== Keep-alive de streams ==================
+        # Mantiene calientes los streams configurados → cambio instantáneo
+        # (sin arranque en frío). Vacío por defecto = desactivado.
+        try:
+            _ka = getattr(settings, "STREAM_KEEPALIVE", "") or ""
+            if _ka.strip():
+                from backend.app.streaming.stream_keepalive import stream_keepalive
+                from backend.app.streaming.go2rtc_manager import Go2RtcManager
+                _port = getattr(settings, "GO2RTC_RTSP_PORT", 8554)
+                stream_keepalive.start(
+                    _ka.split(","), rtsp_base=f"rtsp://127.0.0.1:{_port}")
+                app.stream_keepalive = stream_keepalive
+        except Exception as e:
+            logger.error(f"Error iniciando keep-alive de streams: {e}")
+
+        # ================== Telemetría integrada ==================
+        # Muestrea todos los módulos en uso y guarda a disco fila-a-fila
+        # (sobrevive crash/Ctrl-C). Para que la revise después.
+        try:
+            if getattr(settings, "TELEMETRY_ENABLED", True):
+                from backend.app.infrastructure.telemetry import telemetry_recorder
+                telemetry_recorder.start(
+                    interval=getattr(settings, "TELEMETRY_INTERVAL", 2.0),
+                    out_dir=getattr(settings, "TELEMETRY_PATH", "") or "",
+                )
+                app.telemetry_recorder = telemetry_recorder
+        except Exception as e:
+            logger.error(f"Error iniciando telemetría: {e}")
+
         # (LiveHLSService eliminado: el directo se sirve por go2rtc/WebRTC.)
 
         # ================== NUEVO: Consistency Checker ==================
@@ -574,6 +603,20 @@ if __name__ == "__main__":
         sys.exit(1)
     finally:
         # Graceful shutdown
+        # Telemetría primero: cierra el CSV/JSONL con su última muestra y fsync
+        # (aunque el flush por fila ya garantiza que no se pierda nada antes).
+        try:
+            from backend.app.infrastructure.telemetry import telemetry_recorder
+            telemetry_recorder.stop()
+        except Exception as e:
+            logger.error(f"Error deteniendo telemetría: {e}")
+
+        try:
+            from backend.app.streaming.stream_keepalive import stream_keepalive
+            stream_keepalive.stop()
+        except Exception as e:
+            logger.error(f"Error deteniendo keep-alive: {e}")
+
         if hasattr(app, 'storage_manager'):
             try:
                 app.storage_manager.stop()

@@ -2,8 +2,7 @@
 AI processing module.
 """
 
-#from .yolo_detector import YOLODetector, Detection
-from .inference_queue import InferenceQueue, InferenceTask
 from .ai_scheduler import AIScheduler
+from .ai_frame_source import AIFrameSource
 
-__all__ = ["Detection", "InferenceQueue", "InferenceTask", "AIScheduler"]
+__all__ = ["AIScheduler", "AIFrameSource"]

@@ -10,8 +10,6 @@ from collections import defaultdict
 
 from ..motion.motion_detector import MotionDetector, MotionResult
 from .model_pool import YLOModelPool, Detection
-from .inference_queue import InferenceQueue, InferenceTask
-from ...streaming.frame_buffer import FrameData
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +33,13 @@ class AIScheduler:
         try:
             from backend.app.config import settings
             motion_sensitivity = float(getattr(settings, "AI_MOTION_SENSITIVITY", 0.015))
+            self._proc_fps = float(getattr(settings, "AI_SOURCE_FPS", 6))
         except Exception:
             motion_sensitivity = 0.015
+            self._proc_fps = 6.0
         self._motion_detector = MotionDetector(camera_id, sensitivity=motion_sensitivity)
         self._yolo = YLOModelPool()
-        self._inference_queue = InferenceQueue(maxsize=5)
+        self._frame_source = None  # AIFrameSource (slot-1), asignado en start()
 
         # Estado
         self._running = False
@@ -85,80 +85,38 @@ class AIScheduler:
         self._on_detection_callback = callback
         logger.debug(f"Callback de detección asignado para cámara {self.camera_id}")
 
-    def start(self, frame_distributor) -> None:
+    def start(self, frame_source) -> None:
+        """Arranca el worker. `frame_source` es un AIFrameSource (slot-1)
+        ya iniciado; el worker lee su último frame (sin colas ni distributor)."""
         if self._running:
             logger.warning(f"AIScheduler {self.camera_id} ya está corriendo")
             return
 
+        self._frame_source = frame_source
         self._running = True
 
-        # Registrar como consumidor de frames (lightweight, solo encola)
-        # needs_copy=False: _on_frame hace su PROPIA copia al enqueue
-        # (`frame_data.frame.copy()`). Tener needs_copy=True aquí causaba
-        # DOBLE memcpy por frame: una en el distribuidor + otra al enqueue.
-        # Para dual-lens con frames de 1.5 MB a 15 fps eso eran 22 MB/s
-        # de memcpy desperdiciado en ancho de banda de memoria.
-        consumer_name = f"ai_scheduler_{self.camera_id}"
-        frame_distributor.register_consumer(
-            consumer_name,
-            self._on_frame,  # FIX F1.2: Solo encola, no procesa aquí
-            needs_copy=False  # _on_frame copia internamente al enqueue
-        )
-
-        # FIX F1.2: Iniciar worker thread único
         self._worker_thread = threading.Thread(
-            target=self._inference_worker, 
+            target=self._inference_worker,
             daemon=True,
             name=f"AI-Worker-Cam{self.camera_id}"
         )
         self._worker_thread.start()
 
-        logger.info(f"AIScheduler {self.camera_id} iniciado con worker dedicado")
+        logger.info(f"AIScheduler {self.camera_id} iniciado (fuente dedicada slot-1)")
 
-    def stop(self, frame_distributor) -> None:
+    def stop(self) -> None:
         if not self._running:
             return
 
         self._running = False
 
-        # Desregistrar consumidor
-        consumer_name = f"ai_scheduler_{self.camera_id}"
-        frame_distributor.unregister_consumer(consumer_name)
-
-        # Esperar worker thread
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3.0)
 
-        # Limpiar motion detector
         self._motion_detector.reset()
+        self._frame_source = None
 
         logger.info(f"AIScheduler {self.camera_id} detenido")
-
-    def _on_frame(self, frame_data: FrameData) -> None:
-        """
-        FIX F1.2: Callback ligero del distributor.
-        Solo cuenta frames y encola para procesamiento async.
-        No hace motion detection aquí (no bloquea distributor).
-        """
-        if not self._running:
-            return
-
-        with self._lock:
-            self._frame_count += 1
-
-        # Throttling por intervalo (evitar sobrecargar cola)
-        if self._frame_count % self._inference_interval != 0:
-            return
-
-        # Encolar para procesamiento async (no bloquea si cola llena, descarta)
-        try:
-            self._inference_queue.enqueue(
-                self.camera_id,
-                frame_data.frame.copy(),  # Copia aquí porque la procesaremos async
-                frame_data.timestamp
-            )
-        except Exception as e:
-            logger.error(f"Error encolando frame: {e}")
 
     def _inference_worker(self) -> None:
         """
@@ -171,42 +129,56 @@ class AIScheduler:
           - alertas enviadas (después de cooldown)
         Se loguea un resumen cada N frames procesados.
         """
-        logger.info(f"[AI cam={self.camera_id}] Worker iniciado, esperando frames…")
+        logger.info(f"[AI cam={self.camera_id}] Worker iniciado (lee slot del AIFrameSource)…")
 
         frames_total = 0
         frames_with_motion = 0
         detections_total = 0
         last_summary_t = time.time()
-        last_frame_t = time.time()
+        last_seq = -1
+        poll = 0.05  # espera corta entre comprobaciones del slot (sin busy-wait)
+        # Throttle DEFENSIVO: procesar como máximo a _proc_fps, sea cual sea la
+        # tasa de la fuente. Evita que un stream en ráfaga haga motion+YOLO a
+        # cientos de fps (= "trabajo de más"). Siempre se toma el frame MÁS
+        # reciente (latest-wins), descartando los intermedios.
+        min_interval = 1.0 / max(1.0, self._proc_fps)
+        last_proc_t = 0.0
 
         while self._running:
             try:
-                task = self._inference_queue.dequeue(timeout=1.0)
-                if task is None:
-                    # Sin frame en 1s. Si llevamos 5s sin frames, asumir que
-                    # el stream upstream se reinició y reset al motion detector
-                    # para no comparar contra frames stale.
-                    if time.time() - last_frame_t > 5:
-                        if self._motion_detector._prev_gray is not None:
-                            logger.info(
-                                f"[AI cam={self.camera_id}] Sin frames >5s, "
-                                f"reseteando motion detector"
-                            )
-                            self._motion_detector.reset()
-                            last_frame_t = time.time()  # evitar reset repetitivo
+                now = time.time()
+                wait = min_interval - (now - last_proc_t)
+                if wait > 0:
+                    time.sleep(min(wait, 0.2))
                     continue
-                last_frame_t = time.time()
+
+                src = self._frame_source
+                if src is None:
+                    time.sleep(0.1)
+                    continue
+
+                seq, frame = src.get_latest()
+                # Sin frame nuevo → esperar. Si la fuente lleva rato muerta,
+                # reset del motion detector para no comparar contra frames stale.
+                if frame is None or seq == last_seq:
+                    if not src.is_alive() and self._motion_detector._prev_gray is not None:
+                        self._motion_detector.reset()
+                    time.sleep(poll)
+                    continue
+                last_seq = seq
+                last_proc_t = time.time()
+                timestamp = last_proc_t
 
                 frames_total += 1
-                motion_result = self._motion_detector.detect(task.frame)
+                with self._lock:
+                    self._frame_count += 1
+                motion_result = self._motion_detector.detect(frame)
 
                 if not motion_result.has_motion:
-                    # Resumen periódico cada 30s aunque no haya movimiento
                     if time.time() - last_summary_t > 30:
                         logger.info(
                             f"[AI cam={self.camera_id}] últimos 30s: "
-                            f"{frames_total} frames analizados, "
-                            f"{frames_with_motion} con movimiento, "
+                            f"{frames_total} frames, {frames_with_motion} con movimiento, "
                             f"{detections_total} detecciones"
                         )
                         frames_total = frames_with_motion = detections_total = 0
@@ -215,12 +187,11 @@ class AIScheduler:
 
                 frames_with_motion += 1
                 logger.debug(
-                    f"[AI cam={self.camera_id}] Movimiento detectado "
-                    f"(score={motion_result.motion_score:.3f}) → ejecutando YOLO"
+                    f"[AI cam={self.camera_id}] Movimiento (score={motion_result.motion_score:.3f}) → YOLO"
                 )
 
                 _t_infer = time.perf_counter()
-                detections = self._yolo.detect(task.frame)
+                detections = self._yolo.detect(frame)
                 infer_ms = (time.perf_counter() - _t_infer) * 1000.0
 
                 with self._lock:
@@ -232,13 +203,11 @@ class AIScheduler:
                     detections_total += len(detections)
                     classes = [d.class_name for d in detections]
                     logger.info(
-                        f"[AI cam={self.camera_id}] 🎯 YOLO detectó {len(detections)} objeto(s): "
-                        f"{classes}"
+                        f"[AI cam={self.camera_id}] 🎯 YOLO detectó {len(detections)} objeto(s): {classes}"
                     )
                     if self._on_detection_callback:
-                        self._process_detections_with_cooldown(detections, task)
+                        self._process_detections_with_cooldown(detections, frame, timestamp)
 
-                # Resumen periódico
                 if time.time() - last_summary_t > 30:
                     logger.info(
                         f"[AI cam={self.camera_id}] últimos 30s: "
@@ -254,7 +223,7 @@ class AIScheduler:
 
         logger.info(f"[AI cam={self.camera_id}] Worker finalizado")
 
-    def _process_detections_with_cooldown(self, detections: list[Detection], task) -> None:
+    def _process_detections_with_cooldown(self, detections: list[Detection], frame, timestamp: float) -> None:
         """
         Agrupa detecciones por clase y aplica cooldown.
         """
@@ -293,7 +262,7 @@ class AIScheduler:
                 "count": count,
                 "objects": [d.class_name for d in class_detections],
                 "confidences": [d.confidence for d in class_detections],
-                "timestamp": task.timestamp,
+                "timestamp": timestamp,
                 "cooldown_applied": True
             }
             
@@ -308,7 +277,7 @@ class AIScheduler:
                     self.camera_id,
                     class_name,
                     best_confidence,
-                    task.frame,
+                    frame,
                     metadata
                 )
                 
@@ -352,7 +321,8 @@ class AIScheduler:
                 "frames_received": self._frame_count,
                 "frames_processed": self._frames_processed,
                 "detections": self._detections_count,
-                "queue_size": self._inference_queue.size(),
+                "queue_size": 0,  # ya no hay InferenceQueue (slot-1 latest-wins)
+                "frame_source_alive": bool(self._frame_source and self._frame_source.is_alive()),
                 "cooldown_seconds": self._cooldown_seconds,
                 "active_cooldowns": len(self._last_alert_time),
                 # Latencia de inferencia YOLO (ms): última + media/p95 de la ventana.

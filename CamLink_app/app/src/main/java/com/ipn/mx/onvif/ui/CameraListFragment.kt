@@ -129,12 +129,9 @@ class CameraListFragment : BaseMenuFragment() {
             if (pageIndex < totalPages - 1) { pageIndex++; renderPage() }
         }
 
-        // Botones heredados del layout original
+        // Botón "ver en grande" → abre la vista En Vivo.
         view.findViewById<ImageButton>(R.id.btnVideoList).setOnClickListener {
             findNavController().navigate(R.id.action_cameraList_to_liveView)
-        }
-        view.findViewById<ImageButton>(R.id.btnFullscreen).setOnClickListener {
-            Toast.makeText(requireContext(), "Pantalla completa: pendiente", Toast.LENGTH_SHORT).show()
         }
 
         // Cargar cámaras del servidor
@@ -267,7 +264,12 @@ class CameraListFragment : BaseMenuFragment() {
 
     private fun navigateToLiveView(tileIndex: Int) {
         val tile = tiles.getOrNull(tileIndex) ?: return
-        val bundle = Bundle().apply { putString("cameraId", tile.camera.id.toString()) }
+        // Pasar el LENTE tocado para que LiveView abra ese feed (antes abría
+        // siempre el L1 porque solo se enviaba el id de cámara).
+        val bundle = Bundle().apply {
+            putString("cameraId", tile.camera.id.toString())
+            tile.lens?.let { putString("lens", it) }
+        }
         findNavController().navigate(R.id.action_cameraList_to_liveView, bundle)
     }
 

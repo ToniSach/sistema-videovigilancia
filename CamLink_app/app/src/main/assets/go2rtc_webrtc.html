@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<!--
+  Reproductor WebRTC mínimo para go2rtc, embebido en un WebView de la app.
+
+  Objetivo: matar el ~7s de latencia del HLS. go2rtc ya tiene ingerido el
+  stream H264 de la cámara; aquí solo abrimos una sesión WebRTC (sin transcode
+  ni disco extra en el servidor) por su API WebSocket de signaling:
+
+      ws://IP:1984/api/ws?src=cam_X
+
+  Protocolo go2rtc (mensajes JSON {type, value}):
+    → enviamos  {"type":"webrtc/offer","value":"<sdp>"}
+    ← recibimos {"type":"webrtc/answer","value":"<sdp>"}
+    ↔ candidatos {"type":"webrtc/candidate","value":"candidate:..."}
+
+  Kotlin llama start('ws://...') tras onPageFinished y stop() al pausar.
+  El estado se reporta a Kotlin vía AndroidBridge.onState('playing'|'error')
+  para que el fragment pueda caer a HLS (ExoPlayer) si WebRTC no arranca.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
+    /* contain = sin recorte; encaja en el 16:9 del contenedor sin deformar. */
+    #v { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
+  </style>
+</head>
+<body>
+  <video id="v" autoplay playsinline muted></video>
+  <script>
+    let pc = null, ws = null;
+
+    function report(s) {
+      try { if (window.AndroidBridge && AndroidBridge.onState) AndroidBridge.onState(s); }
+      catch (e) {}
+    }
+
+    function stop() {
+      try { if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); } } catch (e) {}
+      try { if (pc) pc.close(); } catch (e) {}
+      ws = null; pc = null;
+      const v = document.getElementById('v');
+      if (v) { try { v.srcObject = null; } catch (e) {} }
+    }
+
+    function start(url) {
+      stop();
+      console.log('WebRTC start → ' + url);
+      try {
+        pc = new RTCPeerConnection({ iceServers: [] });
+        // recvonly: solo recibimos audio/vídeo → no se pide cámara/mic del
+        // teléfono (no hay diálogo de permisos).
+        pc.addTransceiver('video', { direction: 'recvonly' });
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+
+        pc.ontrack = (ev) => {
+          const v = document.getElementById('v');
+          if (ev.streams && ev.streams[0] && v.srcObject !== ev.streams[0]) {
+            v.srcObject = ev.streams[0];
+          }
+        };
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate && ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'webrtc/candidate', value: ev.candidate.candidate }));
+          }
+        };
+        pc.onconnectionstatechange = () => {
+          if (!pc) return;
+          const st = pc.connectionState;
+          console.log('pc.connectionState=' + st);
+          if (st === 'connected') report('playing');
+          else if (st === 'failed' || st === 'closed') report('error');
+        };
+
+        ws = new WebSocket(url);
+        ws.onopen = async () => {
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({ type: 'webrtc/offer', value: pc.localDescription.sdp }));
+          } catch (e) { report('error'); }
+        };
+        ws.onmessage = async (ev) => {
+          let msg;
+          try { msg = JSON.parse(ev.data); } catch (e) { return; }
+          if (!pc) return;
+          if (msg.type === 'webrtc/answer') {
+            try { await pc.setRemoteDescription({ type: 'answer', sdp: msg.value }); }
+            catch (e) { report('error'); }
+          } else if (msg.type === 'webrtc/candidate') {
+            try { await pc.addIceCandidate({ candidate: msg.value, sdpMid: '0', sdpMLineIndex: 0 }); }
+            catch (e) {}
+          } else if (msg.type === 'error') {
+            report('error');
+          }
+        };
+        ws.onerror = (e) => { console.log('ws.onerror'); report('error'); };
+        // onclose sin error: si ya estaba reproduciendo, no tiramos el vídeo;
+        // el cierre tras negociar es normal en algunas versiones de go2rtc.
+      } catch (e) {
+        report('error');
+      }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      const v = document.getElementById('v');
+      // El primer frame es la señal más fiable de "reproduciendo" (a veces llega
+      // antes que connectionState=connected).
+      v.addEventListener('loadeddata', () => report('playing'));
+      v.addEventListener('playing', () => report('playing'));
+    });
+  </script>
+</body>
+</html>

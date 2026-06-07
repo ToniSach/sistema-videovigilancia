@@ -106,6 +106,7 @@ def build_go2rtc_config(
     public_host: str,
     extra_candidates: str = "",
     include_inactive: bool = False,
+    hwaccel: str = "",
 ) -> dict:
     """
     Paso 2 (núcleo PURO y testeable). Construye el diccionario de config go2rtc
@@ -136,17 +137,53 @@ def build_go2rtc_config(
         # → respeta el límite de 1 conexión RTSP. Además H264 hace que el
         # WebRTC funcione en navegadores (H265 tiene soporte limitado).
         src = stream_name(cam_id)
+
+        def _xcode(filters: str) -> str:
+            # IMPORTANTE: el modificador `#hardware=qsv` de go2rtc NO se aplica
+            # cuando se usa `#raw=` (go2rtc cae a libx264 software → ~500% CPU,
+            # confirmado en telemetría). Para usar la GPU de verdad emitimos un
+            # comando `exec:` EXPLÍCITO con `-hwaccel qsv` (decode por iGPU) +
+            # `h264_qsv` (encode por iGPU). El crop/scale van por software en
+            # memoria de sistema (barato). `-g 30 -bf 0` recorta el arranque.
+            if hwaccel == "qsv":
+                rtsp_in = f"rtsp://127.0.0.1:{rtsp_port}/{src}"
+                # `-c:v hevc_qsv` (decoder QSV EXPLÍCITO) en vez de `-hwaccel qsv`:
+                # con -hwaccel los frames salen en formato GPU (qsv) y el `scale`
+                # por software no puede convertirlos → "Impossible to convert ...
+                # src: qsv" (falla cam_X_*_low/_medium). Con -c:v hevc_qsv los
+                # frames salen en memoria de sistema → crop+scale por software OK
+                # → encode h264_qsv por GPU. (Asume cámara HEVC; si fuera H264
+                # usar h264_qsv como decoder o GO2RTC_HWACCEL="".)
+                # Flags de FLUIDEZ para el directo por WiFi/WebRTC:
+                #   -g 15  → keyframe cada ~1s (cámara ~12-15fps). Con -g 30 el
+                #            keyframe llegaba cada ~2.5-3s: ante CUALQUIER pérdida
+                #            de paquete (WiFi) el vídeo se congelaba hasta el
+                #            siguiente keyframe y "saltaba" ~3s. GOP corto = el
+                #            salto se reduce a ~1s y recupera mucho antes.
+                #   -async_depth 1 → QSV entrega cada frame al codificarlo en vez
+                #            de agruparlos (su default ~4) → ritmo de frames
+                #            estable, sin ráfagas que disparan el jitter buffer.
+                #   -bf 0  → sin B-frames (menor latencia, ya estaba).
+                return (
+                    "exec:ffmpeg -hide_banner -loglevel error "
+                    f"-c:v hevc_qsv -rtsp_transport tcp -i {rtsp_in} "
+                    f"-vf {filters} -c:v h264_qsv -g 15 -bf 0 -async_depth 1 -an "
+                    "-rtsp_transport tcp -f rtsp {output}"
+                )
+            # Sin hwaccel: transcode software (libx264 por defecto de go2rtc).
+            return f"ffmpeg:{src}#video=h264#raw=-vf {filters}"
+
         if getattr(cam, "is_dual_lens", False):
             # Por lente: high = recorte pleno; medium/low = recorte + escala.
             for lens, crop in _DUAL_LENS_CROP.items():
                 base = lens_stream_name(cam_id, lens)
-                streams[base] = f"ffmpeg:{src}#video=h264#raw=-vf {crop}"
+                streams[base] = _xcode(crop)
                 for q, sc in _QUALITY_SCALE.items():
-                    streams[f"{base}_{q}"] = f"ffmpeg:{src}#video=h264#raw=-vf {crop},{sc}"
+                    streams[f"{base}_{q}"] = _xcode(f"{crop},{sc}")
         else:
             # Mono: high = nativo (cam_X, ya añadido, -c copy); medium/low = escala.
             for q, sc in _QUALITY_SCALE.items():
-                streams[f"{src}_{q}"] = f"ffmpeg:{src}#video=h264#raw=-vf {sc}"
+                streams[f"{src}_{q}"] = _xcode(sc)
 
     candidates: list[str] = [f"{public_host}:{webrtc_port}"]
     for extra in (extra_candidates or "").split(","):
@@ -315,6 +352,7 @@ class Go2RtcManager:
             webrtc_port=cfg.GO2RTC_WEBRTC_PORT,
             public_host=self.public_host,
             extra_candidates=cfg.GO2RTC_WEBRTC_CANDIDATES,
+            hwaccel=cfg.GO2RTC_HWACCEL,
         )
         import os
 
@@ -377,8 +415,21 @@ class Go2RtcManager:
             webrtc_port=cfg.GO2RTC_WEBRTC_PORT,
             public_host=self.public_host,
             extra_candidates=cfg.GO2RTC_WEBRTC_CANDIDATES,
+            hwaccel=cfg.GO2RTC_HWACCEL,
             include_inactive=True,   # todas las cámaras; go2rtc conecta perezoso
         )
+        # Guardia anti-churn: si la lectura de cámaras vino VACÍA pero antes
+        # teníamos streams, es casi seguro un fallo transitorio de BD (no que
+        # borraran todas las cámaras). Reiniciar go2rtc con config vacío cortaría
+        # TODOS los streams (el celular ve un micro-corte) y al siguiente ciclo
+        # volvería a cambiar → churn. Conservamos el config actual.
+        if not data["streams"] and self._last_sig:
+            logger.warning(
+                "go2rtc reconcile: lectura de cámaras vacía; conservo el config "
+                "actual (probable fallo transitorio de BD)."
+            )
+            return
+
         sig = frozenset(data["streams"].items())
         if sig == self._last_sig and self.is_running():
             return  # nada cambió

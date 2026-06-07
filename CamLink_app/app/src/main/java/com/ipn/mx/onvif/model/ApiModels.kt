@@ -267,5 +267,8 @@ data class RecordingResponse(
     // miniatura. Las añade el backend (migración VOD firmado). Relativas a la
     // base del servidor: anteponer RetrofitClient.buildBaseUrl(...).
     @SerializedName("playback_url")      val playbackUrl: String? = null,
-    @SerializedName("thumbnail_url")     val thumbnailUrl: String? = null
+    @SerializedName("thumbnail_url")     val thumbnailUrl: String? = null,
+    // "event" (clip de alerta, carpeta /events/) | "continuous". Lo añade el
+    // backend en GET /recordings/ — separa las pestañas Por lente / Eventos.
+    val type: String = "continuous",
 )

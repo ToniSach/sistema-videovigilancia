@@ -27,11 +27,10 @@ EVENT_TYPES_OPTIONS = [
     ("vehicle", "Vehículo"),
     ("motion", "Movimiento"),
     ("camera_offline", "Cámara offline"),
-    ("tampering", "Sabotaje"),
 ]
 EVENT_ICONS = {
     "person": "person", "vehicle": "vehicle", "motion": "motion",
-    "camera_offline": "offline", "tampering": "tamper",
+    "camera_offline": "offline",
 }
 
 # En el ESCRITORIO las notificaciones solo se VEN aquí mismo (canal "app").
@@ -270,6 +269,16 @@ class NotificationPreferencesView(QWidget):
         self.btn_add.clicked.connect(self._add)
         header.addWidget(self.btn_add)
         layout.addLayout(header)
+
+        # Intro breve de la pantalla: explica de un vistazo para qué sirve.
+        intro = QLabel(
+            "Recibe avisos cuando tus cámaras detecten algo o se desconecten. "
+            "Conecta Telegram para que te lleguen al móvil, y abajo elige qué "
+            "eventos quieres y de qué cámaras."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 12px;")
+        layout.addWidget(intro)
 
         # Aviso de IA: las notificaciones SOLO existen para la cámara con IA
         # activa. Si no hay ninguna activa, no se puede personalizar.
@@ -674,6 +683,18 @@ class NotificationPreferencesView(QWidget):
         h.addWidget(self.btn_telegram_link)
 
         v.addLayout(h)
+
+        # Intro de la sección: explica qué es y cómo conectar el bot, para que
+        # el usuario no tenga que adivinar (antes solo había botones sueltos).
+        tg_intro = QLabel(
+            "Aquí conectas tu cuenta de Telegram para recibir las alertas en el "
+            "móvil, gratis y sin tener la app abierta. Pulsa «Vincular nuevo "
+            "chat», abre el enlace en Telegram y envía el código al bot. El "
+            "administrador configura el bot una sola vez con «Configurar bot»."
+        )
+        tg_intro.setWordWrap(True)
+        tg_intro.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 11px;")
+        v.addWidget(tg_intro)
 
         # Lista de chats vinculados
         self.list_telegram_chats = QListWidget()

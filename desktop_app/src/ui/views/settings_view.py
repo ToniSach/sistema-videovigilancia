@@ -144,21 +144,6 @@ class SettingsView(QWidget):
         layout = QVBoxLayout(widget)
         layout.setSpacing(16)
         
-        # Configuración de Video
-        video_group = QGroupBox("Configuración de Video")
-        video_layout = QFormLayout(video_group)
-        
-        self.spin_pre_buffer = QSpinBox()
-        self.spin_pre_buffer.setRange(1, 60)
-        self.spin_pre_buffer.setValue(10)
-        self.spin_pre_buffer.setSuffix(" segundos")
-        video_layout.addRow("Buffer Pre-Evento:", self.spin_pre_buffer)
-
-        # La calidad del directo se elige por cámara en la vista "Cámaras en
-        # vivo" (Auto/Alta/Media/Baja sobre go2rtc), no aquí.
-
-        layout.addWidget(video_group)
-        
         # Configuración de IA
         ai_group = QGroupBox("Inteligencia Artificial")
         ai_layout = QFormLayout(ai_group)
@@ -228,54 +213,6 @@ class SettingsView(QWidget):
 
         layout.addWidget(telegram_group)
 
-        # Bloque de pruebas — útil para validar que Telegram funciona
-        test_group = QGroupBox("Enviar evento de prueba")
-        test_layout = QVBoxLayout(test_group)
-
-        help_lbl = QLabel(
-            "<i>Dispara un evento simulado de 'persona' en una cámara activa "
-            "y envía a Telegram una foto inmediata + un video de ~20 segundos "
-            "(10s pre-evento + 10s post-evento). Útil para verificar que el bot "
-            "está bien configurado.</i>"
-        )
-        help_lbl.setWordWrap(True)
-        help_lbl.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 11px;")
-        test_layout.addWidget(help_lbl)
-
-        cam_row = QHBoxLayout()
-        cam_row.addWidget(QLabel("Cámara:"))
-        self.cmb_test_camera = QComboBox()
-        self.cmb_test_camera.setMinimumWidth(220)
-        cam_row.addWidget(self.cmb_test_camera, 1)
-        self.btn_reload_cams = QPushButton("")
-        self.btn_reload_cams.setMaximumWidth(40)
-        self.btn_reload_cams.clicked.connect(self._reload_test_cameras)
-        cam_row.addWidget(self.btn_reload_cams)
-        test_layout.addLayout(cam_row)
-
-        self.btn_test_event = QPushButton("Enviar evento de prueba a Telegram")
-        self.btn_test_event.setMinimumHeight(40)
-        self.btn_test_event.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {config.THEME_ACCENT};
-                color: {config.THEME_PRIMARY};
-                border: none;
-                border-radius: 6px;
-                font-weight: bold;
-                padding: 8px 16px;
-            }}
-            QPushButton:hover {{ background-color: #0ea5e9; }}
-            QPushButton:disabled {{ background-color: #475569; color: #94a3b8; }}
-        """)
-        self.btn_test_event.clicked.connect(self._send_test_event)
-        test_layout.addWidget(self.btn_test_event)
-
-        self.lbl_test_status = QLabel("")
-        self.lbl_test_status.setStyleSheet(f"color: {config.THEME_TEXT_MUTED};")
-        self.lbl_test_status.setWordWrap(True)
-        test_layout.addWidget(self.lbl_test_status)
-
-        layout.addWidget(test_group)
         layout.addStretch()
 
         self.tabs.addTab(widget, "Notificaciones")
@@ -337,7 +274,6 @@ class SettingsView(QWidget):
                 self._clear_dirty()
 
         api_client.get("system/config", on_config)
-        self._reload_test_cameras()
 
     def _apply_config(self, response):
         if True:
@@ -367,11 +303,6 @@ class SettingsView(QWidget):
             try:
                 conf = int(float(data.get("ai_confidence", 45)))
                 self.spin_confidence.setValue(conf)
-            except (TypeError, ValueError):
-                pass
-            try:
-                pb = int(float(data.get("pre_buffer_seconds", 10)))
-                self.spin_pre_buffer.setValue(pb)
             except (TypeError, ValueError):
                 pass
             self.chk_save_snapshots.setChecked(
@@ -446,7 +377,6 @@ class SettingsView(QWidget):
             # AI
             "ai_confidence": str(self.spin_confidence.value()),
             "ai_model": str(self.cmb_ai_model.currentIndex()),
-            "pre_buffer_seconds": str(self.spin_pre_buffer.value()),
             "save_snapshots": "true" if self.chk_save_snapshots.isChecked() else "false",
         }
 
@@ -512,84 +442,6 @@ class SettingsView(QWidget):
         if path:
             self.txt_storage_path.setText(path)
     
-    def _reload_test_cameras(self):
-        """Refresca la lista de cámaras del selector del test event."""
-        def on_cams(response):
-            if not response.success:
-                return
-            self.cmb_test_camera.clear()
-            for c in (response.data or []):
-                ws = c.get("worker_status") or {}
-                status = ws.get("status") if isinstance(ws, dict) else None
-                marker = "" if status == "running" else ""
-                label = f"{marker}{c.get('name', '')}  (id={c.get('id')})"
-                self.cmb_test_camera.addItem(label, c.get("id"))
-        api_client.get("cameras/", on_cams)
-
-    def _send_test_event(self):
-        """Lanza evento de prueba en la cámara seleccionada."""
-        cam_id = self.cmb_test_camera.currentData()
-        if not cam_id:
-            QMessageBox.warning(
-                self, "Sin cámara",
-                "Selecciona una cámara activa para enviar el evento de prueba."
-            )
-            return
-
-        ans = QMessageBox.question(
-            self, "Confirmar envío",
-            f"Se va a:\n\n"
-            f"1. Capturar un snapshot inmediato de la cámara #{cam_id}\n"
-            f"2. Grabar 10 segundos de video adicional\n"
-            f"3. Enviar foto + video al chat de Telegram\n\n"
-            f"Tarda ~25 segundos. ¿Continuar?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if ans != QMessageBox.Yes:
-            return
-
-        self.btn_test_event.setEnabled(False)
-        self.btn_test_event.setText("Enviando... (espera ~25s)")
-        self.lbl_test_status.setText(
-            "Capturando snapshot y grabando video, "
-            "después se enviará a Telegram…"
-        )
-        self.lbl_test_status.setStyleSheet(
-            f"color: {config.THEME_ACCENT};"
-        )
-
-        def on_response(response):
-            self.btn_test_event.setEnabled(True)
-            self.btn_test_event.setText("Enviar evento de prueba a Telegram")
-
-            if response.success or response.status_code == 202:
-                msg = response.data.get("message", "") if response.data else ""
-                self.lbl_test_status.setText(
-                    f"Solicitud aceptada. {msg}\n"
-                    f"Revisa tu Telegram en unos segundos."
-                )
-                self.lbl_test_status.setStyleSheet("color: #22c55e;")
-            else:
-                err = response.error or "Error desconocido"
-                self.lbl_test_status.setText(f"Error: {err}")
-                self.lbl_test_status.setStyleSheet(
-                    f"color: {config.THEME_DANGER};"
-                )
-                QMessageBox.critical(
-                    self, "Test Telegram falló",
-                    f"No se pudo enviar el evento de prueba:\n\n{err}\n\n"
-                    f"Posibles causas:\n"
-                    f"• La cámara no está activa (sin frames recientes)\n"
-                    f"• Telegram no está configurado en SystemConfig\n"
-                    f"• El bot token o chat_id son inválidos"
-                )
-
-        api_client.post(
-            f"system/test-telegram/{cam_id}",
-            on_response,
-            data={"post_seconds": 10},
-        )
-
     def _cleanup_storage(self):
         """Inicia limpieza manual."""
         reply = QMessageBox.question(
