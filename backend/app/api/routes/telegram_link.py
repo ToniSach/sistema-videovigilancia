@@ -1,18 +1,67 @@
 """
-Endpoints para que los usuarios vinculen su cuenta de Telegram.
+================================================================================
+MÓDULO: api.routes.telegram_link — Vinculación de cuentas de Telegram (capa HTTP)
+================================================================================
 
-Flujo:
-  1. Frontend → POST /generate-code → recibe {code, expires_at, bot_username}
-  2. Frontend hace polling cada 2s: GET /link-status?code=XXX
-  3. Usuario abre Telegram, busca @bot_username, envía /vincular XXX
-  4. TelegramBotPoller (corriendo en backend) detecta el comando, llama
-     link_service.verify_code(), crea UserTelegramChat
-  5. Frontend ve linked=true en /link-status y cierra el diálogo
+PROPÓSITO
+    Blueprint REST que permite a un usuario vincular su cuenta con un chat de
+    Telegram (canal de notificación), configurar el bot del servidor (admin),
+    listar/desvincular chats, probar el envío y dar un resumen administrativo.
+
+FLUJO DE VINCULACIÓN (handshake con polling)
+    1. Frontend → POST /generate-code → recibe {code, bot_username, deep_link...}
+    2. Frontend hace polling cada 2s: GET /link-status?code=XXX
+    3. Usuario abre Telegram, busca @bot_username y envía /vincular XXX
+    4. TelegramBotPoller (corriendo en backend) detecta el comando, llama
+       link_service.verify_code() y crea UserTelegramChat.
+    5. Frontend ve linked=true en /link-status y cierra el diálogo.
+    (El endpoint público /verify existe para que el propio bot confirme el
+    código; normalmente lo invoca el poller, no el frontend.)
+
+RESPONSABILIDAD
+    Contrato HTTP + orquestación del handshake + gating admin para configurar el
+    bot. La lógica de códigos/vinculación vive en TelegramLinkService; el envío
+    real y el ciclo de vida del bot en telegram_bot_poller / telegram_notifier.
+
+DEPENDENCIAS
+    services.telegram_link_service.TelegramLinkService  códigos + vínculos
+    notifications.telegram_bot_poller .... estado/arranque del bot, @username
+    notifications.telegram_notifier ...... envío de mensajes (/test)
+    database.connection.db_manager ....... lee TelegramVerificationCode/UserTelegramChat
+    services.user_service.UserService .... gating admin (/configure, /admin/overview)
+
+COMPONENTES RELACIONADOS
+    routes/notifications.py  preferencias que deciden CUÁNDO notificar por Telegram
+    NotificationRouter ..... enruta eventos a estos chats
+    database.models.TelegramVerificationCode, UserTelegramChat, SystemConfig
+
+PUNTO DE ENTRADA
+    Registrado en main.create_app() vía safe_register(telegram_link_bp).
+    Prefijo: /api/v1/telegram. Best-effort.
+
+PIPELINE(S)
+    Pipeline #13 (Notificaciones) — etapa de ALTA/gestión del canal Telegram
+    (define destinos); el disparo real lo ejecutan EventManager + notifiers.
+
+ENDPOINTS
+    POST   /generate-code        → generate_code()    [auth] genera código + arranca poller
+    GET    /link-status          → link_status()      [auth] polling del estado del código
+    GET    /bot-info             → bot_info()         [auth] estado del bot del servidor
+    POST   /configure            → configure_bot()    [admin] set token + reload en caliente
+    POST   /verify               → verify_code()      [público/bot] confirma vinculación
+    GET    /chats                → get_chats()        [auth] chats vinculados del usuario
+    POST   /test                 → test_my_telegram() [auth] envío de prueba
+    GET    /admin/overview       → admin_overview()   [admin] resumen usuarios↔Telegram
+    DELETE /chats/<chat_id>      → unlink_chat()      [auth] desvincula un chat
+
+NOTA: /configure referencia SystemConfig (modelo ORM) — verificar que esté
+    importado al editar este archivo.
+================================================================================
 """
 from datetime import datetime, timedelta
 
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
 
 from backend.app.services.telegram_link_service import TelegramLinkService
 from backend.app.database.connection import db_manager
@@ -22,17 +71,35 @@ telegram_link_bp = Blueprint("telegram_link", __name__, url_prefix="/api/v1/tele
 link_service = TelegramLinkService()
 
 
+def _device_id_from_jwt():
+    """device_id del JWT (Telegram es POR DISPOSITIVO). El token móvil lo lleva;
+    el de escritorio no → None (alcance "de cuenta")."""
+    dev = get_jwt().get("device_id")
+    return int(dev) if dev is not None else None
+
+
 @telegram_link_bp.route("/generate-code", methods=["POST"])
 @jwt_required()
 def generate_code():
     """
-    Genera código de vinculación para el usuario autenticado.
-    Devuelve también bot_username y expires_in_seconds para que el frontend
-    pueda mostrar todo lo necesario sin más llamadas.
+    Genera un código de vinculación para el usuario autenticado.
+
+    Método+Ruta: POST /api/v1/telegram/generate-code
+    Permiso: JWT válido. Pipeline #13, etapa alta de canal Telegram.
+    Efecto colateral: GARANTIZA que el poller esté vivo (lo (re)arranca si
+        está configurado pero caído) — sin esto el bot no procesa el /vincular.
+    Inputs: ninguno (user_id del token).
+    Outputs:
+        200 {success:true, data:{code, bot_username, bot_configured,
+             expires_in_seconds, telegram_deep_link, instructions[]}, code}
+             (campo top-level `code` duplicado por compat con versión anterior).
+        400 {success:false, error} ante ValueError del servicio.
+        500 ante fallo interno.
+    Llama a: TelegramLinkService.generate_code() + telegram_bot_poller.
     """
     try:
         user_id = int(get_jwt_identity())
-        code = link_service.generate_code(user_id)
+        code = link_service.generate_code(user_id, _device_id_from_jwt())
 
         # Datos auxiliares para que el frontend muestre instrucciones completas
         from backend.app.notifications.telegram_bot_poller import telegram_bot_poller
@@ -57,14 +124,17 @@ def generate_code():
                 "bot_username": bot_username or "",
                 "bot_configured": telegram_bot_poller.is_configured(),
                 "expires_in_seconds": expires_in,
+                # Deep link MANUAL: abre el bot SIN el código (sin ?start=CÓDIGO),
+                # para que el usuario envíe él mismo "/vincular CÓDIGO". Antes el
+                # ?start=CÓDIGO auto-enviaba el código y vinculaba de un toque
+                # "sin pedirlo"; ahora el paso es explícito.
                 "telegram_deep_link": (
-                    f"https://t.me/{bot_username}?start={code}"
-                    if bot_username else None
+                    f"https://t.me/{bot_username}" if bot_username else None
                 ),
                 "instructions": [
                     f"Abre Telegram y busca el bot @{bot_username}" if bot_username
                     else "El bot de Telegram no está configurado en el servidor",
-                    f"Envíale el mensaje: /vincular {code}",
+                    f"Escríbele (o pega) el mensaje: /vincular {code}",
                     "Recibirás confirmación tanto en el bot como en esta ventana",
                 ],
             },
@@ -80,10 +150,18 @@ def generate_code():
 @jwt_required()
 def link_status():
     """
-    Indica si un código ya fue consumido (vinculado) por el bot.
-    Query: ?code=ABCD12
-    Devuelve {linked: bool, expired: bool, chat: {...} | null}.
-    El frontend hace polling cada 2s hasta linked=true o expired=true.
+    Indica si un código ya fue consumido (vinculado) por el bot. Polling.
+
+    Método+Ruta: GET /api/v1/telegram/link-status
+    Permiso: JWT válido (solo consulta códigos del propio usuario).
+    Inputs: Query `code` (str, REQUERIDO; se normaliza a mayúsculas).
+    Outputs:
+        200 {success:true, data:{code, linked, expired, expires_at, chat|null}}
+            El frontend hace polling cada 2s hasta linked=true o expired=true.
+        400 {success:false, error} si falta `code`.
+        404 {success:false, error} si el código no existe para ese usuario.
+        500 ante fallo interno.
+    Llama a: lectura directa de TelegramVerificationCode/UserTelegramChat (BD).
     """
     try:
         user_id = int(get_jwt_identity())
@@ -103,11 +181,11 @@ def link_status():
 
             chat_info = None
             if linked:
-                # Buscar el chat más reciente para este usuario (asumimos
-                # que fue creado al verificarse este código).
+                # Chat más reciente del MISMO alcance del código (user+device);
+                # Telegram es por dispositivo, así que acotamos a verif.device_id.
                 chat = (
                     session.query(UserTelegramChat)
-                    .filter_by(user_id=user_id, is_active=True)
+                    .filter_by(user_id=user_id, device_id=verif.device_id, is_active=True)
                     .order_by(UserTelegramChat.linked_at.desc())
                     .first()
                 )
@@ -136,9 +214,15 @@ def link_status():
 @jwt_required()
 def bot_info():
     """
-    Devuelve qué bot está configurado para que el frontend pueda decir
-    "abre Telegram y busca @MiBot". Si el bot aún no está configurado, el
-    frontend lo dice al usuario y le explica cómo crearlo con BotFather.
+    Estado del bot del servidor (para que el frontend guíe al usuario).
+
+    Método+Ruta: GET /api/v1/telegram/bot-info
+    Permiso: JWT válido.
+    Inputs: ninguno.
+    Outputs:
+        200 {success:true, data:{configured, running, username, deep_link_base}}
+        Si configured=false, el frontend explica cómo crearlo con @BotFather.
+    Llama a: telegram_bot_poller (is_configured/is_running/get_bot_username).
     """
     from backend.app.notifications.telegram_bot_poller import telegram_bot_poller
     return jsonify({
@@ -216,8 +300,19 @@ def configure_bot():
 @telegram_link_bp.route("/verify", methods=["POST"])
 def verify_code():
     """
-    Verifica código (endpoint público, llamado por el bot de Telegram).
-    Body: { "code": "ABCD12", "chat_id": "123456789", "username": "opcional" }
+    Verifica un código y crea el vínculo. Endpoint PÚBLICO (lo llama el bot).
+
+    Método+Ruta: POST /api/v1/telegram/verify
+    Permiso: PÚBLICO (sin JWT). Lo invoca el TelegramBotPoller al recibir
+        /vincular CODE; la "autorización" es el propio código de un solo uso.
+    Inputs (body JSON):
+        code (str, REQUERIDO), chat_id (str, REQUERIDO; chat de Telegram),
+        username (str, opcional).
+    Outputs:
+        200 {success:true, message} si el código era válido → crea UserTelegramChat.
+        400 {success:false, error} si faltan campos o código inválido/expirado.
+        500 ante fallo interno.
+    Llama a: TelegramLinkService.verify_code(code, chat_id, username).
     """
     try:
         data = request.get_json()
@@ -240,10 +335,23 @@ def verify_code():
 @telegram_link_bp.route("/chats", methods=["GET"])
 @jwt_required()
 def get_chats():
-    """Obtiene los chats de Telegram vinculados al usuario."""
+    """
+    Lista los chats de Telegram vinculados al usuario autenticado.
+
+    Método+Ruta: GET /api/v1/telegram/chats
+    Permiso: JWT válido.
+    Inputs: ninguno.
+    Outputs:
+        200 {success:true, data:[chat...]}  (no expone los telegram_chat_id crudos)
+        500 ante fallo interno.
+    Llama a: TelegramLinkService.get_user_chats(user_id).
+    """
     try:
         user_id = int(get_jwt_identity())
-        chats = link_service.get_user_chats(user_id)
+        # Solo los chats del alcance de ESTE cliente (Telegram es por dispositivo).
+        chats = link_service.get_user_chats(
+            user_id, _device_id_from_jwt(), _scope_device=True
+        )
         return jsonify({"success": True, "data": chats}), 200
     except Exception as e:
         return jsonify({"success": False, "error": "Error interno del servidor"}), 500
@@ -259,7 +367,9 @@ def test_my_telegram():
     """
     try:
         user_id = int(get_jwt_identity())
-        chats = link_service.get_user_chats(user_id)
+        device_id = _device_id_from_jwt()
+        # Prueba acotada al alcance del cliente (Telegram es por dispositivo).
+        chats = link_service.get_user_chats(user_id, device_id, _scope_device=True)
         if not chats:
             return jsonify({
                 "success": False,
@@ -270,7 +380,7 @@ def test_my_telegram():
         sent = 0
         with db_manager.get_session() as session:
             rows = session.query(UserTelegramChat).filter_by(
-                user_id=user_id, is_active=True
+                user_id=user_id, device_id=device_id, is_active=True
             ).all()
             chat_ids = [r.telegram_chat_id for r in rows]
         for cid in chat_ids:
@@ -313,7 +423,7 @@ def admin_overview():
         # Etiquetas legibles de tipo de evento para el resumen de preferencias.
         _EV = {
             "person": "Persona", "vehicle": "Vehículo", "motion": "Movimiento",
-            "camera_offline": "Cámara offline", "tampering": "Sabotaje",
+            "camera_offline": "Cámara offline",
         }
         rows = []
         with db_manager.get_session() as session:

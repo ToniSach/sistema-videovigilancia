@@ -1,8 +1,52 @@
 """
-Vista de preferencias de notificaciones por usuario.
+================================================================================
+MÓDULO: ui.views.notifications_view — Preferencias de notificación + Telegram (Pipeline #13)
+================================================================================
 
-Cada usuario configura qué eventos quiere recibir, de qué cámaras, por qué
-canales (Telegram/push/web), y en qué horario / días.
+PROPÓSITO
+    Pantalla donde cada usuario decide QUÉ alertas quiere recibir (regla =
+    evento + cámara + canal + horario + días) y CONECTA su Telegram para recibir
+    las alertas en el móvil. Incluye una tarjeta de Telegram (vincular / probar /
+    desvincular chats; configurar el bot si eres admin) y, solo para admin, una
+    tabla resumen de Usuarios↔Telegram↔reglas.
+
+RESPONSABILIDAD
+    - CRUD de preferencias de notificación del usuario (tabla + diálogo
+      `PreferenceDialog`).
+    - GATEO por IA: las notificaciones se generan de lo que detecta la IA, así
+      que si no hay ninguna cámara con IA activa se bloquea la creación de
+      preferencias y se avisa (`_check_ai_and_gate`).
+    - Sección Telegram: listar chats vinculados, vincular uno nuevo (abre
+      `TelegramLinkDialog`), enviar mensaje de prueba, desvincular, y —solo
+      admin— definir el token del bot de @BotFather.
+    - Vista admin: tabla "Usuarios y Telegram" (quién tiene Telegram y cuántas
+      reglas activas).
+
+DEPENDENCIAS (endpoints consumidos)
+    - GET  cameras/ ............... cámaras para el selector del diálogo.
+    - GET/POST/PUT/DELETE notifications/preferences[...] .. CRUD de reglas.
+    - GET  ai/status ............. cámaras con IA activa (gateo).
+    - GET  telegram/bot-info ..... estado del bot (configurado / @username).
+    - GET  telegram/chats ........ chats Telegram del usuario.
+    - POST telegram/test ......... mensaje de prueba.
+    - POST telegram/configure .... fija el token del bot (solo admin).
+    - DELETE telegram/chats/{id} . desvincula un chat.
+    - GET  telegram/admin/overview  resumen por usuario (tabla admin).
+
+COMPONENTES RELACIONADOS
+    main_window la instancia (índice VIEW_NOTIFICATIONS=5) y le pasa el rol con
+    `set_current_user`. Abre `TelegramLinkDialog` (flujo de vinculación por
+    código), `InfoDialog` (ayuda) y usa `toast`. La tabla de dispositivos
+    Telegram tiene además una vista dedicada (telegram_devices_view).
+
+PUNTO DE ENTRADA (en la app)
+    Sidebar «Notificaciones» → MainWindow._switch_view(VIEW_NOTIFICATIONS).
+
+PIPELINE(S)
+    #13 Notificaciones: aquí el usuario define las reglas y vincula Telegram; el
+    backend (NotificationRouter + TelegramNotifier) usa esas reglas/chats al
+    publicar eventos. El gateo depende del estado de la IA. (Auth #2 subyace.)
+================================================================================
 """
 import logging
 from typing import Optional, List
@@ -11,6 +55,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QDialog,
     QComboBox, QCheckBox, QFormLayout, QMessageBox, QTimeEdit,
+    QTabWidget,
 )
 from PySide6.QtCore import Qt, QTime
 
@@ -33,18 +78,53 @@ EVENT_ICONS = {
     "camera_offline": "offline",
 }
 
-# En el ESCRITORIO las notificaciones solo se VEN aquí mismo (canal "app").
-# El envío por Telegram o al móvil se configura desde la app MÓVIL.
+# Canales de salida. 'app' = se ve aquí mismo y en el móvil (WebSocket LAN);
+# 'telegram' = se envía al/los chat(s) de Telegram vinculados a este usuario.
+# Se configura igual desde escritorio o móvil (misma preferencia por usuario).
 CHANNEL_OPTIONS = [
     ("app", "Ver en la app"),
+    ("telegram", "Telegram"),
 ]
-CHANNEL_ICONS = {"app": "notifications"}
+CHANNEL_ICONS = {"app": "notifications", "telegram": "notifications"}
 
+# Días en orden visual (Lun…Dom). El backend usa la convención 0=Domingo,
+# 1=Lunes … 6=Sábado (= (weekday()+1)%7), así que el índice visual i se mapea a
+# (i+1)%7. _DESKTOP_DAY_TO_BACKEND/_BACKEND_DAY_FROM_DESKTOP encapsulan eso para
+# que escritorio y móvil guarden EXACTAMENTE los mismos valores (antes el
+# escritorio guardaba Lun=0 → se interpretaba como Domingo: días corridos).
 DAY_NAMES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 
 
+def _desktop_day_to_backend(i: int) -> int:
+    """Índice visual (0=Lun…6=Dom) → valor backend (0=Dom,1=Lun…6=Sáb)."""
+    return (i + 1) % 7
+
+# Estilo de las pestañas de Notificaciones (coherente con el tema oscuro).
+_NOTIF_TABS_STYLE = """
+    QTabWidget::pane {
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 8px; top: -1px; background: transparent;
+    }
+    QTabBar::tab {
+        background: #1e293b; color: #94a3b8;
+        padding: 8px 18px; margin-right: 4px;
+        border-top-left-radius: 8px; border-top-right-radius: 8px;
+        font-size: 13px;
+    }
+    QTabBar::tab:selected { background: #334155; color: #f1f5f9; font-weight: bold; }
+    QTabBar::tab:hover:!selected { background: #283548; color: #e2e8f0; }
+"""
+
+
 class PreferenceDialog(QDialog):
-    """Crea o edita una preferencia."""
+    """Diálogo modal para crear o editar UNA preferencia de notificación.
+
+    ROL: recoge los campos de una regla (evento, cámara, activa, canales,
+    horario, días) y los devuelve como dict vía `get_data()`. No habla con el
+    backend; el guardado lo hace `NotificationPreferencesView._add/_edit`.
+    QUIÉN LO INSTANCIA: NotificationPreferencesView (botón «Nueva preferencia»
+    o doble clic / «Editar»).
+    """
 
     def __init__(self, cameras: List[dict],
                  preference: Optional[dict] = None, parent=None):
@@ -101,8 +181,9 @@ class PreferenceDialog(QDialog):
         layout.addLayout(canales)
 
         nota_canal = QLabel(
-            "ℹ️ En el escritorio las alertas se ven aquí mismo. Para recibirlas "
-            "en <b>Telegram</b> o en el <b>móvil</b>, configúralo desde la app móvil."
+            "ℹ️ <b>Ver en la app</b>: alertas aquí y en el móvil (misma red). "
+            "<b>Telegram</b>: requiere haber vinculado tu Telegram (pestaña "
+            "Telegram). La configuración es la misma desde escritorio o móvil."
         )
         nota_canal.setWordWrap(True)
         nota_canal.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 11px;")
@@ -205,15 +286,21 @@ class PreferenceDialog(QDialog):
                 self.time_end.setTime(QTime(int(h), int(m)))
             except Exception:
                 pass
-        # Días
+        # Días (convertir de la convención backend a índice visual).
         days = set(p.get("days", []))
         if days:
             for i, cb in enumerate(self.chk_days):
-                cb.setChecked(i in days)
+                cb.setChecked(_desktop_day_to_backend(i) in days)
 
     def get_data(self) -> dict:
+        """Serializa el diálogo al payload que espera notifications/preferences
+        (event_type, camera_id, enabled, channels, days_of_week y, si procede,
+        schedule_start/schedule_end). Llamado por _add/_edit al aceptar."""
         channels = [k for k, cb in self.chk_channels.items() if cb.isChecked()]
-        days = [i for i, cb in enumerate(self.chk_days) if cb.isChecked()]
+        days = [
+            _desktop_day_to_backend(i)
+            for i, cb in enumerate(self.chk_days) if cb.isChecked()
+        ]
         data = {
             "event_type": self.cmb_event.currentData(),
             "camera_id": self.cmb_camera.currentData(),
@@ -228,6 +315,26 @@ class PreferenceDialog(QDialog):
 
 
 class NotificationPreferencesView(QWidget):
+    """Vista de notificaciones: preferencias del usuario + Telegram (Pipeline #13).
+
+    RESPONSABILIDAD / ROL
+        Página del content_stack que reúne el CRUD de reglas de notificación, la
+        tarjeta de vinculación de Telegram y (para admin) el resumen de usuarios.
+
+    QUIÉN LA INSTANCIA
+        main_window (índice VIEW_NOTIFICATIONS=5). Tras el login, MainWindow
+        llama `set_current_user(id, role)` para aplicar el gating de admin.
+
+    SEÑALES QT
+        No define señales propias. Reacciona a clics de botones y selección de
+        tabla/lista; toda la I/O es vía callbacks async del api_client.
+
+    ESTADO
+        _prefs / _cameras: cachés de la API. _role: rol actual (gating admin).
+        _ai_active_cams: cámaras con IA activa (condiciona crear preferencias).
+        _dialog_open: guard anti-reentrada para el diálogo modal.
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._prefs: List[dict] = []
@@ -264,24 +371,52 @@ class NotificationPreferencesView(QWidget):
         self.btn_refresh.clicked.connect(self.refresh)
         header.addWidget(self.btn_refresh)
 
-        self.btn_add = QPushButton("  Nueva preferencia")
-        self.btn_add.setIcon(icon("add"))
-        self.btn_add.clicked.connect(self._add)
-        header.addWidget(self.btn_add)
         layout.addLayout(header)
 
-        # Intro breve de la pantalla: explica de un vistazo para qué sirve.
+        # Intro breve de la pantalla: explica de un vistazo para qué sirve y
+        # que el contenido está organizado en pestañas.
         intro = QLabel(
             "Recibe avisos cuando tus cámaras detecten algo o se desconecten. "
-            "Conecta Telegram para que te lleguen al móvil, y abajo elige qué "
-            "eventos quieres y de qué cámaras."
+            "En las pestañas de abajo: conecta tu <b>Telegram</b>, consulta el "
+            "resumen de <b>usuarios</b> y elige <b>tus preferencias</b> de aviso."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 12px;")
         layout.addWidget(intro)
 
-        # Aviso de IA: las notificaciones SOLO existen para la cámara con IA
-        # activa. Si no hay ninguna activa, no se puede personalizar.
+        # ====================== PESTAÑAS ======================
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(_NOTIF_TABS_STYLE)
+        layout.addWidget(self.tabs, 1)
+
+        # ---------- Pestaña 1: Telegram ----------
+        tab_telegram = QWidget()
+        tg_layout = QVBoxLayout(tab_telegram)
+        tg_layout.setContentsMargins(4, 10, 4, 4)
+        tg_layout.setSpacing(10)
+        self._setup_telegram_section(tg_layout)
+        tg_layout.addStretch(1)
+        self.tabs.addTab(tab_telegram, "Telegram")
+
+        # ---------- Pestaña 2: Usuarios y Telegram (solo admin) ----------
+        tab_admin = QWidget()
+        admin_layout = QVBoxLayout(tab_admin)
+        admin_layout.setContentsMargins(4, 10, 4, 4)
+        admin_layout.setSpacing(10)
+        self._setup_admin_overview(admin_layout)
+        admin_layout.addStretch(1)
+        self._admin_tab_index = self.tabs.addTab(tab_admin, "Usuarios y Telegram")
+        # Oculta hasta que set_current_user confirme que el rol es admin.
+        self.tabs.setTabVisible(self._admin_tab_index, False)
+
+        # ---------- Pestaña 3: Mis preferencias ----------
+        tab_prefs = QWidget()
+        prefs_layout = QVBoxLayout(tab_prefs)
+        prefs_layout.setContentsMargins(4, 10, 4, 4)
+        prefs_layout.setSpacing(10)
+
+        # Aviso de IA: las notificaciones de detección SOLO existen para la
+        # cámara con IA activa. Si no hay ninguna activa, no se puede personalizar.
         self.lbl_ai_banner = QLabel()
         self.lbl_ai_banner.setWordWrap(True)
         self.lbl_ai_banner.setVisible(False)
@@ -289,15 +424,8 @@ class NotificationPreferencesView(QWidget):
             "background-color: #422006; color: #fcd34d; border: 1px solid #a16207;"
             "border-radius: 8px; padding: 10px; font-size: 12px;"
         )
-        layout.addWidget(self.lbl_ai_banner)
+        prefs_layout.addWidget(self.lbl_ai_banner)
 
-        # ============ SECCIÓN TELEGRAM ============
-        self._setup_telegram_section(layout)
-
-        # ============ TABLA ADMIN: Usuarios ↔ Telegram ↔ preferencias ========
-        self._setup_admin_overview(layout)
-
-        # ============ SECCIÓN PREFERENCIAS ============
         prefs_header = QHBoxLayout()
         prefs_title = QLabel("Mis preferencias")
         prefs_title.setStyleSheet(
@@ -305,7 +433,11 @@ class NotificationPreferencesView(QWidget):
         )
         prefs_header.addWidget(prefs_title)
         prefs_header.addStretch()
-        layout.addLayout(prefs_header)
+        self.btn_add = QPushButton("  Nueva preferencia")
+        self.btn_add.setIcon(icon("add"))
+        self.btn_add.clicked.connect(self._add)
+        prefs_header.addWidget(self.btn_add)
+        prefs_layout.addLayout(prefs_header)
 
         help_lbl = QLabel(
             "<i>Define qué eventos quieres recibir, de qué cámaras, por "
@@ -314,7 +446,7 @@ class NotificationPreferencesView(QWidget):
         )
         help_lbl.setWordWrap(True)
         help_lbl.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 11px;")
-        layout.addWidget(help_lbl)
+        prefs_layout.addWidget(help_lbl)
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
@@ -326,7 +458,7 @@ class NotificationPreferencesView(QWidget):
         self.table.cellDoubleClicked.connect(lambda *a: self._edit())
         from desktop_app.src.ui.views.users_view import _TABLE_STYLE
         self.table.setStyleSheet(_TABLE_STYLE)
-        layout.addWidget(self.table, 1)
+        prefs_layout.addWidget(self.table, 1)
 
         # Acciones
         actions = QHBoxLayout()
@@ -341,20 +473,33 @@ class NotificationPreferencesView(QWidget):
         self.btn_delete.setEnabled(False)
         actions.addWidget(self.btn_delete)
         actions.addStretch()
-        layout.addLayout(actions)
+        prefs_layout.addLayout(actions)
+
+        self.tabs.addTab(tab_prefs, "Mis preferencias")
 
     def set_current_user(self, _user_id: int, _role: str = ""):
+        """Aplica el rol y refresca todo. Llamado por MainWindow tras el login.
+
+        Muestra/oculta lo que es solo-admin (botón «Configurar bot» y la tabla
+        "Usuarios y Telegram") y lanza `refresh()`."""
         self._role = (_role or "").lower()
         is_admin = self._role == "admin"
         # El botón de configurar el token del bot solo tiene sentido para admin.
         if hasattr(self, "btn_telegram_config"):
             self.btn_telegram_config.setVisible(is_admin)
-        # La tabla "Usuarios y Telegram" es solo para admin.
+        # La pestaña "Usuarios y Telegram" (y su tabla) es solo para admin.
         if hasattr(self, "admin_card"):
             self.admin_card.setVisible(is_admin)
+        if hasattr(self, "tabs") and hasattr(self, "_admin_tab_index"):
+            self.tabs.setTabVisible(self._admin_tab_index, is_admin)
         self.refresh()
 
     def refresh(self):
+        """Recarga todo el estado de la vista desde el backend.
+
+        Pide cámaras, preferencias, chats de Telegram, estado de IA (gateo) y,
+        si es admin, la tabla resumen. Llamado por: `set_current_user`, el botón
+        de recargar y tras cada operación de CRUD/Telegram."""
         def on_cams(response):
             if response.success:
                 self._cameras = response.data or []
@@ -446,7 +591,9 @@ class NotificationPreferencesView(QWidget):
 
             days = p.get("days", [])
             if days and len(days) < 7:
-                dias_str = ", ".join(DAY_NAMES[d] for d in sorted(days))
+                # days vienen en convención backend (0=Dom,1=Lun…6=Sáb); el
+                # nombre visual está indexado 0=Lun…6=Dom → (v+6)%7.
+                dias_str = ", ".join(DAY_NAMES[(d + 6) % 7] for d in sorted(days))
             else:
                 dias_str = "Todos"
             self.table.setItem(r, 5, QTableWidgetItem(dias_str))
@@ -464,6 +611,10 @@ class NotificationPreferencesView(QWidget):
         return next((p for p in self._prefs if p.get("id") == pid), None)
 
     def _add(self):
+        """Crea una preferencia: abre PreferenceDialog y la guarda (POST).
+
+        Requiere IA activa (si no, avisa y aborta). Llamado por «Nueva
+        preferencia». Llama a: POST notifications/preferences con get_data()."""
         if self._dialog_open:
             return
         if not self._ai_active_cams:
@@ -800,6 +951,11 @@ class NotificationPreferencesView(QWidget):
             QMessageBox.information(self, "Telegram", message)
 
     def _open_telegram_dialog(self):
+        """Abre el diálogo de vinculación de Telegram (Pipeline #13).
+
+        Lanza `TelegramLinkDialog` (muestra el código/enlace que el usuario envía
+        al bot) y, al cerrarse, recarga los chats por si quedó vinculado.
+        Llamado por: botón «Vincular nuevo chat»."""
         from desktop_app.src.ui.dialogs.telegram_link_dialog import TelegramLinkDialog
         dlg = TelegramLinkDialog(self)
         dlg.exec()

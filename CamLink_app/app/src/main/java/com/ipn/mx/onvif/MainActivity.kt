@@ -1,3 +1,50 @@
+/*
+ * ============================================================================
+ * APP: CamLink — Cliente Android del sistema NVR/VMS de videovigilancia
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Cliente móvil (Kotlin/Android) que consume el MISMO backend Flask que el
+ *   cliente de escritorio: se autentica por JWT, ve el directo y las grabaciones
+ *   de las cámaras y recibe notificaciones push de eventos por WebSocket en LAN
+ *   (sin depender de FCM/Internet).
+ *
+ * ARQUITECTURA (paquete com.ipn.mx.onvif)
+ *   MainActivity .............. host único: Navigation Component + barra inferior
+ *                               + toolbar; orquesta sesión y permisos.
+ *   network/RetrofitClient .... construye el ApiService (Retrofit) e inyecta el
+ *                               header Authorization: Bearer <access_token>.
+ *   network/ApiService ........ interfaz Retrofit: TODOS los endpoints REST.
+ *   network/JwtAuthenticator .. ante 401 hace POST /auth/refresh y reintenta; si
+ *                               falla, emite broadcast SESSION_EXPIRED.
+ *   network/NotificationWsClient + service/NotificationWebSocketService ..
+ *                               WebSocket /ws/notifications en un foreground
+ *                               service → push de eventos en tiempo real (LAN).
+ *   model/ApiModels ........... data classes que espejan el JSON del backend.
+ *   ui/…Fragment .............. pantallas (QR login, live, cámaras, timeline,
+ *                               grabaciones, playback, notificaciones, Telegram).
+ *   ui/…Adapter ............... adaptadores de RecyclerView (listas).
+ *   util/DeviceIdentity ....... identidad estable del dispositivo.
+ *
+ * FLUJO DE SESIÓN (Pipeline #2 Auth, lado móvil)
+ *   QrScanFragment escanea el QR generado por el backend (token + IP:puerto) →
+ *   RetrofitClient.saveToken() → navega a LiveViewFragment. Cuando el
+ *   refresh_token caduca, JwtAuthenticator emite SESSION_EXPIRED y MainActivity
+ *   limpia tokens y vuelve al QR (ver sessionExpiredReceiver más abajo).
+ *
+ * DIRECTO Y GRABACIONES
+ *   El vídeo NO pasa por Retrofit: el directo se reproduce con ExoPlayer desde
+ *   el restream RTSP/HLS de go2rtc (Pipeline #3); las grabaciones se sirven con
+ *   URLs firmadas del backend (Pipeline #14).
+ *
+ * MÓDULO: MainActivity — Activity única (single-activity architecture).
+ *   Responsabilidad: alojar el NavHostFragment, cablear la barra inferior y la
+ *   toolbar, gestionar el permiso POST_NOTIFICATIONS, escuchar SESSION_EXPIRED
+ *   para volver al login, y enrutar las pulsaciones de notificaciones push
+ *   (extra openCameraId → abre el playback del evento). Punto de entrada de la
+ *   app declarado en AndroidManifest.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif
 
 import android.Manifest

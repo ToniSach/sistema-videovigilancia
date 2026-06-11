@@ -1,5 +1,36 @@
 """
-Servicio de generación de tokens para login vía QR.
+================================================================================
+MÓDULO: qr_service — Vinculación de dispositivos por código QR
+================================================================================
+
+PROPÓSITO
+    Permite vincular un móvil a una cuenta sin teclear credenciales: el cliente
+    autenticado (desktop) genera un QR; el móvil lo escanea, extrae el servidor
+    y el `link_token`, y lo canjea para registrarse.
+
+RESPONSABILIDAD PRINCIPAL
+    - Emitir un `LinkToken` de un solo uso y vida corta (5 min) e incrustarlo,
+      junto a la URL del servidor, en una imagen PNG con el QR.
+    - Invalidar tokens previos del usuario al emitir uno nuevo (un QR vigente).
+    - Validar (sin consumir) y consumir (marcar usado) el token al canjearlo.
+
+DEPENDENCIAS
+    database.models ........ LinkToken
+    database.connection .... db_manager (una sesión por operación)
+    services.device_service  DeviceService (registro del móvil tras el canje)
+    qrcode / io / json ..... render del QR a PNG en memoria
+
+COMPONENTES RELACIONADOS
+    - api.routes.qr: expone la generación del QR y el canje del token.
+    - DeviceService: tras consumir el token, registra el MobileDevice.
+
+PUNTO DE ENTRADA
+    Instancia `QRService()` desde las rutas.
+
+PIPELINE(S)
+    #2 Autenticación (variante por QR) y arranque del #13 (provisión del móvil):
+    emite el token efímero que el móvil canjea para obtener su sesión.
+================================================================================
 """
 import logging
 import uuid
@@ -17,8 +48,16 @@ logger = logging.getLogger(__name__)
 
 
 class QRService:
-    """Gestiona tokens de vinculación para login QR."""
-    
+    """
+    Gestiona los tokens de vinculación para login/registro por QR.
+
+    ROL: emitir el QR con un token efímero y validar/consumir ese token al
+    canjearlo. Lo instancian/consumen las rutas de `api.routes.qr`. Colabora con
+    DeviceService (registro del móvil). Pipelines #2 (auth) y #13 (provisión móvil).
+    """
+
+    # Vida útil del token de vinculación (minutos). Corta a propósito: el QR
+    # debe canjearse en el acto; pasado este tiempo hay que regenerarlo.
     TOKEN_EXPIRY_MINUTES = 5
     
     def __init__(self):
@@ -27,10 +66,14 @@ class QRService:
     
     def generate_link_token(self, user_id: int, server_host: str, server_port: int) -> Tuple[str, bytes]:
         """
-        Genera token de vinculación y código QR.
-        
-        Returns:
-            Tupla (token_string, qr_image_bytes)
+        Propósito: invalida los tokens previos del usuario, crea uno nuevo
+            (UUID4, caduca en TOKEN_EXPIRY_MINUTES) y lo renderiza en un QR PNG
+            junto a la URL del servidor para que el móvil sepa a dónde conectarse.
+        Inputs: user_id; server_host, server_port (los del backend, para
+            incrustarlos en el QR).
+        Outputs: tupla (token_string, qr_image_bytes PNG).
+        Excepciones: re-lanza errores de BD/render tras loguear.
+        Llamado por: ruta GET de generación de QR (desde el desktop autenticado).
         """
         try:
             with db_manager.get_session() as session:
@@ -80,10 +123,11 @@ class QRService:
     
     def validate_link_token(self, token: str) -> Optional[int]:
         """
-        Valida token de vinculación.
-        
-        Returns:
-            user_id si válido, None si inválido
+        Propósito: valida un token SIN consumirlo (lo deja disponible para el
+            canje real). Comprueba que exista, no esté usado y no haya caducado.
+        Inputs: token. Outputs: user_id si válido, None si inválido/caducado/usado.
+        Excepciones: capturadas → None (no propaga).
+        Llamado por: ruta de verificación previa del QR (chequeo de validez).
         """
         try:
             with db_manager.get_session() as session:
@@ -108,7 +152,12 @@ class QRService:
     
     def consume_link_token(self, token: str) -> Optional[int]:
         """
-        Consume token (marca como usado) y retorna user_id.
+        Propósito: CANJE real del token — lo marca como usado (un solo uso) y
+            devuelve el user_id al que vincular el móvil. Tras esto la ruta
+            registra el dispositivo vía DeviceService.
+        Inputs: token. Outputs: user_id si válido y no caducado, None si no.
+        Excepciones: capturadas → None (no propaga).
+        Llamado por: ruta de canje del QR (registro del móvil).
         """
         try:
             with db_manager.get_session() as session:

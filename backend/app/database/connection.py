@@ -1,6 +1,40 @@
 """
-Gestión de conexión PostgreSQL con SQLAlchemy 2.0.
-Patrón Singleton para el pool de conexiones.
+================================================================================
+MÓDULO: connection — Gestor de conexión a PostgreSQL (engine + pool de sesiones)
+================================================================================
+
+PROPÓSITO
+    Proveer el ÚNICO punto de acceso a la base de datos: crea el engine
+    SQLAlchemy 2.0 contra PostgreSQL, configura el pool de conexiones
+    (QueuePool) y entrega sesiones transaccionales mediante un context manager
+    que hace commit/rollback/close automáticamente.
+
+RESPONSABILIDAD PRINCIPAL
+    Centralizar la configuración del acceso a datos (URL, tamaño de pool,
+    pre-ping, reciclado) y exponer `get_session()` como la forma canónica de
+    abrir una transacción. También crea las tablas en el arranque (`init_db`).
+
+DEPENDENCIAS IMPORTANTES
+    config.settings ......... `get_database_url()` → postgresql+psycopg2://...
+    database.models.Base .... metadata para `create_all` (import diferido en init_db
+                              para evitar import circular).
+    sqlalchemy (Core/ORM/pool) — engine, sessionmaker, QueuePool.
+
+COMPONENTES RELACIONADOS (quién lo consume)
+    main.create_app() ....... llama a `db_manager.init_db()` en el paso 4 del
+                              pipeline #1 Inicio del sistema.
+    database.repositories.* . TODOS los repos abren `db_manager.get_session()`.
+    Servicios y rutas que necesiten BD pasan SIEMPRE por este singleton.
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    Capa de infraestructura de persistencia. Es el cuello de botella controlado
+    de todo acceso a datos del backend.
+
+PIPELINES
+    Participa, como acceso a BD, en TODOS los pipelines que leen/escriben datos
+    (#2 Autenticación, #10 Eventos, #11 Grabación, #13 Notificaciones,
+    #14 Reproducción...). En el #1 Inicio crea/verifica el esquema.
+================================================================================
 """
 import logging
 from contextlib import contextmanager
@@ -17,8 +51,26 @@ logger = logging.getLogger(__name__)
 
 class DatabaseManager:
     """
-    Singleton para gestionar conexiones PostgreSQL.
-    Configura pooling y provee sesiones con context manager.
+    Gestor singleton del acceso a PostgreSQL.
+
+    ROL
+        Posee el engine SQLAlchemy y la fábrica de sesiones, configura el pool
+        (QueuePool: pool_size=10, max_overflow=20, pre_ping, recycle=3600s) y
+        entrega sesiones transaccionales seguras vía `get_session()`.
+
+    POR QUÉ SINGLETON (__new__)
+        El engine encapsula un POOL de conexiones TCP vivas a la BD: debe existir
+        UNA sola instancia por proceso para no fragmentar/duplicar conexiones.
+        Encaja con la restricción "proceso único" del backend (ver main.py). El
+        engine se construye perezosamente la primera vez que se pide (`_initialize`).
+
+    QUIÉN LO INSTANCIA/CONSUME
+        Se instancia una vez al final del módulo (`db_manager`). Lo consumen
+        `main.create_app()` (init_db) y todos los repositorios.
+
+    DEPENDENCIAS
+        config.settings (URL de BD) y database.models.Base (metadata, import
+        diferido en init_db).
     """
     _instance = None
     _engine = None
@@ -52,8 +104,18 @@ class DatabaseManager:
 
     def init_db(self):
         """
-        Crea todas las tablas definidas en los modelos si no existen.
-        Importación diferida para evitar circular imports.
+        Crea/verifica todas las tablas del esquema (paso 4 del pipeline #1 Inicio).
+
+        Ejecuta `Base.metadata.create_all` con import DIFERIDO de los modelos
+        para evitar el ciclo de imports (models no necesita conocer connection).
+        Idempotente: solo crea lo que falte; una BD ya migrada no se altera.
+
+        Inputs:  ninguno (usa el engine del singleton).
+        Outputs: True si las tablas quedaron creadas/verificadas.
+        Excepciones: re-lanza cualquier error de BD (sin BD no hay sistema → el
+            arranque debe abortar; ver main.create_app, que NO lo captura).
+        Llamado por: main.create_app() durante el arranque.
+        Llama a: get_engine() y Base.metadata.create_all().
         """
         try:
             from ..database.models import Base
@@ -78,9 +140,17 @@ class DatabaseManager:
     @contextmanager
     def get_session(self) -> Generator[Session, None, None]:
         """
-        Context manager para sesiones de base de datos.
-        Maneja automáticamente commit/rollback y cierre.
-        
+        Forma CANÓNICA de abrir una transacción contra la BD.
+
+        Patrón "unit of work": entrega una `Session` del pool y, al salir del
+        bloque `with`, hace COMMIT si todo fue bien o ROLLBACK si saltó una
+        excepción; en cualquier caso CIERRA (devuelve la conexión al pool).
+
+        Inputs:  ninguno.
+        Outputs: genera (yield) una `Session` viva dentro del `with`.
+        Excepciones: re-lanza la excepción tras hacer rollback (no la silencia).
+        Llamado por: todos los repositorios y servicios que tocan la BD.
+
         Uso:
             with db_manager.get_session() as session:
                 session.query(Model).all()

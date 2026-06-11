@@ -1,7 +1,41 @@
 # backend/app/core/executor.py
 """
-Global Executor v2.0 - Pool de threads unificado con límite estricto.
-FIX F1.3: Previene explosión de threads saturando recursos.
+================================================================================
+MÓDULO: core.executor — Pool de hilos GLOBAL unificado (GlobalExecutor)
+================================================================================
+
+PROPÓSITO
+    Proveer UN único ThreadPoolExecutor compartido por todo el backend, con un
+    techo estricto de hilos, para que ningún subsistema cree hilos sin control y
+    sature la máquina (FIX F1.3: evitar la "explosión de hilos").
+
+RESPONSABILIDAD PRINCIPAL
+    - Encolar tareas (submit) en un pool acotado a MAX_WORKERS (50) hilos.
+    - Rechazar de forma segura las tareas si el pool está detenido (shutdown),
+      devolviendo None en vez de lanzar.
+    - Llevar contadores (enviadas/completadas/rechazadas) para diagnóstico
+      (get_stats) y apagar el pool ordenadamente (shutdown).
+
+DEPENDENCIAS
+    concurrent.futures.ThreadPoolExecutor, threading. Sin dependencias del resto
+    del proyecto (es infraestructura base).
+
+COMPONENTES RELACIONADOS
+    cameras.FrameDistributor .. reparte cada frame a sus consumidores vía submit.
+    events.EventManager ....... despacha eventos a suscriptores (su propio pool;
+                                este executor lo usan otros productores de tareas).
+    Cualquier subsistema que necesite trabajo asíncrono breve usa global_executor.
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    Singleton global `global_executor` al pie del módulo. Estado vivo (los hilos)
+    en memoria de proceso → encaja con la restricción de PROCESO ÚNICO. main.py
+    lo apaga en su `finally` (global_executor.shutdown()).
+
+PIPELINE(S)
+    Transversal a varios: alimenta el fan-out de frames del pipeline #3 (Live) /
+    procesamiento, y el trabajo asíncrono de IA (#9), Eventos (#10) y Grabación
+    (#11). No es una etapa propia: es la maquinaria de concurrencia compartida.
+================================================================================
 """
 from concurrent.futures import ThreadPoolExecutor
 import logging

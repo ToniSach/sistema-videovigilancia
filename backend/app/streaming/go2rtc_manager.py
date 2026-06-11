@@ -1,5 +1,62 @@
 """
-Go2RtcManager — Capa de medios (go2rtc) como proceso sidecar.
+================================================================================
+MÓDULO: go2rtc_manager — Capa de medios (go2rtc) como proceso sidecar
+================================================================================
+
+PROPÓSITO
+    Gestionar el ÚNICO componente de directo del sistema: el servidor de medios
+    go2rtc, lanzado como subproceso hijo del backend. Genera su configuración
+    (go2rtc.yaml) a partir de las cámaras de la BD, arranca el binario, lo
+    supervisa (reinicio con backoff) y expone las URLs (RTSP/WebRTC/HLS) que
+    consumen el resto de subsistemas.
+
+RESPONSABILIDAD PRINCIPAL
+    Centralizar UNA sola conexión RTSP por cámara y reexponerla a N clientes sin
+    transcodificar (`-c copy`, CPU ≈ 0). Las cámaras IP solo aceptan 1-4 sesiones
+    RTSP simultáneas; sin go2rtc, preview + grabación + IA + móvil saturarían la
+    cámara. El antiguo pipeline de decode local con FFmpeg fue ELIMINADO: go2rtc
+    es la única capa de directo y Python solo decodifica píxeles para la IA.
+
+PIPELINES EN LOS QUE PARTICIPA
+    #1  Inicio ........ main.py llama Go2RtcManager().start(cams) en el arranque.
+    #3  Live .......... el directo (desktop/móvil) sale SIEMPRE de go2rtc.
+    #5  go2rtc ........ ESTE módulo ES el orquestador del pipeline go2rtc.
+    #6  WebRTC ........ webrtc_signaling usa webrtc_api_base() para el proxy SDP.
+    #9  IA ............ AIFrameSource lee el substream low vía rtsp_restream_url.
+    #11 Grabación ..... recording lee el restream RTSP nativo con `-c copy`.
+
+DEPENDENCIAS
+    config.settings ......... puertos/host/binario/hwaccel (GO2RTC_*).
+    database.connection ..... el reconciliador lee Camera de la BD.
+    database.models.Camera .. id/rtsp_url/is_active/is_dual_lens.
+    PyYAML (opcional) ....... serializa el YAML; hay fallback manual si falta.
+    binario go2rtc .......... subproceso externo (debe estar en PATH).
+
+COMPONENTES RELACIONADOS
+    webrtc_signaling.py ..... proxy de signaling que apunta a webrtc_api_base().
+    stream_keepalive.py ..... mantiene calientes los streams vía rtsp_restream_url.
+    cameras.dual_lens_splitter — la geometría de crop de aquí DEBE coincidir.
+    main.py ................. arranca/detiene el manager y el reconciliador.
+
+PUNTO DE ENTRADA
+    Singleton `Go2RtcManager()`. Métodos públicos clave:
+      start(cams) / stop() / reload(cams)  → ciclo de vida del proceso.
+      rtsp_restream_url / hls_url / webrtc_api_base → URLs para clientes.
+      is_enabled / is_running              → estado.
+
+MAPA DE PUERTOS (los que abre go2rtc y quién los consume)
+    ┌───────────────────────────────────────────────────────────────────────┐
+    │ GO2RTC_API_PORT   (1984)  HTTP: API WebRTC (signaling) + HLS (.m3u8).   │
+    │                           Consumido por webrtc_signaling y la móvil.    │
+    │ GO2RTC_RTSP_PORT  (8554)  RTSP restream. Consumido por grabación, IA,   │
+    │                           keep-alive y VLC del cliente desktop.         │
+    │ GO2RTC_WEBRTC_PORT(8555)  WebRTC: candidatos ICE (host LAN). Vídeo P2P. │
+    └───────────────────────────────────────────────────────────────────────┘
+
+DIAGRAMA — flujo de medios
+    cámara IP ──RTSP(1 sesión)──▶ go2rtc ──┬─▶ WebRTC (8555, P2P)  → desktop/móvil
+                                            ├─▶ RTSP   (8554, -c copy) → grabación/IA
+                                            └─▶ HLS    (1984, .m3u8)   → móvil
 
 QUÉ ES go2rtc
 -------------
@@ -86,14 +143,35 @@ _DUAL_LENS_CROP = {
     "l2": "crop=iw:ih/2:0:0",     # mitad superior
 }
 
-# Niveles de calidad para el DIRECTO. "high" no lleva escala (nativo / recorte
-# pleno). "medium"/"low" añaden un escalado → go2rtc los transcodifica SOLO si
-# alguien los está viendo (perezoso), así que su costo es como mucho 1 transcode
-# por panel abierto. La grabación y la IA NO usan estos niveles (van al nativo).
+# Niveles de calidad DERIVADOS para el DIRECTO. Por decisión de producto SOLO se
+# genera "medium" (480p) — es la única calidad de visualización de la app (lo
+# confirma stream_keepalive). El "original" es el stream nativo cam_<id> (-c copy,
+# sin transcode). Antes se generaba además "low" (360p) y, en dual-lens, el high
+# por lente, lo que producía hasta 7 streams por cámara; se eliminaron. go2rtc
+# transcodifica "medium" SOLO si alguien lo está viendo (perezoso). Las peticiones
+# legacy de "low" o de high-por-lente se normalizan a "medium" en
+# rtsp_restream_url/hls_url, así que ningún consumidor queda apuntando a un stream
+# inexistente.
 _QUALITY_SCALE = {
     "medium": "scale=-2:480",
-    "low": "scale=-2:360",
 }
+
+
+def _normalize_quality(quality: str, lens: Optional[str]) -> str:
+    """
+    Ajusta la calidad pedida al conjunto de streams que SÍ se generan
+    (original + medium). Reglas:
+      - "low" ya no existe → "medium".
+      - Para un lente (dual) no existe "high" por lente → "medium".
+      - El resto ("high" sin lente, "medium") se respeta.
+    Centraliza el mapeo para que ningún consumidor (IA, clientes, keepalive)
+    apunte a un nombre de stream inexistente tras reducir los niveles.
+    """
+    if quality == "low":
+        quality = "medium"
+    if lens and quality == "high":
+        quality = "medium"
+    return quality
 
 
 def build_go2rtc_config(
@@ -110,13 +188,50 @@ def build_go2rtc_config(
 ) -> dict:
     """
     Paso 2 (núcleo PURO y testeable). Construye el diccionario de config go2rtc
-    a partir de una lista de cámaras.
+    a partir de una lista de cámaras. Es el CORAZÓN de "cómo se crean los streams".
+
+    CÓMO SE CREAN LOS STREAMS (estructura del YAML resultante)
+      Por decisión de producto: SOLO "el original" + "calidad media". Por cada
+      cámara se generan estas entradas en `streams:` (nombre → fuente):
+        Mono (1 lente)  → 2 streams:
+          cam_<id>          ← rtsp_url de la cámara (ORIGINAL nativo, -c copy).
+          cam_<id>_medium   ← reescalado a 480p (transcode perezoso).
+        Dual-lens (is_dual_lens=True) → 3 streams: NO se reabre la cámara; los
+        lentes PARTEN del stream ya ingerido cam_<id> y se recortan (crop):
+          cam_<id>          ← ORIGINAL combinado (lado a lado, -c copy).
+          cam_<id>_l1_medium ← mitad inferior a 480p (ver _DUAL_LENS_CROP).
+          cam_<id>_l2_medium ← mitad superior a 480p.
+      "medium" es el único nivel de visualización del DIRECTO (pipeline #3); la
+      grabación (#11) consume el original cam_<id>; la IA (#9) consume "medium"
+      (su petición "low" se normaliza a "medium"). YA NO se generan los substreams
+      "low" (360p) ni el high-por-lente (eran hasta 7 streams; ahora 2-3).
+
+    SUBSTREAMS Y TRANSCODE (perezoso)
+      go2rtc solo arranca el transcoder de un substream cuando alguien lo
+      consume, así que listar todas las calidades NO cuesta CPU hasta que se
+      abre un panel. Con hwaccel="qsv" el medium/low usan la iGPU (h264_qsv);
+      sin hwaccel caen a libx264 software. El nativo high siempre es -c copy.
+
+    SECCIONES FIJAS DEL YAML
+      api    → escucha en api_host:api_port (1984): signaling WebRTC + HLS.
+      rtsp   → escucha en :rtsp_port (8554): restream para grabación/IA/keepalive.
+      webrtc → escucha en :webrtc_port (8555) + `candidates` ICE (host LAN +
+               extra_candidates opcionales para STUN/TURN si hay acceso remoto).
 
     Reglas de negocio:
-      - Solo se incluyen cámaras con `is_active=True` (salvo include_inactive),
-        coherente con "las cámaras inactivas no aparecen en el en vivo".
+      - Solo se incluyen cámaras con `is_active=True` (salvo include_inactive,
+        que usa el reconciliador para listar TODAS — go2rtc conecta perezoso).
       - Se omiten cámaras sin `rtsp_url`.
-      - Cada cámara -> un stream `cam_<id>` con su rtsp_url como fuente.
+
+    Inputs:
+      cameras .......... iterable de objetos con .id/.rtsp_url/.is_active
+                         (/.is_dual_lens). Acepta mocks/SimpleNamespace.
+      api_host/_port, rtsp_port, webrtc_port, public_host, extra_candidates,
+      include_inactive, hwaccel ... ver MAPA DE PUERTOS y config GO2RTC_*.
+    Outputs:
+      dict listo para serializar a YAML (claves api/rtsp/webrtc/streams/log).
+    Llamado por:
+      write_config() (arranque) y reconcile() (sincronización con BD).
 
     No realiza I/O: recibe objetos cámara (o mocks con .id/.rtsp_url/.is_active)
     y devuelve un dict. La serialización a YAML y el arranque del proceso son
@@ -174,14 +289,15 @@ def build_go2rtc_config(
             return f"ffmpeg:{src}#video=h264#raw=-vf {filters}"
 
         if getattr(cam, "is_dual_lens", False):
-            # Por lente: high = recorte pleno; medium/low = recorte + escala.
+            # Por lente SOLO la calidad media (recorte + escala 480p). El "original"
+            # es el combinado cam_X (ya añadido, -c copy). No se genera el high por
+            # lente (era un transcode full-res extra que el usuario no quería).
             for lens, crop in _DUAL_LENS_CROP.items():
                 base = lens_stream_name(cam_id, lens)
-                streams[base] = _xcode(crop)
                 for q, sc in _QUALITY_SCALE.items():
                     streams[f"{base}_{q}"] = _xcode(f"{crop},{sc}")
         else:
-            # Mono: high = nativo (cam_X, ya añadido, -c copy); medium/low = escala.
+            # Mono: original = nativo (cam_X, ya añadido, -c copy); + medium (escala).
             for q, sc in _QUALITY_SCALE.items():
                 streams[f"{src}_{q}"] = _xcode(sc)
 
@@ -244,11 +360,38 @@ def _yaml_scalar(v: Any) -> str:
 
 class Go2RtcManager:
     """
-    Singleton que gestiona el ciclo de vida del proceso go2rtc.
+    Singleton (proceso único) que gestiona el ciclo de vida del proceso go2rtc.
 
-    Es seguro instanciarlo aunque go2rtc esté desactivado: en ese caso `start()`
-    es un no-op y las funciones de URL siguen devolviendo valores coherentes
-    (útiles para construir respuestas de API sin ramificar en cada endpoint).
+    ROL / RESPONSABILIDAD
+        Es el orquestador del pipeline #5 (go2rtc). Posee el subproceso go2rtc,
+        dos hilos de fondo (supervisor + reconciliador) y la firma del último
+        conjunto de streams escrito. Genera el YAML, arranca/reinicia el binario
+        y publica las URLs que consume el resto del sistema.
+
+    QUIÉN LO INSTANCIA / CONSUME
+        - main.py lo arranca (start) y detiene (stop) en el pipeline de inicio.
+        - webrtc_signaling.py lo consulta (webrtc_api_base) para el proxy SDP #6.
+        - stream_keepalive.py deriva URLs RTSP del restream (#3).
+        - Los endpoints de cámaras devuelven rtsp_restream_url/hls_url a clientes.
+
+    SINGLETON
+        Patrón `__new__` con lock de clase: una sola instancia por proceso, que
+        retiene el subproceso y los hilos vivos en memoria. Coherente con la
+        restricción de PROCESO ÚNICO del backend (ver CLAUDE.md): no debe haber
+        dos managers peleando por los puertos 8554/8555/1984.
+
+    SEGURO AUNQUE ESTÉ DESACTIVADO
+        Es seguro instanciarlo aunque go2rtc esté desactivado: en ese caso
+        `start()` es un no-op y las funciones de URL siguen devolviendo valores
+        coherentes (útiles para construir respuestas de API sin ramificar en
+        cada endpoint).
+
+    HILOS DE FONDO
+        - Go2RtcSupervisor: ÚNICO que hace _spawn(); reinicia el proceso con
+          backoff si muere (resiliencia).
+        - Go2RtcReconciler: cada 15s compara los streams de la BD con los
+          escritos y, si cambian, reescribe el YAML y mata el proceso (el
+          supervisor lo relanza) — evita que dos hilos spawneen a la vez.
     """
 
     _instance: Optional["Go2RtcManager"] = None
@@ -297,12 +440,25 @@ class Go2RtcManager:
         self, camera_id: int, lens: Optional[str] = None, quality: str = "high"
     ) -> str:
         """
-        URL RTSP del restream.
-          - Sin `lens` → stream combinado (cam_X). Con `lens` → sub-stream del
-            lente dual (cam_X_l1/l2).
-          - `quality`: "high" (nativo/recorte pleno), "medium" (480p), "low"
-            (360p). Solo aplica al DIRECTO; grabación/IA usan "high"/nativo.
+        URL RTSP del restream de go2rtc (puerto 8554). Etapa: consumo (#3/#9/#11).
+
+        Es la forma en que TODO consumidor RTSP entra al medio centralizado:
+          - Grabación (#11): "high" → `rtsp://host:8554/cam_<id>` (-c copy).
+          - IA (#9): AIFrameSource pide "low" → substream 360p (menos decode).
+          - Keep-alive (#3): mantiene caliente el substream "medium".
+          - Desktop (VLC): abre el restream en vez de la cámara directa.
+
+        Inputs:
+          camera_id ... id de la cámara.
+          lens ........ None → stream combinado (cam_X); "l1"/"l2" → lente dual.
+          quality ..... "high" (=original nativo cam_X, solo SIN lente) o "medium"
+                        (480p). "low" ya no existe → se normaliza a "medium". Para
+                        un lente (dual) tampoco hay "high" → también va a "medium".
+        Outputs:
+          str con la URL rtsp://public_host:GO2RTC_RTSP_PORT/<nombre_stream>.
+        Llama a: stream_name / lens_stream_name + _normalize_quality.
         """
+        quality = _normalize_quality(quality, lens)
         base = lens_stream_name(camera_id, lens) if lens else stream_name(camera_id)
         name = base if quality == "high" else f"{base}_{quality}"
         return f"rtsp://{self.public_host}:{self.cfg.GO2RTC_RTSP_PORT}/{name}"
@@ -311,11 +467,18 @@ class Go2RtcManager:
         self, camera_id: int, lens: Optional[str] = None, quality: str = "high"
     ) -> str:
         """
-        URL HLS del restream (la consume la app MÓVIL con ExoPlayer, que es muy
-        fiable con HLS y flojo con RTSP). go2rtc genera el HLS bajo demanda desde
-        el stream ya ingerido (sin reabrir la cámara). Usa public_host (IP LAN)
-        + el puerto de la API, que ahora escucha en 0.0.0.0.
+        URL HLS del restream (puerto 1984, API HTTP). Etapa: consumo móvil (#3).
+
+        La consume la app MÓVIL con ExoPlayer (muy fiable con HLS y flojo con
+        RTSP). go2rtc genera el HLS bajo demanda desde el stream ya ingerido (sin
+        reabrir la cámara). Usa public_host (IP LAN) + GO2RTC_API_PORT, que
+        escucha en 0.0.0.0 para ser alcanzable desde la LAN.
+
+        Inputs:  camera_id, lens (None/l1/l2), quality (high/medium; low→medium).
+        Outputs: str `http://public_host:GO2RTC_API_PORT/api/stream.m3u8?src=<n>`.
+        Llamado por: endpoints de streaming de cámaras (respuesta a la móvil).
         """
+        quality = _normalize_quality(quality, lens)
         base = lens_stream_name(camera_id, lens) if lens else stream_name(camera_id)
         name = base if quality == "high" else f"{base}_{quality}"
         return (
@@ -342,7 +505,16 @@ class Go2RtcManager:
     # Generación y escritura de config (paso 2)
     # ───────────────────────────────────────────────────────────────────────
     def write_config(self, cameras: Iterable[Any]) -> str:
-        """Genera el go2rtc.yaml desde las cámaras y lo escribe en disco."""
+        """Genera el go2rtc.yaml desde las cámaras y lo escribe en disco (paso 2).
+
+        Puente entre el núcleo puro (build_go2rtc_config) y el disco: inyecta los
+        puertos/host de config, serializa a YAML y escribe en GO2RTC_CONFIG_PATH.
+
+        Inputs:  cameras — cámaras a publicar.
+        Outputs: str con la ruta absoluta del go2rtc.yaml escrito.
+        Llamado por: start() y reload().
+        Llama a:     build_go2rtc_config, _dump_yaml.
+        """
         cfg = self.cfg
         data = build_go2rtc_config(
             cameras,
@@ -402,7 +574,19 @@ class Go2RtcManager:
             return []
 
     def reconcile(self) -> None:
-        """Regenera el config desde la BD y reinicia go2rtc SOLO si cambió."""
+        """Regenera el config desde la BD y reinicia go2rtc SOLO si cambió.
+
+        Núcleo del sincronizado en caliente: lee TODAS las cámaras, construye el
+        conjunto de streams y compara su firma con la última escrita. Si difiere,
+        reescribe el YAML y mata el proceso (el SUPERVISOR lo relanza con el
+        nuevo config — aquí nunca se hace _spawn para no crear dos go2rtc).
+        Incluye una guardia anti-churn: si la lectura de BD viene vacía pero
+        antes había streams, conserva el config (probable fallo transitorio).
+
+        Inputs:  ninguno (lee la BD vía _load_all_cameras).
+        Outputs: None (efecto: YAML reescrito + proceso terminado si cambió).
+        Llamado por: _reconcile_loop (cada 15s).
+        """
         if not self.is_enabled():
             return
         cfg = self.cfg
@@ -477,8 +661,18 @@ class Go2RtcManager:
     # ───────────────────────────────────────────────────────────────────────
     def start(self, cameras: Iterable[Any]) -> bool:
         """
-        Paso 1+3. Arranca go2rtc si está habilitado y el binario existe.
-        Devuelve True si quedó corriendo, False si se omitió o falló.
+        Paso 1+3. Arranca go2rtc si está habilitado y el binario existe. Etapa
+        de arranque del pipeline #5 (llamado desde el pipeline #1 en main.py).
+
+        Secuencia: valida flag + binario → write_config (genera YAML inicial) →
+        abre puertos en el Firewall de Windows (best-effort) → _spawn() →
+        lanza el hilo supervisor (reinicia si muere) y el reconciliador (BD).
+
+        Inputs:  cameras — cámaras activas iniciales (para el primer YAML).
+        Outputs: True si quedó corriendo; False si se omitió (desactivado) o
+                 falló (binario ausente).
+        Llamado por: main.create_app() (pipeline #1).
+        Llama a:     write_config, _ensure_firewall_rules, _spawn.
         """
         if not self.is_enabled():
             logger.info("go2rtc desactivado (GO2RTC_ENABLED=false). No se arranca.")
@@ -619,12 +813,29 @@ class Go2RtcManager:
             # 'a' para conservar entre reinicios; go2rtc rota poco. Útil para
             # diagnosticar por qué un stream no conecta a la cámara.
             self._log_fh = open(log_path, "a", encoding="utf-8", buffering=1)
+
+            # GARANTIZAR ffmpeg en el PATH de go2rtc: los substreams por lente
+            # ('exec:ffmpeg ...') y el medium hacen que go2rtc LANCE ffmpeg como
+            # subproceso. Si no lo encuentra → "exec: ffmpeg executable file not
+            # found in %PATH%" y el directo del móvil/escritorio falla. Prepende-
+            # mos la carpeta del ffmpeg que ve el backend (shutil.which) al PATH
+            # heredado, así go2rtc siempre lo resuelve aunque su entorno no lo trajera.
+            env = os.environ.copy()
+            ffmpeg_bin = shutil.which("ffmpeg")
+            if ffmpeg_bin:
+                ffmpeg_dir = os.path.dirname(os.path.abspath(ffmpeg_bin))
+                env["PATH"] = ffmpeg_dir + os.pathsep + env.get("PATH", "")
+
             self._proc = subprocess.Popen(
                 [self._binary, "-config", self._config_path],
                 stdout=self._log_fh,
                 stderr=subprocess.STDOUT,
+                env=env,
             )
-            logger.info("go2rtc lanzado (pid=%s) — log en %s", self._proc.pid, log_path)
+            logger.info(
+                "go2rtc lanzado (pid=%s, ffmpeg=%s) — log en %s",
+                self._proc.pid, ffmpeg_bin or "NO ENCONTRADO", log_path,
+            )
         except Exception as e:  # pragma: no cover - depende del entorno
             logger.error("No se pudo lanzar go2rtc: %s", e)
             self._proc = None
@@ -652,8 +863,16 @@ class Go2RtcManager:
 
     def reload(self, cameras: Iterable[Any]) -> None:
         """
-        Regenera el config (p.ej. al añadir/quitar/activar una cámara) y reinicia
+        Recarga MANUAL del config (alternativa al reconciliador automático).
+        Regenera el YAML (p.ej. al añadir/quitar/activar una cámara) y reinicia
         go2rtc para aplicarlo. Si está desactivado, solo reescribe el archivo.
+
+        Nota: el camino normal en caliente es el reconciliador (cada 15s); este
+        método existe para forzar la recarga de inmediato desde un endpoint.
+
+        Inputs:  cameras — conjunto de cámaras a publicar.
+        Outputs: None (efecto: YAML reescrito + proceso reiniciado).
+        Llama a: write_config, _terminate_proc, _spawn.
         """
         if not self.is_enabled():
             return
@@ -664,7 +883,12 @@ class Go2RtcManager:
             self._spawn()
 
     def stop(self) -> None:
-        """Detiene el supervisor y el proceso."""
+        """Detiene el supervisor y el proceso (apagado ordenado del pipeline #5).
+
+        Pone _running=False (los hilos supervisor/reconciliador salen de sus
+        bucles) y termina el subproceso go2rtc. Llamado por el `finally` de
+        main.py durante el apagado del backend.
+        """
         self._running = False
         self._terminate_proc()
 

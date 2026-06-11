@@ -1,17 +1,104 @@
 """
-Módulo de configuración global del sistema.
-Lee variables de entorno desde archivo .env
+================================================================================
+MÓDULO: config — Configuración global del backend NVR/VMS (Settings singleton)
+================================================================================
+
+PROPÓSITO
+    Centralizar TODA la configuración del sistema en un único objeto `settings`
+    (instancia global de `Settings`). Lee el `.env` de la raíz del repositorio
+    una sola vez al importar el módulo y expone cada variable de entorno ya
+    parseada/validada como atributo tipado (POSTGRES_*, MAX_CAMERAS, GO2RTC_*,
+    FFMPEG_*, AI_*, JWT_*, etc.).
+
+RESPONSABILIDAD PRINCIPAL
+    - Cargar `.env` (o caer a `.env-example` si no existe, para que un clon
+      recién bajado arranque con defaults razonables).
+    - Convertir strings de entorno a tipos correctos (int/float/bool/path) con
+      defaults seguros para desarrollo y validación dura de secretos en
+      producción (APP_ENV=production exige SECRET_KEY/JWT_SECRET_KEY propios).
+    - Construir la URL de conexión a PostgreSQL (`get_database_url()`).
+    - Permitir overrides OPERACIONALES persistidos en BD (SystemConfig) que se
+      aplican EN CALIENTE sobre el singleton (`reload_runtime_config_from_db()`).
+    - Asegurar que existen los directorios de datos (grabaciones, snapshots).
+
+RESPONSABILIDAD (lo que NO hace)
+    No abre conexiones ni arranca servicios: es solo estado de configuración.
+    Los secretos y la infraestructura (puertos, pools, binarios) viven SOLO en
+    .env (12-factor); a la BD solo bajan ajustes operativos tuneables en runtime.
+
+DEPENDENCIAS
+    python-dotenv (load_dotenv) ........ carga el .env
+    backend.app.runtime ................ bootstrap del modo empaquetado (.exe):
+                                         data dir escribible, PATH de binarios,
+                                         defaults del PostgreSQL embebido.
+    backend.app.database (diferido) .... SystemConfig + db_manager para leer los
+                                         overrides operacionales desde la BD.
+
+COMPONENTES RELACIONADOS
+    main.create_app() .................. primer consumidor; lee SECRET_KEY,
+                                         JWT_*, SERVER_*, GO2RTC_*, etc.
+    Prácticamente todos los módulos importan `settings` para leer sus knobs.
+    container.DependencyContainer ...... los servicios que construye leen aquí.
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    `from backend.app.config import settings`. El singleton se crea al final del
+    módulo (`settings = Settings()`), por lo que el .env se lee exactamente una
+    vez por proceso (encaja con la restricción de PROCESO ÚNICO del backend).
+
+PIPELINE(S)
+    Pipeline #1 (Inicio) — etapa BASE: es lo primero que importa main.py; todo
+    el arranque depende de estos valores. También alimenta indirectamente a los
+    14 pipelines (cada uno lee sus knobs: RTSP_TRANSPORT→#4, GO2RTC_*→#5/#6,
+    AI_*→#9, RECORDING_*→#11, MEDIA_URL_*→#12/#14, TELEGRAM_*→#13...).
+
+GRUPOS DE VARIABLES DE ENTORNO (qué controla cada bloque)
+    SEGURIDAD ......... SECRET_KEY, JWT_SECRET_KEY (+APP_ENV/ALLOW_DEFAULT_SECRETS
+                        que deciden si se aceptan defaults o se aborta).
+    BASE DE DATOS ..... POSTGRES_HOST/PORT/DB/USER/PASSWORD + DB_POOL_* (tamaño
+                        del pool SQLAlchemy). Es la BD activa del sistema.
+    ALMACENAMIENTO .... RECORDINGS_PATH, MAX_STORAGE_GB, AUTO_START_RECORDING,
+                        RECORDING_MAX_FILE_SIZE (split de archivos).
+    LÍMITES SISTEMA ... MAX_CAMERAS, MAX_CONCURRENT_FFMPEG, MAX_AI_INFERENCE_QUEUE,
+                        AI_CAMERA_ID (selector de la única cámara con IA).
+    IA / HARDWARE ..... USE_GPU_AI, AI_BACKEND, AI_CONFIDENCE, AI_MODEL/FORMAT/
+                        IMGSZ, AI_TORCH_THREADS, AI_INFERENCE_INTERVAL_*,
+                        AI_MOTION_SENSITIVITY, AI_SOURCE_* (fuente dedicada),
+                        AI_EVENT_COOLDOWN_SECONDS.
+    RTSP .............. RTSP_TRANSPORT (tcp/udp).
+    FFMPEG ............ FFMPEG_RESOLUTION_*/FPS (mono) y FFMPEG_DUAL_LENS_*
+                        (tamaño RAW antes del split de cámaras dual-lens).
+    TELEGRAM .......... TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (bootstrap del bot).
+    JWT ............... JWT_ACCESS_TOKEN_MINUTES, JWT_REFRESH_TOKEN_DAYS.
+    SERVIDOR .......... SERVER_HOST, SERVER_PORT.
+    STREAMING/go2rtc .. GO2RTC_ENABLED, GO2RTC_BINARY, GO2RTC_API_HOST/PORT,
+                        GO2RTC_RTSP_PORT, GO2RTC_WEBRTC_PORT, GO2RTC_CONFIG_PATH,
+                        GO2RTC_PUBLIC_HOST, GO2RTC_WEBRTC_CANDIDATES,
+                        GO2RTC_HWACCEL, WEBRTC_ENABLED, GO2RTC_AS_SOURCE,
+                        RECORDING_COPY_MODE, CAMERA_SYNC_TIME_ON_START,
+                        LIVE_HIDE_INACTIVE_CAMERAS, STREAM_KEEPALIVE.
+    URLS FIRMADAS ..... MEDIA_URL_SECRET, MEDIA_URL_TTL_SECONDS (HMAC para que
+                        reproductores nativos accedan a medios sin Authorization).
+    TELEMETRÍA ........ TELEMETRY_ENABLED, TELEMETRY_INTERVAL, TELEMETRY_PATH.
+================================================================================
 """
 import os
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Modo EMPAQUETADO (.exe): prepara directorio de datos escribible, secretos
+# autogenerados, PATH con los binarios incluidos y los valores por defecto del
+# PostgreSQL embebido ANTES de leer ninguna variable de entorno. En desarrollo
+# es un no-op (respeta el .env del repositorio).
+from backend.app.runtime import bootstrap as _bootstrap_runtime, app_data_dir, is_frozen
+_bootstrap_runtime()
+
 # Cargar variables de entorno: se usa «.env» si existe; si no, se cae a la
 # plantilla «.env-example» para que un clon recién bajado arranque igualmente
 # (con valores por defecto). En despliegues reales crea tu propio «.env».
+# En modo empaquetado el .env (opcional) vive junto a los datos del usuario.
 _root = Path(__file__).parent.parent.parent
-env_path = _root / '.env'
+env_path = (app_data_dir() / '.env') if is_frozen() else (_root / '.env')
 if not env_path.exists():
     example_path = _root / '.env-example'
     if example_path.exists():
@@ -23,12 +110,43 @@ logger = logging.getLogger(__name__)
 
 class Settings:
     """
-    Clase de configuración que centraliza todas las variables de entorno.
-    Proporciona valores por defecto seguros para desarrollo.
+    Estado de configuración global del sistema (un objeto, todas las knobs).
+
+    ROL / RESPONSABILIDAD
+        Leer las variables de entorno (ya cargadas del .env por load_dotenv al
+        importar el módulo), parsearlas a su tipo y exponerlas como atributos.
+        Validar secretos en producción y crear los directorios de datos.
+
+    QUIÉN LA INSTANCIA / CONSUME
+        Se instancia UNA vez al final del módulo (`settings = Settings()`).
+        No usa el patrón __new__, pero es de facto un singleton de proceso: todo
+        el código importa la MISMA instancia `settings`. No instanciar otra
+        copia (volvería a leer el entorno y perdería los overrides de BD).
+
+    DEPENDENCIAS
+        os.environ (vía os.getenv) y, de forma diferida, la BD (SystemConfig)
+        para los overrides operacionales.
+
+    PIPELINE
+        #1 (Inicio), etapa BASE. Ver docstring del módulo para el detalle de
+        qué grupo de variables alimenta a cada uno de los 14 pipelines.
     """
-    
+
     def __init__(self) -> None:
-        """Inicializa la configuración desde variables de entorno."""
+        """
+        Construye el singleton leyendo y validando TODAS las variables de
+        entorno (etapa BASE del pipeline #1).
+
+        Inputs: ninguno explícito; lee de os.environ (poblado por load_dotenv).
+        Outputs: self con todos los atributos de configuración ya tipados; crea
+            los directorios de datos vía _ensure_directories().
+        Excepciones:
+            RuntimeError — en producción (APP_ENV=production) si SECRET_KEY o
+                JWT_SECRET_KEY siguen en su valor por defecto (sin
+                ALLOW_DEFAULT_SECRETS=true).
+            ValueError — si una variable numérica del .env no parsea (int/float).
+        Llamado por: la línea final `settings = Settings()` (una vez por proceso).
+        """
         try:
             # ==============================
             # SEGURIDAD
@@ -369,7 +487,11 @@ class Settings:
             raise
     
     def _ensure_directories(self) -> None:
-        """Crea los directorios necesarios si no existen."""
+        """
+        Crea el árbol de directorios de datos (grabaciones + snapshots) si no
+        existe. Idempotente (exist_ok=True). Llamado por __init__ al final de la
+        carga. Sin esto, el primer write de grabación/snapshot fallaría.
+        """
         # Directorio de grabaciones
         os.makedirs(self.RECORDINGS_PATH, exist_ok=True)
         
@@ -379,53 +501,87 @@ class Settings:
     
     def get_database_url(self) -> str:
         """
-        Genera la URL de conexión a la base de datos PostgreSQL.
-        
-        Returns:
-            str: URL de conexión SQLAlchemy (postgresql+psycopg2://...)
+        Genera la URL de conexión SQLAlchemy a PostgreSQL a partir de los
+        atributos POSTGRES_*.
+
+        Outputs:
+            str — "postgresql+psycopg2://user:pass@host:port/db".
+        Llamado por:
+            DatabaseManager (database/connection.py) al crear el engine/pool.
+            Es la ÚNICA fuente de la URL de BD (SQLite es legado/no usado).
         """
         return (
             f"postgresql+psycopg2://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
 
-    def reload_storage_from_db(self) -> None:
-        """
-        Relee los overrides de almacenamiento (ruta de grabaciones y cuota) desde
-        SystemConfig y los aplica EN CALIENTE sobre el singleton.
+    # Claves OPERACIONALES que pueden vivir en la BD (SystemConfig) y aplicarse
+    # EN CALIENTE sobre el singleton. clave_BD → (atributo_settings, tipo).
+    #
+    # CRITERIO (arquitectura): aquí solo van ajustes OPERATIVOS y tuneables por el
+    # usuario en runtime. NUNCA secretos (SECRET_KEY, JWT_*, MEDIA_URL_SECRET,
+    # TELEGRAM_BOT_TOKEN) ni infraestructura/arranque (POSTGRES_*, DB_POOL_*,
+    # puertos, GO2RTC_BINARY/HWACCEL, RTSP_TRANSPORT, USE_GPU_AI/AI_BACKEND/
+    # AI_FORMAT): esos diferencian el despliegue/máquina y deben vivir SOLO en
+    # .env (principio 12-factor + no exponer secretos en la BD).
+    _DB_OVERRIDE_KEYS = {
+        "recordings_path": ("RECORDINGS_PATH", "path"),
+        "max_storage_gb": ("MAX_STORAGE_GB", "float"),
+        "ai_confidence": ("AI_CONFIDENCE", "float"),
+        "ai_event_cooldown_seconds": ("AI_EVENT_COOLDOWN_SECONDS", "int"),
+        "telemetry_enabled": ("TELEMETRY_ENABLED", "bool"),
+        "telemetry_interval": ("TELEMETRY_INTERVAL", "float"),
+    }
 
-        Se llama: (1) al arrancar (tras init_db) para que un valor guardado
-        antes persista entre reinicios, y (2) tras guardar la config desde la
-        app de escritorio para que aplique sin reiniciar. Import diferido para
-        evitar dependencia circular en el import-time de config.
+    def reload_runtime_config_from_db(self) -> None:
+        """
+        Relee los overrides OPERACIONALES desde SystemConfig y los aplica EN
+        CALIENTE sobre el singleton. El valor de .env actúa como DEFAULT; si hay
+        un valor en la BD, gana (persistente entre reinicios y editable desde el
+        cliente sin reiniciar). Solo afecta a las claves de `_DB_OVERRIDE_KEYS`
+        (ajustes operativos); secretos e infraestructura NO se tocan.
+
+        Se llama: (1) al arrancar (tras init_db) y (2) tras guardar config desde
+        el cliente. Import diferido para evitar dependencia circular.
         """
         try:
-            import os as _os
             from backend.app.database.connection import db_manager
             from backend.app.database.models import SystemConfig
+            keys = list(self._DB_OVERRIDE_KEYS.keys())
             with db_manager.get_session() as session:
                 rows = {
                     c.key: c.value
                     for c in session.query(SystemConfig).filter(
-                        SystemConfig.key.in_(["recordings_path", "max_storage_gb"])
+                        SystemConfig.key.in_(keys)
                     ).all()
                 }
-            path = (rows.get("recordings_path") or "").strip()
-            if path:
-                try:
-                    _os.makedirs(path, exist_ok=True)
-                    self.RECORDINGS_PATH = path
-                except OSError:
-                    pass
-            gb = rows.get("max_storage_gb")
-            if gb:
-                try:
-                    self.MAX_STORAGE_GB = float(gb)
-                except (TypeError, ValueError):
-                    pass
         except Exception:
             # En el primer arranque la tabla puede no existir aún; es benigno.
-            pass
+            return
+
+        import os as _os
+        for key, (attr, kind) in self._DB_OVERRIDE_KEYS.items():
+            raw = rows.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            raw = str(raw).strip()
+            try:
+                if kind == "path":
+                    _os.makedirs(raw, exist_ok=True)
+                    setattr(self, attr, raw)
+                elif kind == "float":
+                    setattr(self, attr, float(raw))
+                elif kind == "int":
+                    setattr(self, attr, int(float(raw)))
+                elif kind == "bool":
+                    setattr(self, attr, str(raw).lower() in ("1", "true", "yes", "on"))
+            except (TypeError, ValueError, OSError):
+                continue
+
+    def reload_storage_from_db(self) -> None:
+        """Compat: el nombre antiguo sigue funcionando. Ahora recarga TODO el
+        conjunto operacional (incluye almacenamiento)."""
+        self.reload_runtime_config_from_db()
 
 
 # Instancia global de configuración

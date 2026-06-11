@@ -1,3 +1,33 @@
+/*
+ * ============================================================================
+ * MÓDULO: TimelineAdapter — Adaptador RecyclerView del timeline (CamLink)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Adaptador que pinta cada segmento de grabación (TimelineSegment) como una
+ *   fila (item_timeline_segment): hora de inicio, duración (+ tamaño si lo hay)
+ *   y un badge "EVENTO" para los segmentos de tipo evento.
+ *
+ * RESPONSABILIDAD
+ *   - Enlazar cada TimelineSegment a su ViewHolder y formatear hora/duración.
+ *   - Distinguir visualmente continuos vs eventos (badge).
+ *   - Propagar el toque de una fila al callback `onClick`.
+ *
+ * DEPENDENCIAS
+ *   - model.TimelineSegment: DTO de cada segmento.
+ *   - Layout item_timeline_segment.
+ *
+ * COMPONENTES RELACIONADOS
+ *   - TimelineFragment y RecordingsHostFragment: lo crean e inyectan el callback
+ *     que navega a PlaybackFragment.
+ *
+ * PUNTO DE ENTRADA
+ *   Se instancia desde TimelineFragment / RecordingsHostFragment.
+ *
+ * PIPELINE(S)
+ *   #14 Reproducción histórica — etapa de timeline (UI).
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.view.LayoutInflater
@@ -10,6 +40,14 @@ import com.ipn.mx.onvif.model.TimelineSegment
 import java.text.SimpleDateFormat
 import java.util.Locale
 
+/**
+ * Adaptador de la línea de tiempo de grabaciones.
+ *
+ * Rol: render de los segmentos del Pipeline #14. Lo crean TimelineFragment y
+ * RecordingsHostFragment.
+ *
+ * @property onClick invocado al tocar un segmento (abre PlaybackFragment).
+ */
 class TimelineAdapter(
     private val onClick: (TimelineSegment) -> Unit,
 ) : RecyclerView.Adapter<TimelineAdapter.VH>() {
@@ -48,6 +86,12 @@ class TimelineAdapter(
         holder.itemView.setOnClickListener { onClick(seg) }
     }
 
+    /**
+     * Reemplaza toda la lista de segmentos y refresca el RecyclerView.
+     *
+     * @param newItems nueva lista de segmentos a mostrar.
+     * Llamado por: TimelineFragment.loadTimeline y RecordingsHostFragment.applyFilter.
+     */
     fun submit(newItems: List<TimelineSegment>) {
         items.clear()
         items.addAll(newItems)

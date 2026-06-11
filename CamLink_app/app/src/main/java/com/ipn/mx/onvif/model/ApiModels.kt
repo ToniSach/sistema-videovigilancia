@@ -1,14 +1,50 @@
+/*
+ * ============================================================================
+ * MÓDULO: model/ApiModels — DTOs (data classes) que espejan el JSON del backend
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Reúne todas las data classes de request/response que Gson serializa y
+ *   deserializa para la capa de red. Cada una espeja una entidad o un wrapper
+ *   de respuesta del backend Flask. Las anotaciones @SerializedName mapean el
+ *   snake_case del JSON del servidor a camelCase idiomático en Kotlin.
+ *
+ * RESPONSABILIDAD
+ *   Ser el contrato de datos entre app y backend. NO contienen lógica de red
+ *   (eso es ApiService) ni persisten nada; son inmutables (val) salvo helpers
+ *   derivados de solo lectura (p. ej. CameraResponse.liveUrl).
+ *
+ * IMPORTANTE
+ *   Estos DTOs reflejan — pero NO son — las clases SQLAlchemy del backend. Si
+ *   cambia un to_dict() del servidor, hay que sincronizar el DTO correspondiente.
+ *   Muchas respuestas vienen envueltas en { "success": bool, "data": ... }; por
+ *   eso existen los *Response wrapper.
+ *
+ * DEPENDENCIAS
+ *   - Gson (@SerializedName) — lo aplica el GsonConverterFactory de Retrofit.
+ *   - Consumido por network/ApiService (tipos de parámetro y retorno).
+ *
+ * PIPELINES (cubre los DTOs de): #2 Auth · #3 Live · #7 ONVIF · #8 PTZ ·
+ *   #9 IA · #10 Eventos · #11 Grabación · #12 Clips · #13 Notificaciones ·
+ *   #14 Reproducción.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.model
 
 import com.google.gson.annotations.SerializedName
 
-// ── Auth ──────────────────────────────────────────────────────────────────────
+// ── Auth (Pipeline #2) ──────────────────────────────────────────────────────
 
+/** Body de `POST /auth/login`: credenciales de usuario. */
 data class LoginRequest(
     val username: String,
     val password: String
 )
 
+/**
+ * Respuesta de `POST /auth/login`. Espeja el par de tokens que emite
+ * flask-jwt-extended (access + refresh).
+ */
 data class LoginResponse(
     @SerializedName("access_token")  val accessToken: String,
     @SerializedName("refresh_token") val refreshToken: String
@@ -35,12 +71,17 @@ data class DeviceRegisterRequest(
     val platform: String = "android",
 )
 
+/** Usuario dueño del QR; espeja un subconjunto de `User` (id/username/role). */
 data class DeviceRegisterUser(
     val id: Int,
     val username: String,
     val role: String,
 )
 
+/**
+ * Payload de éxito de `POST /devices/register`. Contiene el id del registro en
+ * `mobile_devices`, los tokens JWT reales y el usuario propietario.
+ */
 data class DeviceRegisterPayload(
     @SerializedName("device_id")     val deviceId: Int,
     @SerializedName("access_token")  val accessToken: String,
@@ -49,7 +90,7 @@ data class DeviceRegisterPayload(
     val user: DeviceRegisterUser,
 )
 
-/** Wrapper { success, data: { ... } } del backend. */
+/** Wrapper { success, data: { ... } } del backend para el registro de dispositivo. */
 data class DeviceRegisterResponse(
     val success: Boolean,
     val data: DeviceRegisterPayload? = null,
@@ -75,36 +116,43 @@ data class NotificationItem(
     @SerializedName("thumbnail_url") val thumbnailUrl: String? = null,
 )
 
+/** Metadatos de paginación por cursor de [NotificationsHistoryResponse]. */
 data class NotificationsHistoryPagination(
     @SerializedName("has_more")   val hasMore: Boolean = false,
     @SerializedName("next_cursor") val nextCursor: Double? = null,
     val count: Int = 0,
 )
 
+/** Respuesta de `GET /mobile/notifications/history`: lista de eventos + paginación. */
 data class NotificationsHistoryResponse(
     val success: Boolean,
     val data: List<NotificationItem> = emptyList(),
     val pagination: NotificationsHistoryPagination? = null,
 )
 
-// ── Estado de la IA ───────────────────────────────────────────────────────────
+// ── Estado de la IA (Pipeline #9) ─────────────────────────────────────────────
 // Las notificaciones SOLO existen para la cámara con IA activa. La app consulta
 // esto para gatear la personalización de notificaciones.
+
+/** Cámara (y lente) con YOLO activo según el backend. */
 data class AiActiveCamera(
     @SerializedName("camera_id") val cameraId: Int? = null,
     val lens: String? = null,
 )
+/** Datos de `GET /ai/status`: lista de cámaras IA activas + recuento. */
 data class AiStatusData(
     val active: List<AiActiveCamera> = emptyList(),
     @SerializedName("active_count") val activeCount: Int = 0,
 )
+/** Wrapper { success, data } de `GET /ai/status`. */
 data class AiStatusResponse(
     val success: Boolean = false,
     val data: AiStatusData? = null,
 )
 
-// ── Preferencias de notificación (CRUD) ──────────────────────────────────────
+// ── Preferencias de notificación / CRUD (Pipeline #13) ────────────────────────
 
+/** Espeja una fila de `NotificationPreference` del backend (regla de filtrado). */
 data class NotificationPreferenceDto(
     val id: Int,
     @SerializedName("event_type") val eventType: String,
@@ -116,6 +164,7 @@ data class NotificationPreferenceDto(
     @SerializedName("schedule_end")   val scheduleEnd: String? = null,    // "HH:MM"
 )
 
+/** Respuesta de `GET /notifications/preferences`: reglas del usuario. */
 data class NotificationPreferencesResponse(
     val success: Boolean,
     val data: List<NotificationPreferenceDto> = emptyList(),
@@ -132,14 +181,23 @@ data class PreferenceMutation(
     @SerializedName("schedule_end")   val scheduleEnd: String? = null,
 )
 
+/** Payload de éxito de un POST/PUT de preferencia: el id afectado. */
 data class PreferenceMutationPayload(val id: Int)
+/** Wrapper { success, data } de las mutaciones de preferencia. */
 data class PreferenceMutationResponse(
     val success: Boolean,
     val data: PreferenceMutationPayload? = null,
 )
 
-// ── Cámaras ───────────────────────────────────────────────────────────────────
+// ── Cámaras (Pipelines #3 Live / #7 ONVIF) ────────────────────────────────────
 
+/**
+ * Espeja la entidad `Camera` del backend (vía Camera.to_dict()). Reúne datos de
+ * configuración (nombre, IP, capacidades PTZ/audio) y TODAS las URLs de directo
+ * que publica go2rtc: restream RTSP (streamUrl), WebRTC, HLS y sus variantes por
+ * lente (L1/L2) para cámaras dual-lens. La app elige la fuente con [liveUrl] /
+ * [liveHlsUrl].
+ */
 data class CameraResponse(
     val id: Int,
     val name: String,
@@ -178,6 +236,7 @@ data class CameraResponse(
 // Flujo: POST /telegram/generate-code → code + deep link → el usuario lo abre en
 // Telegram y envía /vincular CODE → polling GET /telegram/link-status?code=...
 
+/** Datos de `POST /telegram/generate-code`: código, deep link y caducidad. */
 data class TelegramCodeData(
     val code: String,
     @SerializedName("bot_username")        val botUsername: String? = null,
@@ -187,24 +246,32 @@ data class TelegramCodeData(
     val instructions: List<String> = emptyList(),
 )
 
+/** Wrapper { success, data, error } de `POST /telegram/generate-code`. */
 data class TelegramCodeResponse(
     val success: Boolean,
     val data: TelegramCodeData? = null,
     val error: String? = null,
 )
 
+/** Datos de `GET /telegram/link-status`: si el código ya fue vinculado/caducó. */
 data class TelegramLinkStatusData(
     val code: String,
     val linked: Boolean = false,
     val expired: Boolean = false,
 )
 
+/** Wrapper { success, data, error } de `GET /telegram/link-status`. */
 data class TelegramLinkStatusResponse(
     val success: Boolean,
     val data: TelegramLinkStatusData? = null,
     val error: String? = null,
 )
 
+/**
+ * Vector PTZ con ejes normalizados (joystick). No tiene un endpoint propio en
+ * el cliente actual — el PTZ se invoca por dirección (ver
+ * [com.ipn.mx.onvif.network.ApiService.ptzMove]); se conserva como DTO auxiliar.
+ */
 data class PtzRequest(
     val x: Float,       // -1.0 a 1.0  (joystick horizontal)
     val y: Float,       // -1.0 a 1.0  (joystick vertical)
@@ -214,23 +281,27 @@ data class PtzRequest(
 // ── Wrappers de respuesta del servidor ────────────────────────────────────────
 // El servidor Flask envuelve todas las respuestas en { "success": true, "data": ... }
 
+/** Wrapper de `GET /cameras/`: lista de cámaras accesibles. */
 data class CameraListResponse(
     val success: Boolean,
     val data: List<CameraResponse>
 )
 
+/** Wrapper de `GET /recordings/`: lista de grabaciones. */
 data class RecordingListResponse(
     val success: Boolean,
     val data: List<RecordingResponse>
 )
 
+/** Wrapper de `GET /recordings/{id}`: una grabación. */
 data class RecordingDetailResponse(
     val success: Boolean,
     val data: RecordingResponse
 )
 
-// ── Timeline de grabaciones ────────────────────────────────────────────────────
+// ── Timeline de grabaciones (Pipeline #14) ────────────────────────────────────
 
+/** Un segmento del timeline; espeja un tramo de `Recording` (continua o evento). */
 data class TimelineSegment(
     @SerializedName("recording_id")    val recordingId: Int,
     val start: String? = null,
@@ -240,20 +311,28 @@ data class TimelineSegment(
     val type: String = "continuous",   // "event" | "continuous"
 )
 
+/** Datos de `GET /recordings/timeline`: fecha, cámara y sus segmentos del día. */
 data class TimelineData(
     val date: String,
     @SerializedName("camera_id") val cameraId: Int,
     val segments: List<TimelineSegment> = emptyList(),
 )
 
+/** Wrapper { success, data, error } de `GET /recordings/timeline`. */
 data class TimelineResponse(
     val success: Boolean,
     val data: TimelineData? = null,
     val error: String? = null,
 )
 
-// ── Grabaciones ───────────────────────────────────────────────────────────────
+// ── Grabaciones (Pipelines #11 Grabación / #12 Clips / #14 Reproducción) ──────
 
+/**
+ * Espeja la entidad `Recording` del backend. Incluye metadatos (cámara, inicio,
+ * duración, tamaño) y la `playback_url` FIRMADA + miniatura que permiten
+ * reproducir sin enviar el header Authorization. Las URLs son relativas a la
+ * base del servidor (anteponer RetrofitClient.buildBaseUrl).
+ */
 data class RecordingResponse(
     val id: String,
     @SerializedName("camera_id")         val cameraId: Int,

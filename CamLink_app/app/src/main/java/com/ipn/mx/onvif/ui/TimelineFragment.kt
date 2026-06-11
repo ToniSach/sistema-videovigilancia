@@ -1,3 +1,36 @@
+/*
+ * ============================================================================
+ * MÓDULO: TimelineFragment — Línea de tiempo de grabaciones de un día (CamLink)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Pantalla que, elegida una cámara y una fecha, lista los segmentos grabados
+ *   ese día (continuos y de eventos) consultando el endpoint dedicado de
+ *   timeline del backend. Tocar un segmento abre PlaybackFragment.
+ *
+ * RESPONSABILIDAD
+ *   - Cargar cámaras (GET /cameras) y la línea de tiempo del día
+ *     (GET /recordings/timeline).
+ *   - Permitir cambiar de cámara (spinner) y de fecha (DatePicker).
+ *   - Aceptar argumentos `cameraId` + `date` para abrirse directamente en una
+ *     cámara/fecha (lo usa el deep-link de las notificaciones push).
+ *
+ * DEPENDENCIAS
+ *   - RetrofitClient + ApiService (getCameras, getTimeline).
+ *   - TimelineAdapter (filas de segmentos) y PlaybackFragment (reproducción).
+ *   - BaseMenuFragment (menú de la toolbar).
+ *
+ * COMPONENTES RELACIONADOS
+ *   - RecordingsHostFragment / RecordingsFragment: vistas hermanas de grabaciones.
+ *   - MainActivity: puede navegar aquí con cameraId/date desde una notificación.
+ *
+ * PUNTO DE ENTRADA
+ *   Destino de Navigation `timelineFragment`.
+ *
+ * PIPELINE(S)
+ *   #14 Reproducción histórica — etapa de timeline (consume /recordings/timeline).
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.app.DatePickerDialog
@@ -29,6 +62,11 @@ import java.util.Locale
  *
  * Puede recibir argumentos `cameraId` (Int) y `date` (YYYY-MM-DD) para abrirse
  * directamente en una cámara/fecha — lo usa el link de las notificaciones.
+ *
+ * Ciclo de vida: los argumentos opcionales se leen en onCreate (y fijan la fecha
+ * del calendario); el cableado de vistas y la carga de cámaras ocurren en
+ * onViewCreated. Las corrutinas de red usan `viewLifecycleOwner.lifecycleScope`.
+ * La instancia el NavController (pestaña o deep-link de notificación).
  */
 class TimelineFragment : BaseMenuFragment() {
 
@@ -96,6 +134,13 @@ class TimelineFragment : BaseMenuFragment() {
         ).show()
     }
 
+    /**
+     * Carga las cámaras, puebla el spinner (preseleccionando `argCameraId` si
+     * llegó por argumento) y dispara la primera carga del timeline.
+     *
+     * Llamado por: onViewCreated. Usa endpoint GET /cameras (ApiService.getCameras).
+     * Llama a: loadTimeline.
+     */
     private fun loadCameras() {
         val baseUrl = RetrofitClient.buildBaseUrl(requireContext()) ?: return
         val api = RetrofitClient.create(baseUrl, requireContext())
@@ -123,6 +168,13 @@ class TimelineFragment : BaseMenuFragment() {
         }
     }
 
+    /**
+     * Pide la línea de tiempo de la cámara y fecha seleccionadas y la vuelca en
+     * el adapter; muestra estado vacío/error según corresponda.
+     *
+     * Llamado por: loadCameras, cambio de cámara/fecha y pull-to-refresh.
+     * Usa endpoint GET /recordings/timeline (ApiService.getTimeline).
+     */
     private fun loadTimeline() {
         val pos = spinnerCamera.selectedItemPosition
         val cam = cameras.getOrNull(pos) ?: return
@@ -144,6 +196,13 @@ class TimelineFragment : BaseMenuFragment() {
         }
     }
 
+    /**
+     * Navega a PlaybackFragment con el `recordingId` del segmento tocado (modo
+     * legado de una única grabación).
+     *
+     * @param seg segmento de timeline que el usuario pulsó.
+     * Llamado por: el callback del TimelineAdapter. Navega a: playbackFragment.
+     */
     private fun openPlayback(seg: TimelineSegment) {
         val bundle = Bundle().apply { putString("recordingId", seg.recordingId.toString()) }
         findNavController().navigate(R.id.playbackFragment, bundle)

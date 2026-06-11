@@ -1,3 +1,38 @@
+/*
+ * ============================================================================
+ * MÓDULO: CameraListFragment — Rejilla de cámaras del usuario (CamLink Android)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Mostrar varias cámaras a la vez en una rejilla paginada (2 por página) con
+ *   vista previa en vivo de cada una, como "panel de control" desde el que el
+ *   usuario salta al directo a pantalla completa (LiveViewFragment).
+ *
+ * RESPONSABILIDAD
+ *   - Cargar las cámaras del usuario (GET /cameras) y aplanarlas en "tiles":
+ *     mono = 1 tile; dual-lens = 2 tiles (L1/L2), vistos como independientes.
+ *   - Reproducir cada slot con ExoPlayer (HLS preferido, RTSP de fallback) en
+ *     calidad MEDIA (varias a la vez es lo más pesado), en silencio.
+ *   - Paginar, ocultar/desconectar slots y navegar al live del tile tocado
+ *     (pasando cameraId + lens).
+ *
+ * DEPENDENCIAS
+ *   - ExoPlayer/Media3 (HLS+RTSP) — un reproductor por slot (máx. 2).
+ *   - RetrofitClient + ApiService — GET /cameras.
+ *   - go2rtc (sidecar) — restream HLS/RTSP del que se nutren los slots.
+ *   - BaseMenuFragment — menú compartido.
+ *
+ * COMPONENTES RELACIONADOS
+ *   - LiveViewFragment — destino al tocar un tile (action_cameraList_to_liveView).
+ *   - MainActivity — host de navegación (pestaña inferior).
+ *
+ * PUNTO DE ENTRADA
+ *   Destino de Navigation R.id.cameraListFragment (pestaña inferior).
+ *
+ * PIPELINE(S)
+ *   #1 Inicio (listado de cámaras) · #3 Live (previews) · #5 go2rtc.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.os.Bundle
@@ -23,12 +58,31 @@ import com.ipn.mx.onvif.network.RetrofitClient
 import kotlinx.coroutines.launch
 
 /**
- * Grid de cámaras (2 por página) con vista previa en vivo.
+ * Fragment de rejilla de cámaras (2 por página) con vista previa en vivo.
  *
- * MIGRACIÓN: antes decodificaba el endpoint MJPEG `/cameras/{id}/stream`
- * (eliminado del backend). Ahora cada slot usa un ExoPlayer sobre el restream
- * RTSP de go2rtc (camera.liveUrl), igual que LiveViewFragment, así no hay
- * transcodificación MJPEG ni una segunda conexión a la cámara.
+ * ROL Y RESPONSABILIDAD
+ *   Vista "multi-cámara": reproduce hasta 2 feeds simultáneos (un ExoPlayer por
+ *   slot, en silencio y calidad media), pagina sobre la lista de tiles y enruta
+ *   al directo a pantalla completa del tile tocado.
+ *
+ * QUIÉN LA INSTANCIA / CONSUME
+ *   La instancia el Navigation Component como destino R.id.cameraListFragment
+ *   (pestaña inferior). Al tocar un tile navega a LiveViewFragment pasando
+ *   "cameraId" y "lens".
+ *
+ * CICLO DE VIDA ANDROID RELEVANTE
+ *   - onViewCreated: monta PlayerView+label por slot y cablea paginación/botones.
+ *   - onPause / onDestroyView: stopAllStreams() libera ambos ExoPlayer (clave
+ *     para no mantener conexiones a go2rtc en segundo plano).
+ *   - onResume: re-renderiza la página actual (reanuda los streams).
+ *
+ * MIGRACIÓN
+ *   Antes decodificaba el endpoint MJPEG `/cameras/{id}/stream` (eliminado del
+ *   backend). Ahora cada slot usa ExoPlayer sobre el restream HLS/RTSP de go2rtc,
+ *   igual que LiveViewFragment, sin transcode MJPEG ni 2ª conexión a la cámara.
+ *
+ * PIPELINE
+ *   #1 Inicio · #3 Live · #5 go2rtc.
  */
 class CameraListFragment : BaseMenuFragment() {
 
@@ -54,6 +108,14 @@ class CameraListFragment : BaseMenuFragment() {
     private fun toMedium(url: String?): String? =
         if (url.isNullOrBlank()) url else "${url}_medium"
 
+    /**
+     * Aplana las cámaras en tiles del grid: dual-lens válida → 2 (L1/L2);
+     * cualquier otra → 1. Todas las URLs se fijan a calidad media (toMedium).
+     *
+     * @param cams cámaras de GET /cameras (CameraResponse).
+     * @return lista de [Tile] que pagina renderPage().
+     * Llamado por: loadCameras.
+     */
     private fun buildTiles(cams: List<CameraResponse>): List<Tile> {
         val out = mutableListOf<Tile>()
         for (c in cams) {
@@ -155,6 +217,12 @@ class CameraListFragment : BaseMenuFragment() {
 
     // ── Red: cargar lista de cámaras ──────────────────────────────────────────
 
+    /**
+     * Pide las cámaras del usuario al backend y, si hay, construye los tiles y
+     * renderiza la primera página. Endpoint: GET /cameras (ApiService.getCameras).
+     * Mapea 401/403 a mensajes legibles.
+     * Llamado por: onViewCreated. Llama a: buildTiles, renderPage.
+     */
     private fun loadCameras() {
         val baseUrl = RetrofitClient.buildBaseUrl(requireContext()) ?: return
         val api     = RetrofitClient.create(baseUrl, requireContext())
@@ -217,6 +285,16 @@ class CameraListFragment : BaseMenuFragment() {
 
     // ── Stream (go2rtc) por slot: HLS preferido, RTSP de fallback ────────────
 
+    /**
+     * Reproduce un tile en un slot con ExoPlayer: HLS preferido y, si falla,
+     * reintenta UNA vez con la URL RTSP de respaldo. El audio va a 0 (rejilla
+     * silenciosa).
+     *
+     * @param tile feed a reproducir (aporta url HLS y fallbackUrl RTSP).
+     * @param slot índice del reproductor (0 o 1) en el array players.
+     * @param playerView PlayerView del slot donde se renderiza el vídeo.
+     * Llamado por: renderPage.
+     */
     private fun startRtspStream(tile: Tile, slot: Int, playerView: PlayerView) {
         players[slot]?.release()
 
@@ -262,6 +340,13 @@ class CameraListFragment : BaseMenuFragment() {
         feed.visibility = View.INVISIBLE
     }
 
+    /**
+     * Navega al directo a pantalla completa del tile indicado, pasando su
+     * cameraId y el lens tocado (para que LiveView abra ESE feed y no siempre L1).
+     *
+     * @param tileIndex índice global del tile en la lista (no relativo a página).
+     * Llamado por: los click listeners de feedCam1/feedCam2.
+     */
     private fun navigateToLiveView(tileIndex: Int) {
         val tile = tiles.getOrNull(tileIndex) ?: return
         // Pasar el LENTE tocado para que LiveView abra ese feed (antes abría

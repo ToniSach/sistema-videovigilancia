@@ -1,5 +1,34 @@
 """
-WebRTCSignalingService — Proxy de signaling WebRTC (WHEP) hacia go2rtc.
+================================================================================
+MÓDULO: webrtc_signaling — Proxy de signaling WebRTC (WHEP) hacia go2rtc
+================================================================================
+
+PROPÓSITO
+    Reenviar SOLO el "saludo" inicial de WebRTC (intercambio SDP offer/answer)
+    entre el cliente y go2rtc, tras validar la autorización en el backend. El
+    vídeo NUNCA pasa por aquí: viaja peer-a-peer entre cliente y go2rtc.
+
+RESPONSABILIDAD PRINCIPAL
+    Ser el punto de control de acceso del directo WebRTC: el endpoint autentica
+    (JWT) y comprueba permiso ANTES de delegar en este servicio, que se limita a
+    hacer de proxy del SDP. Así el backend decide QUIÉN puede abrir el stream
+    sin pagar coste de CPU por el medio (que va directo P2P).
+
+PIPELINES EN LOS QUE PARTICIPA
+    #6  WebRTC ... ESTE módulo ejecuta el signaling del pipeline WebRTC.
+    #3  Live ..... es el camino del directo de baja latencia (desktop/móvil).
+    #5  go2rtc ... destino del proxy (usa Go2RtcManager.webrtc_api_base()).
+
+DEPENDENCIAS
+    go2rtc_manager .... webrtc_api_base() (base API) + stream_name() (nombre).
+    urllib (stdlib) ... POST del SDP a go2rtc (sin dependencia de `requests`).
+
+COMPONENTES RELACIONADOS
+    Endpoint /cameras/<id>/webrtc — autentica/autoriza y llama a exchange().
+    Go2RtcManager — provee la URL de la API WebRTC (puerto 1984).
+
+PUNTO DE ENTRADA
+    Singleton `webrtc_signaling`. Método público: exchange(camera_id, offer).
 
 QUÉ HACE
 --------
@@ -40,7 +69,15 @@ class WebRTCSignalingError(Exception):
 
 
 class WebRTCSignalingService:
-    """Servicio de signaling. Singleton ligero; sin estado propio relevante."""
+    """Servicio de signaling WebRTC. Singleton ligero; sin estado propio.
+
+    ROL: hace de intermediario del SDP entre cliente y go2rtc (pipeline #6).
+    QUIÉN LO USA: el endpoint /cameras/<id>/webrtc (ya autenticado/autorizado)
+    llama a exchange(); este servicio NO valida permisos (eso es del endpoint).
+    SINGLETON: sin estado mutable relevante (solo cachea su instancia); el
+    patrón existe por consistencia con el resto del sistema, no por estado vivo.
+    Se expone como `webrtc_signaling` al final del módulo.
+    """
 
     _instance: Optional["WebRTCSignalingService"] = None
 
@@ -63,8 +100,22 @@ class WebRTCSignalingService:
         """
         Paso 3. Reenvía el SDP offer a go2rtc y devuelve el SDP answer.
 
-        Lanza WebRTCSignalingError si go2rtc no está accesible o responde mal,
-        para que el endpoint lo traduzca a un 502/503 claro.
+        Etapa central del signaling (#6): POST del offer a la API WebRTC de
+        go2rtc (puerto 1984) y espera de la answer. Tras esto, el vídeo va P2P
+        entre cliente y go2rtc (8555) — este método NO vuelve a intervenir.
+
+        Inputs:
+          camera_id ... id de la cámara (resuelve el stream cam_<id>).
+          offer_sdp ... SDP offer del cliente (texto). Se rechaza si está vacío.
+          timeout ..... segundos máx. a esperar a go2rtc (corto: no cuelga la
+                        petición si go2rtc está caído).
+        Outputs:
+          str con el SDP answer de go2rtc (validado: debe contener "v=0").
+        Excepciones:
+          WebRTCSignalingError — offer vacío, go2rtc inaccesible o answer
+          inválida; el endpoint la traduce a un 502/503 claro.
+        Llamado por: endpoint /cameras/<id>/webrtc.
+        Llama a:     webrtc_endpoint (construye la URL destino en go2rtc).
         """
         if not offer_sdp or not offer_sdp.strip():
             raise WebRTCSignalingError("SDP offer vacío")

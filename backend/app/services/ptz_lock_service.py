@@ -1,7 +1,41 @@
 # backend/app/services/ptz_lock_service.py
 """
-PTZ Lock Service - Control de exclusión mutua para PTZ.
-Evita que múltiples usuarios controlen la misma cámara simultáneamente.
+================================================================================
+MÓDULO: services.ptz_lock_service — Exclusión mutua del control PTZ (Pipeline #8)
+================================================================================
+
+PROPÓSITO
+    Lock en memoria que garantiza que SOLO UN usuario controle el PTZ de una
+    cámara a la vez. Evita "tirones" cuando dos operadores intentan mover la
+    misma cámara simultáneamente.
+
+RESPONSABILIDAD PRINCIPAL
+    Conceder/liberar/forzar un lock por cámara con: timeout automático (30s),
+    reentrancia por usuario (contador), extensión de tiempo y limpieza periódica
+    de locks expirados en un hilo de fondo. NO mueve la cámara: eso lo hace
+    CameraService.ptz_control; este servicio solo arbitra el acceso.
+
+ESTADO Y CONCURRENCIA
+    Estado vivo en memoria de proceso (_locks, _lock_counts) protegido por un
+    RLock. Singleton de módulo `ptz_lock_service`. Como vive en memoria, encaja
+    en la restricción de proceso único del backend (no se comparte entre workers).
+
+DEPENDENCIAS
+    Solo stdlib: threading (RLock + hilo de limpieza), datetime/timedelta.
+
+COMPONENTES RELACIONADOS
+    Lo INSTANCIA: este propio módulo, como singleton global al importar.
+    Lo CONSUME: blueprint `cameras_bp` (api/routes/cameras.py) en los endpoints
+        PTZ: adquiere el lock ANTES de llamar a CameraService.ptz_control y lo
+        libera/expande según corresponda; el admin puede forzar la liberación.
+
+PUNTO DE ENTRADA
+    `ptz_lock_service.acquire_lock(camera_id, user_id, username)` (instancia
+    global ya creada al final del módulo).
+
+PIPELINE(S)
+    #8 PTZ — etapa de control de concurrencia: gate previo al movimiento real.
+================================================================================
 """
 import threading
 import time
@@ -15,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LockInfo:
+    """Tenencia actual de un lock PTZ: quién lo tiene y hasta cuándo es válido."""
     user_id: int
     username: str
     acquired_at: datetime
@@ -23,10 +58,19 @@ class LockInfo:
 
 class PTZLockService:
     """
-    Servicio de bloqueo distribuido en memoria para control PTZ.
-    - Timeout automático: 30 segundos
-    - Liberación explícita por usuario
-    - Reentrancia: mismo usuario puede adquirir múltiples veces (contador)
+    Lock de control PTZ en memoria de proceso (capa del Pipeline #8).
+
+    Rol: árbitro de concurrencia para el movimiento de cámaras. No es un lock
+    "distribuido" real (vive en un solo proceso), lo cual es suficiente porque el
+    backend corre como proceso único.
+    Garantías:
+      - Timeout automático: 30s (un cliente que se cuelga libera la cámara solo).
+      - Liberación explícita por el mismo usuario que lo tomó.
+      - Reentrancia: el mismo usuario puede readquirir (contador); se libera
+        cuando el contador llega a 0.
+
+    Lo instancia: el módulo (singleton global `ptz_lock_service`).
+    Lo consume: cameras_bp (endpoints PTZ).
     """
     
     DEFAULT_TIMEOUT = 30  # segundos
@@ -42,9 +86,16 @@ class PTZLockService:
     def acquire_lock(self, camera_id: int, user_id: int, username: str, 
                      timeout_seconds: int = None) -> Tuple[bool, Optional[str]]:
         """
-        Intenta adquirir el lock PTZ para una cámara.
-        Returns:
-            (success, error_message)
+        Intenta adquirir el lock PTZ de una cámara (gate previo al movimiento).
+
+        Casos: (a) el mismo usuario ya lo tiene → reentrancia (incrementa
+        contador, True); (b) otro usuario lo tiene y sigue vigente → rechazo con
+        mensaje y segundos restantes; (c) lock libre o expirado → lo concede.
+
+        Inputs: camera_id, user_id, username, timeout_seconds (default 30s).
+        Outputs: (success: bool, error_message: str|None). El mensaje describe
+            quién tiene la cámara y cuánto falta, para mostrarlo en la UI.
+        Llamado por: endpoint PTZ de cameras_bp ANTES de CameraService.ptz_control.
         """
         if timeout_seconds is None:
             timeout_seconds = self.DEFAULT_TIMEOUT
@@ -82,7 +133,13 @@ class PTZLockService:
             return True, None
     
     def release_lock(self, camera_id: int, user_id: int) -> bool:
-        """Libera el lock PTZ (decrementa contador de reentrancia)."""
+        """
+        Libera el lock PTZ decrementando el contador de reentrancia; solo cuando
+        llega a 0 se elimina realmente. Solo el dueño del lock puede liberarlo.
+
+        Outputs: True si el solicitante era el dueño; False si no lo tenía.
+        Llamado por: endpoint PTZ de cameras_bp tras terminar el movimiento.
+        """
         with self._mutex:
             if camera_id not in self._locks:
                 return False
@@ -99,7 +156,9 @@ class PTZLockService:
             return True
     
     def extend_lock(self, camera_id: int, user_id: int, extra_seconds: int = 30) -> bool:
-        """Extiende el tiempo de un lock existente."""
+        """Renueva el vencimiento del lock (keep-alive durante un control PTZ
+        sostenido). Solo el dueño puede extenderlo. Outputs: True si se extendió.
+        Llamado por: heartbeat del cliente mientras mantiene el PTZ activo."""
         with self._mutex:
             if camera_id not in self._locks:
                 return False
@@ -109,7 +168,9 @@ class PTZLockService:
             return True
     
     def get_lock_status(self, camera_id: int) -> Optional[dict]:
-        """Retorna estado del lock para una cámara."""
+        """Estado del lock de una cámara para la UI (quién, desde cuándo, cuánto
+        queda). Outputs: dict o None si la cámara no está bloqueada.
+        Llamado por: endpoint de estado PTZ de cameras_bp (polling de la UI)."""
         with self._mutex:
             if camera_id not in self._locks:
                 return None
@@ -124,7 +185,14 @@ class PTZLockService:
             }
     
     def force_unlock(self, camera_id: int, admin_user_id: int) -> bool:
-        """Fuerza liberación de lock (solo admin)."""
+        """
+        Libera el lock SIN ser el dueño ni respetar la reentrancia (override de
+        admin para destrabar una cámara cuyo dueño no la suelta).
+
+        Outputs: True si había un lock que liberar; False si no.
+        Llamado por: endpoint admin de force-unlock (cameras_bp); la autorización
+            de admin se valida en la capa de ruta, no aquí.
+        """
         with self._mutex:
             if camera_id in self._locks:
                 logger.warning(f"Admin {admin_user_id} forzó liberación de lock cámara {camera_id}")
@@ -134,7 +202,9 @@ class PTZLockService:
             return False
     
     def _cleanup_expired(self):
-        """Limpia locks expirados periódicamente."""
+        """Hilo de fondo (daemon): cada 10s purga locks ya vencidos. Segunda
+        línea de defensa frente al timeout — libera la cámara aunque el cliente
+        nunca llame a release_lock (se desconectó/crasheó)."""
         while self._cleanup_running:
             time.sleep(10)
             with self._mutex:
@@ -146,8 +216,10 @@ class PTZLockService:
                     self._lock_counts.pop(cid, None)
     
     def shutdown(self):
+        """Detiene el hilo de limpieza (apagado ordenado del backend)."""
         self._cleanup_running = False
 
 
-# Instancia global
+# Instancia global (singleton de módulo): los endpoints PTZ importan ESTA
+# instancia para que el estado de los locks sea compartido en todo el proceso.
 ptz_lock_service = PTZLockService()

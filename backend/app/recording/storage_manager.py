@@ -1,3 +1,52 @@
+"""
+================================================================================
+MÓDULO: storage_manager — Rotación y limpieza por cuota del almacenamiento
+================================================================================
+
+PROPÓSITO
+    Mantener el uso de disco de las grabaciones por debajo de la cuota
+    configurada (MAX_STORAGE_GB). Un hilo de fondo vigila el espacio usado y,
+    cuando se supera el umbral, borra las grabaciones MÁS ANTIGUAS (política
+    LRU por antigüedad) de forma atómica BD + filesystem.
+
+RESPONSABILIDAD PRINCIPAL
+    - Medir el espacio usado (vía RecordingRepository; fallback a walk del FS).
+    - Ejecutar limpieza por cuota: al pasar del 90 %, borrar las más viejas
+      hasta bajar al 70 %.
+    - Borrado ATÓMICO con rollback (rename .deleting → delete BD → remove file).
+
+DEPENDENCIAS IMPORTANTES
+    RecordingRepository ... tamaño total, get_oldest(), get_by_id(), delete()
+    settings .............. RECORDINGS_PATH, MAX_STORAGE_GB (leídos en caliente)
+
+COMPONENTES RELACIONADOS
+    - RecordingManager produce los archivos/filas que este módulo rota.
+    - ConsistencyChecker (storage/) reconcilia FS↔BD; es complementario: este
+      borra por CUOTA, aquel borra por INCONSISTENCIA.
+    - Ruta REST storage.py expone get_stats() a la UI (polling de espacio).
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    main.py (paso 10 del arranque) construye StorageManager(recording_repo) y
+    llama a start(); el finally de main.py llama a stop(). NO es singleton.
+
+PIPELINE Y ETAPA
+    #11 Grabación — fase de RETENCIÓN/rotación: corre en paralelo a la grabación
+    para que el disco no se llene. No participa en la captura ni en los clips.
+
+FLUJO DE LIMPIEZA (ASCII)
+    _cleanup_loop (cada 600 s)
+         │
+         ▼
+    run_cleanup(): usado >= 90 % cuota ?
+         │ sí
+         ▼
+    mientras usado > 70 % cuota:
+         get_oldest(20) ──▶ delete_recording_atomic(id)
+                                 │ rename → .deleting
+                                 │ delete fila BD  (rollback si falla)
+                                 └ remove archivo físico
+================================================================================
+"""
 import os
 import threading
 import time
@@ -12,6 +61,27 @@ from ..config import settings
 
 
 class StorageManager:
+    """
+    Hilo de rotación/limpieza de grabaciones por cuota (etapa de retención #11).
+
+    ROL
+        Garantizar que las grabaciones no superen MAX_STORAGE_GB borrando las más
+        antiguas. La ruta y la cuota se leen EN CALIENTE de settings, así que un
+        cambio guardado desde la app de escritorio aplica sin reiniciar.
+
+    QUIÉN LO INSTANCIA / CONSUME
+        - Instancia y arranca: main.py (paso 10). NO es singleton `__new__`.
+        - Consume: la ruta REST storage.py llama get_stats() para el panel de
+          almacenamiento.
+
+    DEPENDENCIAS
+        RecordingRepository (medición y borrado en BD), settings (ruta+cuota).
+
+    UMBRALES
+        Limpia al superar el 90 % de la cuota y se detiene al bajar al 70 %
+        (histéresis para no borrar en cada ciclo).
+    """
+
     CLEANUP_INTERVAL = 600  # 10 minutos
 
     def __init__(self, recording_repo: RecordingRepository):
@@ -31,8 +101,17 @@ class StorageManager:
     def _max_size_bytes(self) -> int:
         return int(settings.MAX_STORAGE_GB * 1024 ** 3)
 
-    # Usar repositorio para calcular tamaño total
     def get_used_space_bytes(self) -> int:
+        """
+        Devuelve el espacio total usado por las grabaciones, en bytes.
+
+        Propósito: base de la decisión de limpieza. Usa el SUM de la BD (rápido);
+            si falla, hace fallback a un os.walk del directorio de grabaciones.
+        Inputs: ninguno.
+        Outputs: int (bytes usados).
+        Llamado por: run_cleanup() y get_stats().
+        Llama a: recording_repo.get_total_size_bytes().
+        """
         try:
             return self._recording_repo.get_total_size_bytes()
         except Exception as e:
@@ -47,6 +126,15 @@ class StorageManager:
             return total
 
     def get_stats(self) -> dict:
+        """
+        Resumen de uso de almacenamiento para la UI (panel de almacenamiento).
+
+        Propósito: exponer GB usados/máx/libres y % de uso.
+        Inputs: ninguno.
+        Outputs: dict con used_gb, max_gb, percent_used, free_gb.
+        Llamado por: ruta REST storage.py (polling de la UI).
+        Llama a: get_used_space_bytes().
+        """
         used = self.get_used_space_bytes()
         max_gb = settings.MAX_STORAGE_GB
         used_gb = used / (1024**3)
@@ -121,7 +209,17 @@ class StorageManager:
 
     def run_cleanup(self) -> int:
         """
-        Ejecuta limpieza de almacenamiento usando eliminación atómica.
+        Ejecuta UNA pasada de limpieza por cuota (LRU por antigüedad).
+
+        Propósito (etapa de retención #11): si el uso supera el 90 % de la cuota,
+            borrar grabaciones de la más vieja a la más nueva (en lotes de 20)
+            con borrado atómico hasta bajar al 70 %.
+        Inputs: ninguno.
+        Outputs: int — número de grabaciones eliminadas (0 si no hizo falta).
+        Excepciones: capturadas → devuelve 0.
+        Llamado por: _cleanup_loop() cada CLEANUP_INTERVAL.
+        Llama a: get_used_space_bytes(), recording_repo.get_oldest(),
+            delete_recording_atomic().
         """
         try:
             used_bytes = self.get_used_space_bytes()
@@ -151,6 +249,14 @@ class StorageManager:
             return 0
 
     def start(self) -> None:
+        """
+        Arranca el hilo daemon de limpieza periódica.
+
+        Propósito: lanzar _cleanup_loop en segundo plano (idempotente).
+        Inputs/Outputs: ninguno.
+        Llamado por: main.py (paso 10 del arranque).
+        Llama a: crea threading.Thread(target=_cleanup_loop).
+        """
         if self._running:
             return
         self._running = True
@@ -159,6 +265,7 @@ class StorageManager:
         logging.info("StorageManager iniciado")
 
     def _cleanup_loop(self) -> None:
+        """Bucle del hilo: run_cleanup() cada CLEANUP_INTERVAL hasta stop()."""
         while self._running:
             try:
                 self.run_cleanup()
@@ -167,5 +274,7 @@ class StorageManager:
             time.sleep(self.CLEANUP_INTERVAL)
 
     def stop(self) -> None:
+        """Detiene el hilo de limpieza (baja la bandera _running). Llamado por
+        el finally de main.py en el apagado ordenado."""
         self._running = False
         logging.info("StorageManager detenido")

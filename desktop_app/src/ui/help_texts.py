@@ -1,9 +1,33 @@
 """
-Textos de ayuda contextual de cada vista de la app.
+================================================================================
+MÓDULO: ui.help_texts — Textos de ayuda contextual por vista
+================================================================================
 
-Cada entrada es una tupla (título, lista_de_secciones), donde cada sección
-es (encabezado, descripción). Se usan en InfoDialog desde el botón "" de
-cada vista principal.
+PROPÓSITO
+    Centralizar, como datos (no UI), la ayuda contextual que se muestra al
+    pulsar el botón de ayuda ("?") de cada vista principal. Separar el COPY de
+    los widgets facilita revisarlo/traducirlo sin tocar la lógica.
+
+RESPONSABILIDAD
+    - Definir `HELP`: dict {clave_de_vista → (título, [(encabezado, texto), …])}.
+      Cada vista tiene su entrada (live_view, events_view, playback_view…).
+    - Exponer `get_help(view_key)`, que devuelve el contenido de una vista o un
+      texto genérico si la clave no existe (nunca lanza KeyError).
+
+DEPENDENCIAS
+    Solo typing (alias `HelpContent`). Sin dependencias de Qt: es un módulo de
+    datos puro, consumible desde cualquier capa.
+
+COMPONENTES RELACIONADOS
+    Lo consume el InfoDialog que abre el botón de ayuda de cada vista; las
+    claves de `HELP` deben coincidir con las que esas vistas pasan a `get_help`.
+
+PUNTO DE ENTRADA
+    `get_help(view_key)` (única función pública).
+
+ROL EN LA NAVEGACIÓN
+    Transversal: no navega; alimenta la ayuda emergente de las vistas.
+================================================================================
 """
 from __future__ import annotations
 

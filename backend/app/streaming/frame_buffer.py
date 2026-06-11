@@ -1,3 +1,36 @@
+"""
+================================================================================
+MÓDULO: frame_buffer — Buffer circular de frames (LEGACY / fallback)
+================================================================================
+
+ESTADO: LEGACY — YA NO FORMA PARTE DEL PIPELINE ACTIVO
+    Pertenecía al antiguo pipeline de decode local con FFmpeg (RTSP →
+    FFmpegWorker → CircularFrameBuffer → FrameDistributor → consumidores), que
+    fue ELIMINADO del camino de directo: hoy go2rtc es la ÚNICA capa de medios
+    y Python solo decodifica píxeles para la IA. Este buffer se conserva como
+    pieza de respaldo/histórica; no se instancia en el flujo de directo actual.
+    NO construir nuevas rutas sobre él — usar go2rtc (ver go2rtc_manager.py).
+
+PROPÓSITO (cuando estaba activo)
+    Estructura thread-safe "newest-frame-wins" que desacoplaba la velocidad del
+    productor (worker FFmpeg) de la de los consumidores (IA/grabación/preview):
+    siempre conservaba los N frames más recientes y descartaba los viejos,
+    contando los descartes para telemetría.
+
+RESPONSABILIDAD
+    Almacenar frames decodificados (numpy ndarray) con metadatos (timestamp,
+    camera_id, frame_id, stream_id) y entregar el más reciente sin bloquear al
+    productor.
+
+PIPELINES (histórico)
+    #4 RTSP/FFmpeg (decode local) — etapa intermedia, hoy en desuso.
+
+NOTA SOBRE LA COPIA DE FRAMES
+    get_latest() devuelve una REFERENCIA al ndarray (sin .copy()); la decisión
+    de copiar la tomaba el FrameDistributor según el flag needs_copy de cada
+    consumidor (zero-copy cuando el consumidor serializaba de inmediato).
+================================================================================
+"""
 import collections
 import threading
 import numpy as np
@@ -8,16 +41,29 @@ from typing import Optional
 
 @dataclass
 class FrameData:
+    """Frame decodificado + metadatos que viajaban por el pipeline legacy.
+
+    frame ...... imagen BGR (numpy ndarray).
+    timestamp .. epoch de captura (para medir latencia/antigüedad).
+    camera_id .. cámara de origen.
+    frame_id ... contador incremental del buffer (orden/depuración).
+    stream_id .. lente/stream lógico ("main", o "l1"/"l2" en dual-lens).
+    """
     frame: np.ndarray
     timestamp: float
     camera_id: int
     frame_id: int = 0
-    stream_id: str = "main" 
+    stream_id: str = "main"
 
 
 class CircularFrameBuffer:
     """
-    Buffer circular thread-safe para almacenar frames de video.
+    Buffer circular thread-safe (deque acotada) — LEGACY, ver docstring de módulo.
+
+    ROL (histórico): newest-frame-wins entre el worker FFmpeg (productor) y los
+    consumidores. Un único lock protege la deque; al llenarse, append descarta
+    el frame más viejo y suma dropped_frames. Instanciado por cámara/stream en
+    el antiguo pipeline de decode local (hoy reemplazado por go2rtc).
     """
 
     def __init__(self, camera_id: int, maxsize: int = 30):

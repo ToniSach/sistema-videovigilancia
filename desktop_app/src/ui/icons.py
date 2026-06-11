@@ -1,14 +1,42 @@
 """
-Helper central de ICONOS para el cliente de escritorio (reemplaza emojis).
+================================================================================
+MÓDULO: ui.icons — Provisión central de iconos del cliente desktop
+================================================================================
 
-Usa **qtawesome** (Material Design Icons) si está instalado:
-    pip install qtawesome
-Si no está, cae a iconos estándar de Qt (QStyle) y, en último caso, a un
-QIcon vacío — así la app funciona igual aunque qtawesome no esté presente.
+PROPÓSITO
+    Resolver un nombre semántico ("refresh", "live", "logout"…) a un QIcon,
+    aislando al resto de la UI de la librería de iconos concreta. Reemplaza el
+    uso de emojis por iconos vectoriales coherentes con el tema oscuro.
+
+RESPONSABILIDAD
+    - Mantener `_MAP`: nombre semántico → (icono Material Design de qtawesome,
+      fallback QStyle.SP_*).
+    - Degradar con elegancia en tres niveles: qtawesome (ideal) → icono estándar
+      de Qt (QStyle) → QIcon() vacío. Así la app arranca aunque qtawesome no
+      esté instalado, solo que con iconos más pobres.
+    - Cachear los QIcon resueltos (lru_cache) por (nombre, color).
+
+DEPENDENCIAS
+    PySide6 (QIcon, QStyle, QApplication). `qtawesome` es OPCIONAL: si falta, se
+    detecta en import y se usa el fallback (ver `_HAS_QTA`).
+        pip install qtawesome   # para el set completo de iconos
+
+COMPONENTES RELACIONADOS
+    Lo consume toda la UI; en particular main_window.py para los botones de la
+    sidebar. El color por defecto (`_DEFAULT_COLOR`) está pensado para el tema
+    oscuro de ui/theme.py.
+
+PUNTO DE ENTRADA
+    `icon(name, color=...)` (función pública principal).
+    `has_real_icons()` indica si qtawesome está disponible.
+
+ROL EN LA NAVEGACIÓN
+    Transversal: no navega; solo provee la iconografía de los controles.
 
 Uso:
     from desktop_app.src.ui.icons import icon
     btn.setIcon(icon("refresh"))
+================================================================================
 """
 from __future__ import annotations
 
@@ -103,7 +131,13 @@ _DEFAULT_COLOR = "#cbd5e1"  # gris claro, combina con el tema oscuro
 
 @lru_cache(maxsize=512)
 def icon(name: str, color: str = _DEFAULT_COLOR) -> QIcon:
-    """Devuelve un QIcon para el nombre semántico (cacheado)."""
+    """Resuelve un nombre semántico a QIcon, con fallback en cascada (cacheado).
+
+    Inputs: `name` (clave de `_MAP`), `color` (tinte del icono qtawesome).
+    Output: QIcon. Cascada: 1) qtawesome con el glifo MDI si está disponible;
+    2) si no, el icono estándar de Qt (QStyle.SP_*) — requiere que ya exista la
+    QApplication; 3) en último caso, QIcon() vacío (la app sigue funcionando).
+    Cacheado por (name, color) vía lru_cache. Llamado por toda la UI."""
     spec = _MAP.get(name)
     if _HAS_QTA and spec and spec[0]:
         try:

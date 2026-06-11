@@ -1,0 +1,743 @@
+classDiagram
+  class AIControlWidget {
+    activated
+    btn_activate
+    btn_deactivate
+    camera_id : Optional[int]
+    cmb_lens
+    cmb_mode
+    deactivated
+    lbl_global_ai
+    lbl_status
+    set_camera(camera_id: int, is_dual_lens: bool)
+  }
+  class APIClient {
+    auth_error
+    request_error
+    session : Session
+    tokens : NoneType, Optional[AuthTokens]
+    check_setup_status(callback: Callable[[APIResponse], None])
+    clear_tokens()
+    delete(endpoint: str, callback: Callable, data: Dict)
+    get(endpoint: str, callback: Callable, params: Dict)
+    get_stream_token() Optional[str]
+    login(username: str, password: str, callback: Callable[[APIResponse], None])
+    patch(endpoint: str, callback: Callable, data: Dict)
+    post(endpoint: str, callback: Callable, data: Dict)
+    put(endpoint: str, callback: Callable, data: Dict)
+    request_async(method: str, endpoint: str, callback: Callable[[APIResponse], None], data: Dict, params: Dict, stream: bool)
+    set_tokens(tokens: AuthTokens)
+    setup_admin(username: str, password: str, callback: Callable[[APIResponse], None])
+  }
+  class APIResponse {
+    data : Optional[Any]
+    error : Optional[str]
+    status_code : int
+    success : bool
+  }
+  class APIWorker {
+    callback : Optional[Callable]
+    dispatcher
+    func : Callable
+    run()
+  }
+  class AudioControlWidget {
+    btn_listen
+    btn_ptt
+    btn_reload_mics
+    camera_id : Optional[int]
+    cmb_mic
+    lbl_status
+    listen_changed
+    slider_volume
+    talk_ended
+    talk_started
+    volume_changed
+    set_camera(camera_id: int)
+  }
+  class AuthTokens {
+    access_token : str
+    expires_at : Optional[datetime]
+    refresh_token : str
+  }
+  class Camera {
+    connection_type : Optional[str]
+    created_at : Optional[str]
+    fallback_url : Optional[str]
+    fps : int
+    has_ai : bool
+    has_audio : bool
+    has_leds : bool
+    has_ptz : bool
+    id : int
+    ip_address : str
+    is_active : bool
+    is_dual_lens : bool
+    last_connected_at : Optional[str]
+    last_error_code : Optional[str]
+    manufacturer : Optional[str]
+    model : Optional[str]
+    name : str
+    onvif_url : Optional[str]
+    owner_id : Optional[int]
+    password : Optional[str]
+    permissions : Dict[str, bool]
+    profile_token : Optional[str]
+    resolution_height : int
+    resolution_width : int
+    rtsp_url : str
+    status : str
+    stream_url : Optional[str]
+    stream_url_l1 : Optional[str]
+    stream_url_l2 : Optional[str]
+    stream_urls : Optional[Dict]
+    username : Optional[str]
+    webrtc_url : Optional[str]
+    worker_status : Optional[Dict]
+    from_dict(data: dict) 'Camera'
+    to_dict() dict
+  }
+  class CameraControlPanel {
+    ai_widget
+    audio_widget
+    btn_go_preset
+    btn_save_preset
+    cmb_presets
+    current_camera_id : NoneType, Optional[int]
+    led_widget
+    ptz_widget
+    rec_widget
+    tabs
+    clear()
+    set_camera(camera_id: int, camera_data: dict)
+  }
+  class CameraControlView {
+    back_requested
+    btn_back
+    cmb_camera
+    cmb_lens
+    control_panel
+    lbl_fps
+    splitter
+    video_widget
+    hideEvent(event)
+    set_cameras(cameras: list)
+    showEvent(event)
+    show_camera(camera_id: int, lens: str)
+  }
+  class CameraDiscoveryThread {
+    api_token : str
+    cameras_found
+    error
+    finished_search
+    subnet_scan : bool
+    timeout_s : int
+    run()
+  }
+  class CameraEditDialog {
+    btn_cancel
+    btn_save
+    btn_test
+    camera : Optional[Camera]
+    chk_ai
+    chk_audio
+    chk_dual_lens
+    chk_leds
+    chk_notify_offline
+    chk_notify_person
+    chk_notify_vehicle
+    chk_ptz
+    cmb_ai_mode
+    lbl_test_result
+    txt_ip
+    txt_name
+    txt_onvif
+    txt_password
+    txt_rtsp
+    txt_username
+    get_camera_data() dict
+    get_notification_prefs() dict
+  }
+  class CameraManagementView {
+    btn_add
+    btn_delete
+    btn_discover
+    btn_edit
+    btn_toggle
+    camera_selected
+    camera_updated
+    cameras : List[Camera], list
+    cmb_preview_lens
+    details_widget
+    discovery_thread
+    info_widget
+    lbl_details
+    lbl_info_ai
+    lbl_info_capabilities
+    lbl_info_ip
+    lbl_info_name
+    lbl_info_status
+    lbl_preview_lens
+    lbl_title
+    list_cameras
+    preview_lens_row
+    preview_lens_widget
+    preview_video
+    hideEvent(event)
+    showEvent(event)
+  }
+  class CameraWidget {
+    btn_config
+    btn_snapshot
+    camera_id : int
+    camera_name : str
+    clicked
+    config_requested
+    double_clicked
+    is_maximized : bool
+    lbl_clock
+    lbl_name
+    lbl_rec
+    lbl_status
+    lbl_video
+    ptz_requested
+    snapshot_requested
+    stream_type : str
+    stream_url : str
+    closeEvent(event)
+    contextMenuEvent(event: QContextMenuEvent)
+    hideEvent(event)
+    is_live() bool
+    mouseDoubleClickEvent(event: QMouseEvent)
+    mousePressEvent(event: QMouseEvent)
+    release_resources()
+    resizeEvent(event)
+    set_live_url(url: str)
+    set_offline()
+    set_online_pending()
+    set_recording(on: bool)
+    showEvent(event)
+    start_live()
+    stop_video()
+  }
+  class Config {
+    API_BASE_URL : str
+    BORDER_RADIUS : int
+    FFMPEG_FPS : int
+    FFMPEG_HEIGHT : int
+    FFMPEG_WIDTH : int
+    GLASS_BG : str
+    GLASS_BORDER : str
+    STREAM_BUFFER_SIZE : int
+    THEME_ACCENT : str
+    THEME_ACCENT_DARK
+    THEME_ACCENT_LIGHT
+    THEME_ACCENT_SECONDARY : str
+    THEME_DANGER : str
+    THEME_PRIMARY : str
+    THEME_SECONDARY : str
+    THEME_TEXT : str
+    THEME_TEXT_MUTED : str
+    TIMEOUT : int
+    VLC_OPTIONS : Optional[list]
+  }
+  class DashboardView {
+    EVENT_LABELS : dict
+    events_box
+    kpi_cams
+    kpi_disk_extra : str
+    kpi_events
+    kpi_health
+    kpi_uptime
+    lbl_date
+    lbl_disk_detail
+    lbl_hello
+    open_cameras
+    open_events
+    open_live
+    open_playback
+    hideEvent(event)
+    set_user(username: str)
+    showEvent(event)
+  }
+  class DownloadThread {
+    error
+    finished_download
+    headers : dict
+    output_path : str
+    progress
+    url : str
+    cancel()
+    run()
+  }
+  class EventsView {
+    btn_ack
+    btn_ack_all
+    btn_jump
+    btn_refresh
+    btn_view_gallery
+    btn_view_list
+    chk_unread
+    cmb_camera
+    cmb_type
+    gallery
+    jump_to_playback
+    lbl_auto
+    lbl_count
+    lbl_info
+    lbl_snapshot
+    spin_hours
+    table
+    view_stack
+    hideEvent(event)
+    showEvent(event)
+  }
+  class GlassCard {
+  }
+  class GrantPermissionDialog {
+    chk_audio
+    chk_download
+    chk_leds
+    chk_ptz
+    chk_view
+    cmb_user
+    users : List[dict]
+    get_data() tuple[int, dict]
+  }
+  class HelpButton {
+  }
+  class InfoDialog {
+  }
+  class LEDControlWidget {
+    btn_auto
+    btn_off
+    btn_on
+    camera_id : Optional[int]
+    lbl_status
+    mode_buttons : list
+    set_camera(camera_id: int)
+  }
+  class LiveView {
+    btn_help
+    btn_next
+    btn_prev
+    btn_tv
+    camera_config_requested
+    camera_selected
+    cameras : Dict[Tuple[int, str], CameraWidget]
+    cmb_layout
+    grid
+    grid_widget
+    lbl_page
+    lbl_title
+    ptz_requested
+    cleanup()
+    closeEvent(event)
+    hideEvent(event)
+    restart_streams(api_token: str)
+    set_cameras(cameras: List[Camera], api_token: str)
+    showEvent(event)
+  }
+  class LoginView {
+    btn_login
+    card
+    chk_remember
+    lbl_status
+    lbl_subtitle
+    lbl_title
+    lbl_version
+    login_successful
+    txt_password
+    txt_password2
+    txt_username
+    reset()
+  }
+  class MainWindow {
+    btn_link_mobile
+    btn_logout
+    btn_tutorial
+    camera_control_view
+    camera_management_view
+    cameras : list
+    central
+    content_stack
+    current_user : Optional[User]
+    dashboard_view
+    events_view
+    lbl_section_admin
+    lbl_user
+    lbl_user_role
+    live_view
+    login_view
+    main_layout
+    main_view
+    notifications_view
+    permissions_view
+    playback_view
+    settings_view : NoneType
+    sidebar
+    stack
+    statusbar
+    system_view
+    telegram_devices_view
+    users_view
+    show_login()
+  }
+  class NotificationPreferencesView {
+    admin_card
+    admin_table
+    btn_add
+    btn_delete
+    btn_edit
+    btn_help
+    btn_refresh
+    btn_telegram_config
+    btn_telegram_link
+    btn_telegram_test
+    btn_telegram_unlink
+    lbl_ai_banner
+    lbl_telegram_status
+    list_telegram_chats
+    table
+    refresh()
+    set_current_user(_user_id: int, _role: str)
+  }
+  class OnboardingWizard {
+    btn_next
+    btn_prev
+    card
+    chk_dont_show
+    hint_box
+    lbl_body
+    lbl_hint
+    lbl_icon
+    lbl_title
+    dont_show_again() bool
+  }
+  class PTZCommand {
+    direction : str
+    speed : float
+  }
+  class PTZJoystick {
+    lbl_speed_val
+    move
+    slider_speed
+    stop
+  }
+  class PermissionsView {
+    btn_grant
+    btn_refresh
+    btn_revoke
+    lbl_cam_title
+    lbl_warn
+    list_cams
+    table
+    refresh()
+    set_current_user(_user_id: int, role: str)
+  }
+  class PlaybackService {
+    download_error
+    download_finished
+    download_progress
+    player
+    cleanup()
+    get_player() VLCPlayer
+    play_local_file(file_path: str)
+    play_recording(recording_id: int, api_url: str, token: str, local_file: Optional[str], lens: Optional[str])
+    set_lens(lens: Optional[str])
+    stop()
+  }
+  class PlaybackState {
+    duration : int
+    is_playing : bool
+    position : float
+    speed : float
+    time : int
+  }
+  class PlaybackView {
+    btn_export
+    btn_load
+    btn_pause
+    btn_play
+    btn_stop
+    cmb_camera
+    cmb_lens
+    cmb_speed
+    current_camera_id : Optional[int]
+    current_date : Optional[str]
+    date_edit
+    lbl_lens
+    lbl_status
+    lbl_time
+    progress_download
+    segments : list
+    slider_pos
+    timeline
+    video_player
+    cleanup()
+    jump_to_time(camera_id: int, when: datetime)
+    set_cameras(cameras: list)
+  }
+  class PreferenceDialog {
+    cameras : List[dict]
+    chk_channels : dict
+    chk_days : list
+    chk_enabled
+    chk_schedule
+    cmb_camera
+    cmb_event
+    is_edit
+    pref : Optional[dict]
+    time_end
+    time_start
+    get_data() dict
+  }
+  class QRLinkDialog {
+    btn_close
+    btn_refresh
+    lbl_qr
+    lbl_status
+    qr_frame
+    closeEvent(event)
+  }
+  class RecordingControlWidget {
+    btn_start
+    btn_stop
+    camera_id : Optional[int]
+    lbl_status
+    started
+    stopped
+    set_camera(camera_id: int)
+  }
+  class RecordingSegment {
+    camera_id : int
+    duration : timedelta
+    duration_seconds : float
+    end : Optional[datetime]
+    file_size_mb : float
+    has_clip : bool
+    recording_id : int
+    start : datetime
+    start_seconds : int
+  }
+  class RtspVideoWidget {
+    closeEvent(event)
+    has_audio() bool
+    play(url: str)
+    resizeEvent(event)
+    set_audio_enabled(enabled: bool)
+    set_url(url: str)
+    set_volume(value: int)
+    showEvent(event)
+    show_message(text: str)
+    stop()
+  }
+  class SettingsView {
+    btn_cleanup_now
+    btn_goto_notifications
+    btn_reset
+    btn_save
+    chk_save_snapshots
+    cmb_ai_model
+    lbl_dirty
+    lbl_storage_info
+    lbl_telegram_status
+    spin_cleanup
+    spin_confidence
+    spin_max_storage
+    tabs
+    txt_storage_path
+    showEvent(event)
+  }
+  class SnapshotLoaderThread {
+    event_id : int
+    failed
+    loaded
+    token : str
+    url : str
+    run()
+  }
+  class Sparkline {
+    add_value(value: float)
+    clear()
+    paintEvent(event)
+    set_color(color: str)
+  }
+  class StatCard {
+    bar
+    lbl_sub
+    lbl_title
+    lbl_value
+    update_value(value: str, percent: float, subtitle: str, color: str)
+  }
+  class Step {
+    body : str
+    hint : Optional[str]
+    icon : str
+    title : str
+  }
+  class SystemHealthView {
+    card_cams
+    card_cpu
+    card_disk
+    card_ram
+    card_uptime
+    lbl_cpu_info
+    lbl_gpu_info
+    lbl_health
+    lbl_last_update
+    lbl_os_info
+    lbl_ram_info
+    lbl_spark_cpu
+    lbl_spark_ram
+    spark_cpu
+    spark_ram
+    table_cams
+    hideEvent(event)
+    showEvent(event)
+  }
+  class TelegramDevicesView {
+    btn_refresh
+    lbl_count
+    lbl_empty
+    table
+    refresh()
+    showEvent(event)
+  }
+  class TelegramLinkDialog {
+    btn_close
+    btn_copy
+    btn_open_telegram
+    btn_refresh
+    code_frame
+    lbl_code
+    lbl_command
+    lbl_status
+    lbl_step1
+    lbl_step2
+    lbl_step3
+    closeEvent(event)
+  }
+  class TimelineDay {
+    camera_id : int
+    date : str
+    segments : list
+    total_duration_seconds : float
+  }
+  class TimelineWidget {
+    colors : dict
+    current_time : int
+    duration : int
+    event_markers : List[tuple]
+    pixels_per_second : float
+    position_changed
+    segment_clicked
+    segment_height_ratio : float
+    segments : List[RecordingSegment]
+    mouseMoveEvent(event: QMouseEvent)
+    mousePressEvent(event: QMouseEvent)
+    mouseReleaseEvent(event: QMouseEvent)
+    paintEvent(event: QPaintEvent)
+    set_current_time(seconds: int)
+    set_event_markers(markers: List[tuple])
+    set_segments(segments: List[RecordingSegment])
+    wheelEvent(event: QWheelEvent)
+  }
+  class User {
+    accessible_cameras : List[int]
+    created_at : Optional[datetime]
+    id : int
+    is_active : bool
+    is_admin : bool
+    role : str
+    username : str
+    to_dict() dict
+  }
+  class UserEditDialog {
+    chk_active
+    cmb_role
+    is_edit
+    txt_password
+    txt_username
+    user : Optional[dict]
+    get_data() dict
+  }
+  class UsersView {
+    btn_add
+    btn_delete
+    btn_edit
+    btn_refresh
+    lbl_warn
+    table
+    refresh()
+    set_current_user(user_id: int, role: str)
+  }
+  class VLCPlayer {
+    ended
+    error
+    first_frame
+    instance : Instance, NoneType
+    player
+    position_changed
+    state_changed
+    time_changed
+    get_duration() int
+    get_time() int
+    get_video_size()
+    is_swapping() bool
+    pause()
+    play_file(file_path: str)
+    play_url(url: str)
+    play_url_async(url: str)
+    seek(position: float)
+    seek_time(seconds: int)
+    set_crop(geometry)
+    set_hwnd(hwnd: int)
+    set_speed(speed: float)
+    set_xwindow(xid: int)
+    stop()
+  }
+  class VideoPlayerWidget {
+    cleanup()
+    get_player()
+    play(url: str)
+    resizeEvent(event)
+    showEvent(event)
+    stop()
+  }
+  class _APIWorker {
+    failed
+    ok
+    run()
+  }
+  class _CallbackDispatcher {
+    dispatch(callback, response)
+  }
+  class _KpiCard {
+    lbl_label
+    lbl_sub
+    lbl_value
+    set(value: str, sub: str, color: str)
+  }
+  class _QRFetchWorker {
+    failed
+    fetched
+    run()
+  }
+  LiveView --> CameraWidget : cameras
+  VLCPlayer --* PlaybackService : player
+  AIControlWidget --* CameraControlPanel : ai_widget
+  AudioControlWidget --* CameraControlPanel : audio_widget
+  LEDControlWidget --* CameraControlPanel : led_widget
+  RecordingControlWidget --* CameraControlPanel : rec_widget
+  CameraDiscoveryThread --* CameraManagementView : discovery_thread
+  _KpiCard --* DashboardView : kpi_cams
+  _KpiCard --* DashboardView : kpi_events
+  _KpiCard --* DashboardView : kpi_health
+  _KpiCard --* DashboardView : kpi_uptime
+  StatCard --* SystemHealthView : card_cpu
+  StatCard --* SystemHealthView : card_ram
+  StatCard --* SystemHealthView : card_disk
+  StatCard --* SystemHealthView : card_cams
+  StatCard --* SystemHealthView : card_uptime
+  _CallbackDispatcher --o APIWorker : dispatcher

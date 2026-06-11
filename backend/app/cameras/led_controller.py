@@ -1,11 +1,34 @@
 """
-Control de LEDs / IR Cut Filter vía ONVIF Imaging Service.
+================================================================================
+MÓDULO: led_controller — Control de IR-cut / luz blanca vía ONVIF Imaging
+================================================================================
 
-Reescrito para:
-- Probar varios puertos ONVIF (mismas cámaras requieren :8000 / :8899).
-- Probar Basic Auth primero y caer a UsernameToken.
-- Logs detallados (qué puerto y método de auth se usa).
-- Cache singleton (LEDManager) para no reconectar en cada petición.
+PROPÓSITO
+    Controlar la iluminación de la cámara:
+      - Filtro IR-CUT (modo día/noche): ON / OFF / AUTO, vía el servicio Imaging
+        de ONVIF (estándar). Es lo que activa la visión nocturna IR.
+      - Luz blanca / foco: NO es estándar ONVIF — se intenta best-effort con
+        comandos auxiliares propietarios (SendAuxiliaryCommand) de XiongMai/iCSee.
+
+QUÉ SERVICIO ONVIF USA
+    `imaging`: GetImagingSettings devuelve la configuración actual (brillo,
+    contraste, IrCutFilter...). Se modifica IrCutFilter y se reenvía con
+    SetImagingSettings, referenciando el VideoSourceToken (no el ProfileToken).
+
+RESPONSABILIDAD
+    - LEDController: una conexión Imaging por cámara (cacheada).
+    - LEDManager: singleton que cachea controladores por camera_id.
+
+DEPENDENCIAS: onvif-zeep, .onvif_common.
+QUIÉN LO CONSUME: api/routes/cameras.py (endpoints de LED/visión nocturna).
+PIPELINE: #7 ONVIF (control de imaging).
+
+INCOMPATIBILIDADES TÍPICAS
+    - La LUZ BLANCA no es ONVIF estándar: se prueban varios tokens aux
+      (WhiteLight/FloodLight/IRLamp...) por PTZ y por device-mgmt; si ninguno
+      responde, la cámara puede requerir su protocolo binario propietario
+      (puerto 34567), fuera del alcance de este módulo.
+================================================================================
 """
 from __future__ import annotations
 
@@ -26,7 +49,16 @@ logger = logging.getLogger(__name__)
 
 
 class LEDController:
-    """Controla el filtro IR-cut (modos: ON/OFF/AUTO)."""
+    """
+    Controla el filtro IR-cut y (best-effort) la luz blanca de UNA cámara.
+
+    ROL
+        Mantiene una conexión Imaging por cámara (cacheada por LEDManager).
+        Guarda el VideoSourceToken (necesario para Get/SetImagingSettings) que
+        deriva de la VideoSourceConfiguration del primer perfil.
+
+    Pipeline #7 ONVIF. Lo consume api/routes/cameras.py.
+    """
 
     def __init__(self, camera: Camera):
         self._camera = camera
@@ -96,7 +128,17 @@ class LEDController:
         return self._connected
 
     def set_ir_cut_filter(self, mode: str) -> bool:
-        """mode = 'ON' | 'OFF' | 'AUTO'."""
+        """
+        Fija el modo del filtro IR-cut (día/noche). (Pipeline #7 ONVIF.)
+
+        Solicitud SOAP: GetImagingSettings(VideoSourceToken) para leer la config
+            actual → se modifica IrCutFilter → SetImagingSettings con esa config.
+        Respuesta esperada: SetImagingSettingsResponse vacío (HTTP 200 sin Fault).
+        Servicio ONVIF: imaging.
+        Inputs:  mode ∈ {'ON','OFF','AUTO'}. ON = forzar IR (noche), AUTO = la
+            cámara decide según luz ambiente.
+        Outputs: True si se aplicó; False si no conecta o el modo es inválido.
+        """
         if not self._connected:
             return False
         mode_u = (mode or "").upper()
@@ -121,7 +163,15 @@ class LEDController:
 
     def set_white_light(self, on: bool) -> bool:
         """
-        BEST-EFFORT: enciende/apaga la LUZ BLANCA de la cámara.
+        BEST-EFFORT: enciende/apaga la LUZ BLANCA de la cámara. (Pipeline #7.)
+
+        Solicitud SOAP: SendAuxiliaryCommand con AuxiliaryData = token
+            propietario ("tt:WhiteLight|On", "FloodLight|Off"...), probado
+            primero vía servicio ptz (con ProfileToken) y luego vía
+            device_service.
+        Respuesta esperada: respuesta vacía (HTTP 200 sin Fault) en la cámara
+            que acepte el token; el resto devuelven Fault y se ignoran.
+        Servicios ONVIF: ptz y device_service (SendAuxiliaryCommand).
 
         OJO: la luz blanca NO es estándar ONVIF. Las cámaras XiongMai/iCSee la
         controlan con comandos auxiliares propietarios (o el protocolo binario
@@ -197,7 +247,13 @@ class LEDController:
 
 
 class LEDManager:
-    """Cache de LEDControllers por camera_id."""
+    """
+    SINGLETON que cachea un LEDController por camera_id. (Pipeline #7 ONVIF.)
+
+    Evita reconectar (recargar WSDL) en cada petición de visión nocturna/luz.
+    drop() lo descarta (al cambiar IP/credenciales). Instancia global:
+    `led_manager`. Lo consume api/routes/cameras.py.
+    """
     _instance: "Optional[LEDManager]" = None
     _instance_lock = threading.Lock()
 

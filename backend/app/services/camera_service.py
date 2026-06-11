@@ -1,3 +1,46 @@
+"""
+================================================================================
+MÓDULO: services.camera_service — Servicio de cámaras (Pipelines #1/#3/#7/#8)
+================================================================================
+
+PROPÓSITO
+    Capa de negocio para TODO lo relacionado con una cámara: CRUD, alta con
+    auto-descubrimiento ONVIF, arranque/parada del pipeline de captura, y los
+    controles del dispositivo (PTZ, LEDs/IR-Cut, audio bidireccional).
+
+RESPONSABILIDAD PRINCIPAL
+    Orquestar las tres piezas que componen una cámara y mantenerlas coherentes:
+      - CameraRepository ... persistencia (la fila en BD).
+      - CameraManager ...... estado vivo (worker FFmpeg, buffer, distributor).
+      - ONVIFDiscovery ..... descubrimiento/probe en la red LAN.
+    Cualquier operación que cambie config crítica (rtsp_url, resolución, fps,
+    is_active) debe reflejarse en el worker → de ahí los restart_camera()/
+    start_camera()/stop_camera() tras escribir en BD.
+
+DEPENDENCIAS
+    cameras.camera_manager .... CameraManager (singleton de estado vivo)
+    cameras.onvif_discovery ... ONVIFDiscovery (WS-Discovery + probe por IP)
+    database.repositories ..... CameraRepository (CRUD de la entidad Camera)
+    cameras.ptz_controller / led_controller / audio_controller (carga perezosa)
+    streaming.go2rtc_manager ... restream RTSP local para "escuchar" audio
+
+COMPONENTES RELACIONADOS
+    Lo INSTANCIA: DependencyContainer (container.py) inyectando los tres repos/
+        managers; se registra como `camera_service`.
+    Lo CONSUME: blueprint `cameras_bp` (api/routes/cameras.py) — alta, edición,
+        borrado, toggle, descubrimiento, PTZ, LEDs y audio.
+
+PUNTO DE ENTRADA
+    No tiene main propio; cada método público es invocado por una ruta REST.
+
+PIPELINE(S)
+    #1 Inicio ....... add/toggle/update arrancan o reinician el worker (capture).
+    #3 Live ......... get_camera(s) exponen worker_status para la UI de directo.
+    #7 ONVIF ........ add_camera (probe) y discover_cameras (descubrimiento LAN).
+    #8 PTZ .......... ptz_control/presets/goto/save (movimiento del dispositivo);
+                      el lock de exclusión lo lleva PTZLockService, no este módulo.
+================================================================================
+"""
 import logging
 from typing import Optional
 
@@ -10,7 +53,14 @@ from ..database.repositories.camera_repository import CameraRepository
 class CameraService:
     """
     Servicio de negocio para gestión completa de cámaras.
-    Coordina entre repositorio, manager de streaming y descubrimiento ONVIF.
+
+    Rol: fachada única entre las rutas REST de cámara y las tres capas
+    subyacentes (repositorio BD, CameraManager de estado vivo, descubrimiento
+    ONVIF). Garantiza que un cambio persistido se propague al worker en ejecución.
+
+    Lo instancia: container.py (singleton `camera_service`).
+    Lo consume: api/routes/cameras.py (cameras_bp).
+    Dependencias inyectadas: CameraRepository, CameraManager, ONVIFDiscovery.
     """
 
     def __init__(
@@ -26,10 +76,13 @@ class CameraService:
 
     def get_all_cameras(self) -> list[dict]:
         """
-        Obtiene todas las cámaras con su estado de worker.
+        Lista todas las cámaras fusionando su fila de BD con el estado vivo del
+        worker (Pipeline #3 Live: la UI necesita saber si cada cámara emite).
 
-        Returns:
-            Lista de diccionarios con datos de cámara y estado
+        Outputs: lista de dicts; cada uno lleva `worker_status` (None si el worker
+            no existe — cámara inactiva o aún sin arrancar).
+        Llamado por: GET /api/v1/cameras (cameras_bp).
+        Llama a: CameraRepository.get_all + CameraManager.get_worker.
         """
         cameras = self._camera_repo.get_all()
         result = []
@@ -50,13 +103,11 @@ class CameraService:
 
     def get_camera(self, camera_id: int) -> dict | None:
         """
-        Obtiene una cámara específica con su estado.
+        Obtiene una cámara concreta con su estado de worker (Pipeline #3 Live).
 
-        Args:
-            camera_id: ID de la cámara
-
-        Returns:
-            Diccionario con datos y estado, o None si no existe
+        Inputs: camera_id.
+        Outputs: dict con datos + worker_status, o None si la cámara no existe.
+        Llamado por: GET /api/v1/cameras/<id> (cameras_bp).
         """
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
@@ -71,7 +122,19 @@ class CameraService:
 
     def add_camera(self, data: dict) -> dict:
         """
-        Agrega nueva cámara al sistema y la inicia si está activa.
+        Alta de cámara (Pipelines #7 ONVIF → #1 Inicio): valida, opcionalmente
+        descubre la URL por ONVIF, persiste y arranca el worker.
+
+        Inputs: data (dict del cliente). Claves relevantes: ip_address, rtsp_url,
+            username/password, force_probe, skip_probe (legacy), is_active,
+            is_dual_lens, resolución/fps. Los campos None se normalizan a "".
+        Outputs: dict de la cámara creada con worker_status=None.
+        Excepciones: ValueError si la IP ya existe, o si no hay rtsp_url y el
+            probe ONVIF falla (sin URL no se puede arrancar el worker → la ruta
+            traduce esto a HTTP 400).
+        Llamado por: POST /api/v1/cameras (cameras_bp).
+        Llama a: ONVIFDiscovery.probe_single_ip, CameraRepository.create,
+            CameraManager.start_camera (si activa), sync_camera_time (si inactiva).
 
         Política de probe ONVIF (cambiada en 2026-05):
         - Si el cliente envía `rtsp_url`, NO se hace probe por defecto. La cámara
@@ -180,7 +243,12 @@ class CameraService:
             resolution_width=data.get('resolution_width', 1920),
             resolution_height=data.get('resolution_height', 1080),
             fps=data.get('fps', 25),
-            connection_type=data.get('connection_type', 'manual')
+            connection_type=data.get('connection_type', 'manual'),
+            # El dueño lo inyecta la ruta POST /cameras desde el JWT
+            # (cameras.py: data["owner_id"]). Sin esto la cámara quedaba con
+            # owner_id=NULL → audiencia vacía en el router de notificaciones →
+            # nunca se enviaban alertas (ni Telegram ni app).
+            owner_id=data.get('owner_id')
         )
 
         # Guardar en BD
@@ -210,14 +278,16 @@ class CameraService:
 
     def update_camera(self, camera_id: int, data: dict) -> dict | None:
         """
-        Actualiza datos de una cámara existente.
+        Actualiza una cámara y reinicia el worker si cambió config crítica.
 
-        Args:
-            camera_id: ID de la cámara a actualizar
-            data: Diccionario con campos a actualizar
+        Solo escribe campos que existan como atributo de Camera (ignora 'id' y
+        claves desconocidas). Si en `data` viene rtsp_url, resolución, fps o
+        is_active, el pipeline en vivo debe reconstruirse → restart_camera.
 
-        Returns:
-            Cámara actualizada o None si no existe
+        Inputs: camera_id, data (parcial).
+        Outputs: cámara actualizada (vía get_camera) o None si no existe.
+        Llamado por: PUT/PATCH /api/v1/cameras/<id> (cameras_bp).
+        Llama a: CameraRepository.update + CameraManager.restart_camera.
         """
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
@@ -251,6 +321,10 @@ class CameraService:
         """
         Elimina una cámara del sistema y todas sus referencias en otras tablas.
 
+        Llamado por: DELETE /api/v1/cameras/<id> (cameras_bp).
+        Outputs: True si la fila se borró. Excepciones: propaga si falla la
+            limpieza de dependencias (no se borra la cámara a medias).
+
         La BD tiene FKs sobre `cameras.id` desde: events, recordings,
         user_camera_permissions y notification_preferences. PostgreSQL las
         protege por defecto (RESTRICT), así que hay que limpiarlas explícitamente
@@ -278,7 +352,7 @@ class CameraService:
                 # Importar los modelos dentro para evitar ciclos
                 from backend.app.database.models import (
                     NotificationPreference, UserCameraPermission,
-                    Event, Recording,
+                    Event, Recording, NotificationLog,
                 )
 
                 # Notification preferences: SET NULL (la preferencia sigue vigente
@@ -290,6 +364,14 @@ class CameraService:
                 cnt_p = session.query(UserCameraPermission).filter_by(
                     camera_id=camera_id
                 ).delete()
+                # Notification logs: DELETE primero (event_id es NOT NULL con FK
+                # RESTRICT a events, así que hay que borrarlos antes que los eventos).
+                event_ids_subq = session.query(Event.id).filter_by(
+                    camera_id=camera_id
+                ).subquery()
+                cnt_nl = session.query(NotificationLog).filter(
+                    NotificationLog.event_id.in_(session.query(event_ids_subq.c.id))
+                ).delete(synchronize_session=False)
                 # Eventos: DELETE
                 cnt_e = session.query(Event).filter_by(camera_id=camera_id).delete()
                 # Grabaciones: DELETE (archivos físicos quedan pero el registro DB no)
@@ -298,7 +380,8 @@ class CameraService:
                 session.commit()
                 self._logger.info(
                     f"Cámara {camera_id}: limpiado {cnt_np} notif_prefs, "
-                    f"{cnt_p} permisos, {cnt_e} eventos, {cnt_r} grabaciones"
+                    f"{cnt_p} permisos, {cnt_nl} notif_logs, {cnt_e} eventos, "
+                    f"{cnt_r} grabaciones"
                 )
         except Exception as e:
             self._logger.error(f"Error limpiando dependencias de cámara {camera_id}: {e}")
@@ -309,14 +392,13 @@ class CameraService:
 
     def toggle_camera(self, camera_id: int, active: bool) -> dict | None:
         """
-        Activa o desactiva una cámara.
+        Activa/desactiva una cámara y arranca o para su worker en consecuencia
+        (Pipeline #1: persistir is_active + reflejarlo en el estado vivo).
 
-        Args:
-            camera_id: ID de la cámara
-            active: True para activar, False para desactivar
-
-        Returns:
-            Cámara actualizada o None
+        Inputs: camera_id, active.
+        Outputs: cámara actualizada (vía get_camera) o None si no existe.
+        Llamado por: endpoint de toggle de cámara (cameras_bp).
+        Llama a: CameraManager.start_camera / stop_camera.
         """
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
@@ -334,14 +416,15 @@ class CameraService:
 
     def set_ai_camera(self, camera_id: int) -> bool:
         """
-        Establece una cámara como la única cámara con AI activada.
-        Desactiva has_ai en todas las demás.
+        Marca UNA cámara como la única con has_ai=True (exclusividad de IA).
 
-        Args:
-            camera_id: ID de la cámara para AI
+        Coherente con la restricción del sistema: solo una cámara corre YOLO a la
+        vez (ver AI_CAMERA_ID / AIService). Apaga has_ai en todas las demás antes
+        de encenderlo en la elegida. Aquí solo persiste la BANDERA en BD; el
+        scheduler de IA lo activa AIService.activate_ai (Pipeline #9).
 
-        Returns:
-            True si se actualizó correctamente
+        Inputs: camera_id objetivo.
+        Outputs: True si se actualizó; False si la cámara no existe o hubo error.
         """
         try:
             # Desactivar AI en todas las cámaras primero
@@ -382,13 +465,12 @@ class CameraService:
 
     def get_camera_status(self, camera_id: int) -> dict:
         """
-        Obtiene estado detallado de una cámara.
+        Estado detallado de una cámara (worker + info), tolerante a inexistencia.
 
-        Args:
-            camera_id: ID de la cámara
-
-        Returns:
-            Diccionario con estado del worker e info de cámara
+        Inputs: camera_id.
+        Outputs: dict con camera_id, worker_status (None si no hay worker) y
+            camera_info (None si la cámara no existe en BD).
+        Llamado por: endpoint de estado de cámara (cameras_bp).
         """
         worker = self._camera_manager.get_worker(camera_id)
         camera = self._camera_repo.get_by_id(camera_id)
@@ -420,7 +502,22 @@ class CameraService:
             "connection_type": camera.connection_type if hasattr(camera, 'connection_type') else "unknown"
         }
     
+    # ------------------------------------------------------------------
+    # PTZ — movimiento del dispositivo (Pipeline #8). La exclusión mutua
+    # entre usuarios la lleva PTZLockService en la capa de ruta, NO aquí:
+    # este método asume que el lock ya fue adquirido.
+    # ------------------------------------------------------------------
     def ptz_control(self, camera_id: int, direction: str, speed: float = 0.5) -> dict:
+        """
+        Mueve la cámara PTZ en una dirección (o la detiene con direction="stop").
+
+        Inputs: camera_id, direction ("stop" para parar; resto → move), speed.
+        Outputs: {"direction", "status": "ok"}.
+        Excepciones: ValueError si la cámara no existe o no tiene PTZ;
+            RuntimeError si no se puede conectar por ONVIF o el movimiento falla.
+        Llamado por: endpoint PTZ de cameras_bp (tras adquirir el lock PTZ).
+        Llama a: ptz_controller.ptz_manager.get(camera).move/stop.
+        """
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
             raise ValueError("Cámara no encontrada")
@@ -445,6 +542,7 @@ class CameraService:
         return {"direction": direction, "status": "ok"}
 
     def ptz_presets(self, camera_id: int) -> list[dict]:
+        """Lista los presets PTZ guardados en la cámara (vía ONVIF). Pipeline #8."""
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
             raise ValueError("Cámara no encontrada")
@@ -452,6 +550,13 @@ class CameraService:
         return ptz_manager.get(camera).get_presets()
 
     def ptz_goto_preset(self, camera_id: int, preset_token: str) -> dict:
+        """
+        Mueve la cámara a un preset PTZ existente (Pipeline #8).
+
+        Outputs: {"preset_token", "status": "ok"}.
+        Excepciones: ValueError si la cámara no existe; RuntimeError si el
+            posicionamiento falla.
+        """
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
             raise ValueError("Cámara no encontrada")
@@ -479,7 +584,13 @@ class CameraService:
     # ------------------------------------------------------------------
     def set_led_state(self, camera_id: int, state: str) -> dict:
         """
+        Controla el filtro IR-Cut / iluminación de la cámara vía ONVIF Imaging.
+
         state ∈ {"on", "off", "auto"} → IR-Cut OFF / ON / AUTO.
+        Outputs: {"camera_id", "state"}.
+        Excepciones: ValueError (cámara inexistente o state inválido);
+            RuntimeError si ONVIF Imaging no responde o no aplica el estado.
+        Llamado por: endpoint de LEDs de cameras_bp.
         """
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
@@ -509,7 +620,17 @@ class CameraService:
     # Audio bidireccional (talk-back)
     # ------------------------------------------------------------------
     def audio_talk(self, camera_id: int, data: dict | None = None) -> dict:
-        """Inicia stream de micrófono local hacia la cámara."""
+        """
+        Talk-back: envía el micrófono local del servidor hacia el altavoz de la
+        cámara (FFmpeg empuja audio por ONVIF/backchannel).
+
+        Inputs: camera_id; data opcional con "mic_device" (selector de micro).
+        Outputs: {"camera_id", "talking": True}.
+        Excepciones: ValueError (cámara inexistente); RuntimeError si no se puede
+            contactar la cámara por ONVIF o FFmpeg no arranca.
+        Nota: hablar NO depende del micro de la cámara (is_supported), solo de
+            alcanzarla por ONVIF (is_talk_supported, best-effort).
+        """
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
             raise ValueError("Cámara no encontrada")

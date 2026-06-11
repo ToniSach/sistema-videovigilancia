@@ -1,9 +1,43 @@
 """
-Vista de Permisos por cámara — quién puede ver/controlar qué.
+================================================================================
+MÓDULO: ui.views.permissions_view — Permisos por cámara (UserCameraPermission)
+================================================================================
 
-UX: seleccionas una cámara a la izquierda, ves quién tiene acceso a la
-derecha, con checks por capacidad (view, PTZ, LEDs, audio, descarga). Botón
-"otorgar" abre selector de usuario.
+PROPÓSITO
+    Pantalla (solo administradores) para gestionar QUIÉN puede ver/controlar
+    cada cámara. Materializa en la UI el modelo `UserCameraPermission` del
+    backend: por cada (usuario, cámara) hay flags de capacidad (ver, PTZ, LEDs,
+    audio, descargar grabaciones).
+
+RESPONSABILIDAD
+    - Listar cámaras (izquierda) y, al seleccionar una, mostrar la tabla de
+      usuarios con acceso y sus capacidades (derecha).
+    - Otorgar acceso a un usuario sobre la cámara (diálogo `GrantPermissionDialog`
+      con checks por capacidad) y revocar todos sus permisos.
+    - Gating de rol: si el usuario no es admin, deshabilita la sección.
+
+DEPENDENCIAS (endpoints consumidos)
+    - GET    cameras/ ........................... lista de cámaras (panel izq.).
+    - GET    users/ ............................. usuarios activos (para otorgar).
+    - GET    permissions/camera/{cam_id} ........ accesos actuales de la cámara.
+    - POST   permissions/camera/{cam_id}/user/{user_id} .. otorga/actualiza flags.
+    - DELETE permissions/camera/{cam_id}/user/{user_id} .. revoca el acceso.
+
+COMPONENTES RELACIONADOS
+    main_window la instancia (índice VIEW_PERMISSIONS=8) y le pasa el rol con
+    `set_current_user`. Reutiliza `_TABLE_STYLE` de users_view y `GlassCard`.
+
+PUNTO DE ENTRADA (en la app)
+    Sidebar «Permisos» (solo admin) → MainWindow._switch_view(VIEW_PERMISSIONS).
+
+PIPELINE(S)
+    #2 Auth/autorización: estos permisos los aplica `PermissionService` en el
+    backend para decidir el acceso a cámaras compartidas (no basta `owner_id`).
+
+UX
+    [ Cámaras (lista) ] | [ Usuarios con acceso + capacidades (tabla) ]
+    Botón «Otorgar acceso» abre el selector de usuario; «Revocar» quita todo.
+================================================================================
 """
 import logging
 from typing import Optional, List
@@ -25,7 +59,13 @@ logger = logging.getLogger(__name__)
 
 
 class GrantPermissionDialog(QDialog):
-    """Diálogo para otorgar permisos a un usuario sobre una cámara."""
+    """Diálogo modal para otorgar permisos a un usuario sobre una cámara.
+
+    ROL: elige el usuario y marca las capacidades (ver, PTZ, LEDs, audio,
+    descargar); devuelve (user_id, dict_de_flags) vía `get_data()`. No habla con
+    el backend; el POST lo hace `PermissionsView._grant`.
+    QUIÉN LO INSTANCIA: PermissionsView (botón «Otorgar acceso»).
+    """
 
     def __init__(self, camera_name: str, users: List[dict], parent=None):
         super().__init__(parent)
@@ -103,6 +143,9 @@ class GrantPermissionDialog(QDialog):
         """)
 
     def get_data(self) -> tuple[int, dict]:
+        """Devuelve (user_id, flags) con las capacidades marcadas (can_view,
+        can_control_ptz/leds/audio, can_download_recordings). Llamado por
+        `PermissionsView._grant` al aceptar."""
         return self.cmb_user.currentData(), {
             "can_view": self.chk_view.isChecked(),
             "can_control_ptz": self.chk_ptz.isChecked(),
@@ -113,6 +156,25 @@ class GrantPermissionDialog(QDialog):
 
 
 class PermissionsView(QWidget):
+    """Vista de gestión de permisos por cámara (solo admin; autorización #2).
+
+    RESPONSABILIDAD / ROL
+        Página del content_stack que edita las filas UserCameraPermission:
+        selecciona cámara → ve/otorga/revoca accesos de usuarios sobre ella.
+
+    QUIÉN LA INSTANCIA
+        main_window (índice VIEW_PERMISSIONS=8). Recibe el rol vía
+        `set_current_user` (deshabilita la vista si no es admin).
+
+    SEÑALES QT
+        No define señales propias. Reacciona a la selección de la lista de
+        cámaras y de la tabla; I/O por callbacks async del api_client.
+
+    ESTADO
+        _cameras / _users: cachés de la API. _current_camera_id: cámara
+        seleccionada. _is_admin: gating de las acciones.
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._cameras: List[dict] = []
@@ -216,6 +278,8 @@ class PermissionsView(QWidget):
         layout.addWidget(splitter, 1)
 
     def set_current_user(self, _user_id: int, role: str):
+        """Aplica el rol: si es admin, habilita y refresca; si no, muestra el
+        aviso y bloquea. Llamado por MainWindow tras el login."""
         self._is_admin = (role == "admin")
         if not self._is_admin:
             self.lbl_warn.setVisible(True)
@@ -226,6 +290,8 @@ class PermissionsView(QWidget):
             self.refresh()
 
     def refresh(self):
+        """Recarga cámaras (panel izq.) y usuarios (para otorgar) en paralelo.
+        Llamado por: `set_current_user` (si admin) y el botón «Refrescar»."""
         # Cargar cámaras y usuarios en paralelo
         def on_cameras(response):
             if response.success:
@@ -288,6 +354,11 @@ class PermissionsView(QWidget):
         self.btn_revoke.setEnabled(bool(rows) and self._is_admin)
 
     def _grant(self):
+        """Otorga/actualiza permisos de un usuario sobre la cámara actual.
+
+        Abre GrantPermissionDialog y, al aceptar, hace POST a
+        permissions/camera/{cam}/user/{user} con los flags. Recarga la tabla al
+        terminar. Llamado por: botón «Otorgar acceso»."""
         if self._current_camera_id is None:
             return
         if not self._users:
@@ -317,6 +388,10 @@ class PermissionsView(QWidget):
         )
 
     def _revoke(self):
+        """Revoca TODOS los permisos del usuario seleccionado sobre la cámara.
+
+        Pide confirmación y hace DELETE permissions/camera/{cam}/user/{user};
+        recarga la tabla. Llamado por: botón «Revocar»."""
         rows = self.table.selectionModel().selectedRows()
         if not rows or self._current_camera_id is None:
             return

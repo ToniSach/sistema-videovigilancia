@@ -1,9 +1,26 @@
 """
-Heurísticas para el alta de cámaras:
-  - sugerir si una cámara es dual-lens (a partir de resolución / modelo),
-  - autocompletar URLs RTSP y ONVIF a partir de la IP.
+================================================================================
+MÓDULO: camera_heuristics — Heurísticas para el alta de cámaras
+================================================================================
 
-Son SUGERENCIAS: el usuario siempre puede corregirlas en el formulario de alta.
+PROPÓSITO
+    Acelerar el ALTA de cámaras con sugerencias automáticas (NO decisiones):
+      - suggest_dual_lens(): adivinar si una cámara es de doble lente a partir
+        de su resolución/modelo (las dual-lens combinan dos sensores en un solo
+        frame con aspect ratio atípico ~3:2).
+      - build_default_urls(): autocompletar las URLs RTSP y ONVIF a partir de la
+        IP, en el formato típico de las cámaras del proyecto (XiongMai/iCSee).
+
+RESPONSABILIDAD
+    Son SUGERENCIAS puras (funciones sin estado ni I/O): el usuario SIEMPRE
+    puede corregirlas en el formulario de alta. No hablan ONVIF ni tocan BD.
+
+DEPENDENCIAS: ninguna (solo stdlib).
+QUIÉN LO CONSUME: la capa de servicio/rutas de alta de cámaras, para
+    prerellenar el formulario antes de que el usuario confirme.
+PIPELINE: #7 ONVIF (apoyo al alta; el resultado final entra en #1/#3 vía
+    CameraManager + go2rtc).
+================================================================================
 """
 from __future__ import annotations
 

@@ -1,0 +1,1 @@
+"""Paquete `infrastructure` — servicios transversales de observabilidad (métricas de salud + telemetría a disco). No pertenece a un pipeline concreto; arranca en el Pipeline #1 (Inicio) y da soporte al monitoreo de todos los demás."""

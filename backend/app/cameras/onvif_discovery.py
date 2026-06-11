@@ -1,3 +1,55 @@
+"""
+================================================================================
+MÓDULO: onvif_discovery — Descubrimiento de cámaras ONVIF/RTSP en la LAN
+================================================================================
+
+PROPÓSITO
+    Encontrar automáticamente cámaras IP en la red local y devolver, por cada
+    una, un dict listo para dar de alta (IP, RTSP, ONVIF, credenciales,
+    capacidades). Combina TRES estrategias en cascada:
+      1) WS-Discovery (multicast) — el mecanismo estándar de ONVIF.
+      2) Escaneo de subred /24 — fallback cuando el multicast lo bloquea el
+         firewall (típico en Windows).
+      3) RTSP fallback — para cámaras baratas que SOLO exponen RTSP, sin ONVIF.
+
+QUÉ ES ONVIF (contexto)
+    ONVIF es el estándar de interoperabilidad de cámaras IP. Define operaciones
+    SOAP 1.2 sobre HTTP, autenticadas con WS-Security UsernameToken. El
+    DESCUBRIMIENTO usa WS-Discovery: el host envía un "Probe" multicast a
+    239.255.255.250:3702 y las cámaras responden con un "ProbeMatch" que incluye
+    sus XAddrs (URLs del device_service). A partir de ahí se consultan
+    capacidades, perfiles y la URL RTSP (GetStreamUri).
+
+INCOMPATIBILIDADES TÍPICAS
+    - Cámaras XiongMai/iCSee y similares no exponen ONVIF en :80 sino en
+      :8000/:8899, y a veces NO responden a WS-Discovery → por eso el subnet
+      scan y el RTSP fallback.
+    - Algunas anuncian por WS-Discovery una IP estática de OTRA subred (no
+      enrutable desde el host) → se filtran con un pre-check TCP (_is_reachable).
+
+RESPONSABILIDAD
+    `ONVIFDiscovery.discover()` es el punto de entrada; `probe_single_ip()`
+    prueba una IP concreta (con o sin credenciales) para el alta manual.
+
+DEPENDENCIAS
+    wsdiscovery .......... WS-Discovery multicast (ThreadedWSDiscovery).
+    onvif (onvif-zeep) ... SLOW PATH: cliente ONVIF basado en WSDL.
+    .onvif_soap .......... FAST PATH: cliente SOAP directo (sin WSDL).
+    ifaddr ............... enumerar interfaces locales para el subnet scan.
+
+PIPELINE
+    #7 ONVIF — etapa de descubrimiento. Su salida alimenta el alta de cámaras
+    (CameraService.add_camera), que luego entra en el pipeline #1/#3 vía
+    CameraManager + go2rtc.
+
+FAST PATH vs SLOW PATH (clave de rendimiento)
+    Por cada IP se intenta primero el cliente SOAP directo de onvif_soap
+    (rápido, sin WSDL, cubre ~95% de cámaras). Solo si falla y NO es modo quick
+    se cae al cliente onvif-zeep (carga WSDL, mucho más lento). En subnet scan y
+    en probe con credenciales explícitas el SLOW PATH suele estar deshabilitado
+    para no bloquear el request HTTP del cliente desktop.
+================================================================================
+"""
 import logging
 import socket
 import re
@@ -160,6 +212,25 @@ class ONVIFProfile:
 
 
 class RobustONVIFClient:
+    """
+    Cliente ONVIF del SLOW PATH, basado en onvif-zeep (carga WSDL local).
+
+    ROL
+        Envoltorio "robusto" sobre onvif-zeep que prueba HTTP Basic Auth y, si
+        falla, UsernameToken (WS-Security). Expone helpers de alto nivel:
+        get_profiles() (GetProfiles), get_stream_url() (GetStreamUri),
+        get_device_info() (GetDeviceInformation), has_ptz()/has_audio().
+
+    CUÁNDO SE USA
+        Solo en el SLOW PATH de ONVIFDiscovery (cuando el FAST PATH SOAP de
+        onvif_soap no resolvió la cámara y el caller permite el camino lento).
+        Es más lento porque onvif-zeep construye el árbol WSDL completo.
+
+    SERVICIOS ONVIF QUE TOCA
+        device_service (GetCapabilities/GetDeviceInformation), media (GetProfiles/
+        GetStreamUri), ptz (GetStatus para detectar soporte PTZ).
+    """
+
     def __init__(self, ip: str, port: int, user: str, pwd: str):
         self.ip = ip
         self.port = port
@@ -221,6 +292,17 @@ class RobustONVIFClient:
             return False
 
     def get_profiles(self) -> List[ONVIFProfile]:
+        """
+        Obtiene los perfiles de medios de la cámara. (ONVIF media service.)
+
+        Solicitud SOAP: GetProfiles (sin parámetros).
+        Respuesta esperada: lista de Profiles; de cada uno se leen
+            VideoEncoderConfiguration (encoding, resolución, fps, bitrate→quality).
+        Servicio ONVIF: media.
+        Outputs: lista de ONVIFProfile válidos (descarta perfiles sin video
+            encoder o con encoding no soportado).
+        Llamado por: _try_onvif_robust*/probe_single_ip (SLOW PATH).
+        """
         if not self._media:
             return []
         try:
@@ -299,6 +381,17 @@ class RobustONVIFClient:
         return selected
 
     def get_stream_url(self, profile_token: str) -> Optional[str]:
+        """
+        Resuelve la URL RTSP de un perfil. (Provee URLs al pipeline #3 Live.)
+
+        Solicitud SOAP: GetStreamUri con StreamSetup={Stream: RTP-Unicast,
+            Transport.Protocol: RTSP} y el ProfileToken indicado.
+        Respuesta esperada: <Uri> con la URL rtsp://... del stream.
+        Servicio ONVIF: media.
+        Detalle: si la URL no trae credenciales (sin '@'), se inyectan
+            user:pwd codificados para que FFmpeg/go2rtc puedan autenticarse.
+        Outputs: URL RTSP (str) o None si falla.
+        """
         if not self._media:
             return None
         try:
@@ -357,6 +450,15 @@ class RobustONVIFClient:
             return False
 
     def has_ptz(self) -> bool:
+        """
+        Detecta si la cámara soporta PTZ. (Marca has_ptz en el alta → pipeline #8.)
+
+        Solicitud SOAP: GetStatus sobre el servicio PTZ con el ProfileToken del
+            primer perfil (si el servicio responde sin Fault, hay PTZ).
+        Respuesta esperada: PTZStatus (posición/estado de movimiento).
+        Servicio ONVIF: ptz (+ media para obtener el ProfileToken).
+        Outputs: True si el servicio PTZ respondió; False ante cualquier error.
+        """
         try:
             ptz = self._cam.create_ptz_service()
             media = self._cam.create_media_service()
@@ -369,6 +471,24 @@ class RobustONVIFClient:
 
 
 class ONVIFDiscovery:
+    """
+    Orquestador del descubrimiento de cámaras en la LAN. (Pipeline #7 ONVIF.)
+
+    ROL
+        Punto de entrada del descubrimiento. Coordina las tres estrategias
+        (WS-Discovery → subnet scan → RTSP fallback) y, por cada IP candidata,
+        intenta primero el FAST PATH SOAP (onvif_soap) y luego el SLOW PATH
+        (RobustONVIFClient/onvif-zeep). Devuelve dicts de cámara agregables.
+
+    QUIÉN LO CONSUME
+        api/routes/cameras.py (endpoint de descubrimiento) y el alta manual.
+        Su salida alimenta CameraService.add_camera.
+
+    MÉTODOS PÚBLICOS
+        discover() ........... descubrimiento completo (multicast + scan).
+        probe_single_ip() .... probar UNA IP concreta (alta manual).
+    """
+
     def __init__(self):
         self._wsd = WSDiscovery()
 
@@ -734,7 +854,17 @@ class ONVIFDiscovery:
 
     def probe_single_ip(self, ip: str, username: str = None, password: str = None) -> Optional[Dict]:
         """
-        Prueba una IP específica. Si se proporcionan username/password, los usa primero.
+        Prueba una IP específica para el alta manual. (Pipeline #7 ONVIF.)
+
+        Estrategia: si hay credenciales explícitas, las prueba primero (FAST
+        PATH SOAP); si no, itera credenciales comunes; como último recurso cae
+        a RTSP fallback.
+
+        Inputs:  ip; username/password opcionales.
+        Outputs: dict de cámara agregable (IP, RTSP, ONVIF, capacidades) o None.
+        Llamado por: rutas de alta manual de cámara.
+        Llama a: _try_onvif_robust_with_creds(), _try_onvif_robust(),
+            _try_rtsp_fallback().
         """
         # Si hay credenciales específicas, probarlas primero
         if username and password:

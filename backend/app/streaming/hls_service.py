@@ -1,4 +1,37 @@
 # backend/app/streaming/hls_service.py
+"""
+================================================================================
+MÓDULO: hls_service — Conversión MP4 → HLS de GRABACIONES (LEGACY / EN DESUSO)
+================================================================================
+
+ESTADO: LEGACY / EN DESUSO
+    Servicio que transcodeaba grabaciones MP4 a HLS (segmentos .ts + manifiesto
+    .m3u8) para reproducirlas en navegador/móvil. Hoy está EN DESUSO:
+      - El DIRECTO se sirve por go2rtc (WebRTC/RTSP/HLS), no por aquí
+        (ver go2rtc_manager.hls_url para el HLS de directo).
+      - La REPRODUCCIÓN de grabaciones (pipeline #14) usa los MP4 directamente.
+    No construir nuevas rutas sobre este módulo; se conserva como respaldo.
+
+PROPÓSITO (cuando estaba activo)
+    Dado un recording_id + ruta MP4, generar (de forma asíncrona y cacheada) un
+    HLS reproducible por HTTP, sirviendo manifiesto y segmentos bajo demanda.
+
+RESPONSABILIDAD
+    - Cachear conversiones en RECORDINGS_PATH/hls_cache/<recording_id>/.
+    - Limitar la concurrencia de conversiones (semáforo) y la repetición
+      (no reconvertir si el manifiesto está fresco).
+    - Limpiar el caché periódicamente (TTL).
+
+PIPELINES (histórico)
+    #12 Clips / #14 Reproducción — entrega HLS de grabaciones, hoy reemplazado
+    por la reproducción directa de MP4.
+
+DEPENDENCIAS
+    config.settings.RECORDINGS_PATH — raíz del caché HLS.
+    core.executor.global_executor — encola la conversión fuera del hilo HTTP.
+    ffmpeg (PATH) — realiza el remux MP4→HLS (-c copy, sin recodificar).
+================================================================================
+"""
 import os
 import time
 import shutil
@@ -14,6 +47,18 @@ logger = logging.getLogger(__name__)
 
 
 class HLSService:
+    """Servicio de conversión MP4→HLS de grabaciones (LEGACY — ver módulo).
+
+    ROL (histórico): cachea y sirve HLS de grabaciones bajo demanda. Singleton
+    de conveniencia (`hls_service` al final). Mantiene un hilo de limpieza del
+    caché y un semáforo que acota las conversiones ffmpeg concurrentes.
+
+    Constantes:
+      SEGMENT_DURATION ........... duración de cada segmento .ts (s).
+      MAX_CONCURRENT_CONVERSIONS . tope de conversiones ffmpeg simultáneas.
+      CACHE_TTL_SECONDS .......... frescura del manifiesto antes de regenerar.
+    """
+
     SEGMENT_DURATION = 4
     MAX_CONCURRENT_CONVERSIONS = 2
     CACHE_TTL_SECONDS = 3600
@@ -32,6 +77,13 @@ class HLSService:
         self._cleanup_thread.start()
 
     def get_hls_manifest(self, recording_id: int, mp4_path: str) -> Optional[str]:
+        """Devuelve la ruta del manifiesto HLS si está listo, o None si se encola.
+
+        Si el manifiesto cacheado está fresco, lo devuelve de inmediato. Si no,
+        encola la conversión en el executor global y devuelve None (el cliente
+        reintenta) — patrón no bloqueante. None también si falta ffmpeg/MP4.
+        Inputs: recording_id, mp4_path. Llama a: _convert_to_hls (async).
+        """
         if not self._ffmpeg_path or not os.path.exists(mp4_path):
             return None
 
@@ -88,6 +140,11 @@ class HLSService:
                     self._active_conversions.pop(recording_id, None)
 
     def get_segment(self, recording_id: int, segment_name: str) -> Optional[str]:
+        """Devuelve la ruta de un segmento .ts del caché, o None si no es válido.
+
+        Valida el nombre contra path traversal (rechaza "..", "/" y extensiones
+        que no sean .ts) antes de resolver la ruta. None si el segmento no existe.
+        """
         if ".." in segment_name or "/" in segment_name or not segment_name.endswith(".ts"):
             return None
         segment_path = os.path.join(self._cache_dir, str(recording_id), segment_name)

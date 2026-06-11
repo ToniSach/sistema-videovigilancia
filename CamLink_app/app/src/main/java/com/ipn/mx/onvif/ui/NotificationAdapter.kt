@@ -1,3 +1,34 @@
+/*
+ * ============================================================================
+ * MÓDULO: NotificationAdapter — adaptador RecyclerView del historial de alertas
+ *         (Pipeline #13 Notificaciones, lado móvil)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Renderizar la lista de eventos (NotificationItem) del panel de notificaciones:
+ *   título, subtítulo (cámara + "hace X" + confianza), icono por tipo y el punto
+ *   de "no leído". Soporta inserción de eventos en vivo desde el WebSocket.
+ *
+ * RESPONSABILIDAD
+ *   - Mantener la lista mutable de items y notificar cambios al RecyclerView.
+ *   - Calcular la condición de "no leído" comparando created_at de cada item con
+ *     lastSeenTimestampMs.
+ *   - Formatear textos (título/subtítulo/tiempo-relativo) e iconos por event_type.
+ *   - Parsear created_at ISO (con o sin milisegundos, UTC) a epoch ms.
+ *
+ * DEPENDENCIAS
+ *   - model/NotificationItem (DTO de la fila), R.layout.item_notification.
+ *
+ * COMPONENTES RELACIONADOS
+ *   - ui/NotificationsPanelFragment (lo crea, le pasa datos y el callback onClick).
+ *
+ * PUNTO DE ENTRADA
+ *   Constructor con callback onClick; usado por el RecyclerView del panel.
+ *
+ * PIPELINE(S)
+ *   #13 Notificaciones — presentación de la lista.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.view.LayoutInflater
@@ -19,6 +50,9 @@ import kotlin.math.abs
  * historial (o uno entrante en vivo). Click → callback para navegar a la
  * cámara correspondiente. La unread-ness se calcula contra
  * [lastSeenTimestampMs]: cualquier item con `created_at` posterior se marca.
+ *
+ * @property onClick callback invocado al pulsar una fila (navega al playback del
+ *           evento). Quién lo instancia: NotificationsPanelFragment.
  */
 class NotificationAdapter(
     private val onClick: (NotificationItem) -> Unit,
@@ -35,6 +69,11 @@ class NotificationAdapter(
         timeZone = TimeZone.getTimeZone("UTC")
     }
 
+    /**
+     * Reemplaza por completo la lista (resultado de un fetch de historial).
+     * @param newItems items recibidos del backend, ya filtrados.
+     * Llamado por: NotificationsPanelFragment.loadHistory.
+     */
     fun submitList(newItems: List<NotificationItem>) {
         val oldSize = items.size
         items.clear()
@@ -43,7 +82,12 @@ class NotificationAdapter(
         if (newItems.isNotEmpty()) notifyItemRangeInserted(0, newItems.size)
     }
 
-    /** Inserta un item nuevo al inicio (notificación en vivo desde WS). */
+    /**
+     * Inserta un item nuevo al inicio (notificación en vivo recibida por WS).
+     * Evita duplicados si la API ya lo había traído (mismo id).
+     * @param item evento entrante. Llamado por: el receiver de eventos en vivo del
+     *        NotificationsPanelFragment.
+     */
     fun prependLive(item: NotificationItem) {
         // Evitar duplicados si la API ya lo trajo
         if (items.any { it.id == item.id }) return
@@ -51,6 +95,12 @@ class NotificationAdapter(
         notifyItemInserted(0)
     }
 
+    /**
+     * Fija la marca temporal de "última vez visto" (recalcula los puntos de no
+     * leído al re-bindear las filas visibles).
+     * @param timestampMs epoch ms del último item considerado leído.
+     * Llamado por: NotificationsPanelFragment (init del badge y markLatestAsSeen).
+     */
     fun setLastSeen(timestampMs: Long) {
         if (timestampMs == lastSeenMs) return
         lastSeenMs = timestampMs
@@ -59,8 +109,10 @@ class NotificationAdapter(
         if (items.isNotEmpty()) notifyItemRangeChanged(0, items.size)
     }
 
+    /** @return nº de items con timestamp posterior a lastSeenMs (no leídos). */
     fun unreadCount(): Int = items.count { itemTimestampMs(it) > lastSeenMs }
 
+    /** @return el timestamp (epoch ms) del item más reciente, o 0 si lista vacía. */
     fun newestTimestampMs(): Long =
         items.maxOfOrNull { itemTimestampMs(it) } ?: 0L
 
@@ -125,6 +177,10 @@ class NotificationAdapter(
         }
     }
 
+    /**
+     * Parsea created_at (ISO UTC, con o sin milisegundos, con o sin "Z") a epoch ms.
+     * @return epoch ms o 0 si no se pudo parsear. Usado para ordenar/no-leído/tiempo.
+     */
     private fun itemTimestampMs(it: NotificationItem): Long {
         val raw = it.createdAt.trim().removeSuffix("Z")
         // El backend serializa con o sin millis según el caso

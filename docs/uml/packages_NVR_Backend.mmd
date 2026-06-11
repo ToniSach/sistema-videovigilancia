@@ -1,0 +1,216 @@
+classDiagram
+  class app {
+  }
+  class api {
+  }
+  class helpers {
+  }
+  class middleware {
+  }
+  class audit {
+  }
+  class rate_limiter {
+  }
+  class routes {
+  }
+  class ai {
+  }
+  class auth {
+  }
+  class cameras {
+  }
+  class devices {
+  }
+  class events {
+  }
+  class metrics {
+  }
+  class mobile {
+  }
+  class notifications {
+  }
+  class permissions {
+  }
+  class qr {
+  }
+  class recordings {
+  }
+  class storage {
+  }
+  class system {
+  }
+  class telegram_link {
+  }
+  class users {
+  }
+  class ws {
+  }
+  class cameras {
+  }
+  class audio_controller {
+  }
+  class camera_heuristics {
+  }
+  class camera_manager {
+  }
+  class led_controller {
+  }
+  class onvif_common {
+  }
+  class onvif_discovery {
+  }
+  class onvif_soap {
+  }
+  class ptz_controller {
+  }
+  class time_sync {
+  }
+  class config {
+  }
+  class container {
+  }
+  class core {
+  }
+  class executor {
+  }
+  class hardware_detector {
+  }
+  class jwt_blocklist {
+  }
+  class qr_generator {
+  }
+  class security {
+  }
+  class database {
+  }
+  class connection {
+  }
+  class models {
+  }
+  class repositories {
+  }
+  class base_repository {
+  }
+  class camera_repository {
+  }
+  class event_repository {
+  }
+  class recording_repository {
+  }
+  class events {
+  }
+  class event_manager {
+  }
+  class infrastructure {
+  }
+  class metrics {
+  }
+  class collector {
+  }
+  class telemetry {
+  }
+  class main {
+  }
+  class notifications {
+  }
+  class telegram_bot_poller {
+  }
+  class telegram_notifier {
+  }
+  class ws_broker {
+  }
+  class processing {
+  }
+  class ai {
+  }
+  class ai_frame_source {
+  }
+  class ai_scheduler {
+  }
+  class model_pool {
+  }
+  class motion {
+  }
+  class motion_detector {
+  }
+  class recording {
+  }
+  class recording_manager {
+  }
+  class storage_manager {
+  }
+  class services {
+  }
+  class ai_service {
+  }
+  class auth_service {
+  }
+  class camera_service {
+  }
+  class device_service {
+  }
+  class event_service {
+  }
+  class notification_preference_service {
+  }
+  class notification_router {
+  }
+  class permission_service {
+  }
+  class ptz_lock_service {
+  }
+  class qr_service {
+  }
+  class signed_url_service {
+  }
+  class telegram_link_service {
+  }
+  class user_service {
+  }
+  class storage {
+  }
+  class consistency_checker {
+  }
+  class streaming {
+  }
+  class frame_buffer {
+  }
+  class go2rtc_manager {
+  }
+  class hls_service {
+  }
+  class stream_keepalive {
+  }
+  class webrtc_signaling {
+  }
+  class utils {
+  }
+  class image_optimizer {
+  }
+  class workers {
+  }
+  class ffmpeg_worker {
+  }
+  system --> cameras
+  cameras --> audio_controller
+  cameras --> led_controller
+  cameras --> ptz_controller
+  audio_controller --> onvif_common
+  camera_manager --> ptz_controller
+  led_controller --> onvif_common
+  onvif_discovery --> onvif_soap
+  ptz_controller --> onvif_common
+  time_sync --> onvif_common
+  camera_repository --> base_repository
+  event_repository --> base_repository
+  recording_repository --> base_repository
+  events --> event_manager
+  notifications --> telegram_notifier
+  ai --> ai_frame_source
+  ai --> ai_scheduler
+  ai_scheduler --> model_pool
+  motion --> motion_detector
+  recording --> recording_manager
+  recording --> storage_manager
+  stream_keepalive --> go2rtc_manager
+  webrtc_signaling --> go2rtc_manager

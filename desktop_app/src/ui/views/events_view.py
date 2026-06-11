@@ -1,9 +1,46 @@
 """
-Vista de Eventos/Alarmas — corazón de un NVR comercial.
+================================================================================
+MÓDULO: ui.views.events_view — Lista de eventos/alarmas con snapshots
+================================================================================
 
-Lista todos los eventos detectados (persona, vehículo, movimiento, etc.) con
-filtros por cámara/tipo/período, snapshot embebido, reconocer eventos, y
-auto-refresh cada 5s para que el operador vea alertas en tiempo real.
+PROPÓSITO
+    Pantalla central de eventos/alarmas del NVR. Lista todos los eventos
+    detectados por el backend (persona, vehículo, movimiento, cámara offline…)
+    con filtros (cámara/tipo/período/solo sin revisar), DOS modos de
+    visualización (tabla "Lista" y "Galería" de miniaturas), panel de detalle
+    con el snapshot del evento, acciones de "reconocer" (acknowledge) y
+    auto-refresh periódico para que el operador vea alertas casi en tiempo real.
+
+RESPONSABILIDAD
+    - Cargar eventos y cámaras del backend y poblar tabla/galería.
+    - Descargar los snapshots en HILOS de fondo (sin congelar la UI), tanto el
+      grande del detalle como las miniaturas de la galería (cola secuencial para
+      no saturar el backend), con cache de miniaturas.
+    - Marcar eventos como revisados (individual o "Marcar todos").
+    - Saltar de un evento a su reproducción exacta emitiendo `jump_to_playback`.
+
+DEPENDENCIAS (endpoints que consume)
+    - GET   /cameras/                       → nombres para el filtro/columna.
+    - GET   /events/?hours=&limit=&...      → lista de eventos (vía api_client).
+    - GET   /events/{id}/snapshot           → imagen del evento (vía requests
+                                              directo en SnapshotLoaderThread, con
+                                              JWT, porque corre fuera del hilo UI).
+    - PATCH /events/{id}/acknowledge        → marcar como revisado.
+
+COMPONENTES RELACIONADOS
+    - SnapshotLoaderThread (definido aquí): QThread que baja una imagen y la
+      emite como QPixmap.
+    - ui/components/glass_card.GlassCard , help_button.HelpButton, ui/icons.icon.
+
+PUNTO DE ENTRADA
+    La instancia MainWindow._create_main_view (índice VIEW_EVENTS=2). MainWindow
+    conecta su señal `jump_to_playback` a `_on_jump_to_playback` (cambia a la
+    vista de reproducción y hace seek al instante del evento).
+
+PIPELINE(S)
+    #10 Eventos (consumo/visualización de los eventos que el backend persiste y
+    publica; esta vista no genera eventos, solo los lista y los reconoce).
+================================================================================
 """
 import logging
 from datetime import datetime
@@ -37,7 +74,24 @@ EVENT_TYPES = {
 
 
 class SnapshotLoaderThread(QThread):
-    """Descarga el snapshot del evento en background."""
+    """
+    Hilo de descarga de un snapshot de evento (no bloquea la UI).
+
+    RESPONSABILIDAD / ROL
+        Bajar la imagen de GET /events/{id}/snapshot con requests + JWT (fuera
+        del hilo de UI), decodificarla y emitirla como QPixmap. Se reutiliza
+        tanto para el snapshot grande del detalle como para las miniaturas de la
+        galería.
+
+    SEÑALES QT
+        - loaded(int event_id, QPixmap): imagen lista.
+        - failed(int event_id, str): error (HTTP, decodificación, red).
+
+    NOTA
+        Sobrescribe run() (sin event loop): por eso EventsView NO usa quit()/
+        wait() para cancelarlo; deja terminar los hilos en vuelo y descarta sus
+        resultados si ya no corresponden al evento seleccionado.
+    """
     loaded = Signal(int, QPixmap)  # event_id, pixmap
     failed = Signal(int, str)
 
@@ -67,7 +121,39 @@ class SnapshotLoaderThread(QThread):
 
 
 class EventsView(QWidget):
-    """Vista central de eventos del NVR."""
+    """
+    Vista central de eventos/alarmas: tabla + galería + detalle.
+
+    RESPONSABILIDAD / ROL
+        Listar, filtrar, visualizar (lista/galería) y reconocer eventos, y
+        permitir saltar a su reproducción. Coordina la descarga asíncrona de
+        snapshots/miniaturas con cache.
+
+    QUIÉN LA INSTANCIA
+        MainWindow._create_main_view (índice VIEW_EVENTS=2).
+
+    SEÑALES QT
+        - EMITE `jump_to_playback(int camera_id, datetime timestamp)`: ver un
+          evento en la reproducción exacta. La escucha MainWindow →
+          `_on_jump_to_playback`.
+        No escucha señales externas.
+
+    ESTADO
+        - `_events` / `_cameras`: datos cargados del backend.
+        - `_view_mode`: "list" | "gallery".
+        - `_snapshot_threads`: hilos de snapshot en vuelo (se conservan para que
+          el GC no los destruya mientras corren).
+        - `_thumb_queue` / `_thumb_worker` / `_thumb_cache`: cola+cache de
+          miniaturas de la galería (carga secuencial).
+
+    TIMERS
+        - `_refresh_timer` (10s): auto-refresh silencioso (conserva la selección);
+          se pausa en `hideEvent`.
+
+    DEPENDENCIAS
+        api_client (GET /cameras/, GET /events/, PATCH acknowledge),
+        SnapshotLoaderThread (GET /events/{id}/snapshot), GlassCard/HelpButton.
+    """
 
     # Señal emitida cuando el usuario hace doble-click en un evento que tiene
     # video asociado, para saltar al playback en ese momento.
@@ -178,7 +264,7 @@ class EventsView(QWidget):
         f_layout.addWidget(self.btn_view_list)
         f_layout.addWidget(self.btn_view_gallery)
 
-        self.lbl_auto = QLabel("Auto-refresh: ON")
+        self.lbl_auto = QLabel("Auto-actualización: activada")
         self.lbl_auto.setStyleSheet(f"color: {config.THEME_ACCENT}; font-size: 11px;")
         f_layout.addWidget(self.lbl_auto)
         layout.addWidget(filters)
@@ -327,6 +413,12 @@ class EventsView(QWidget):
         QTimer.singleShot(400, self._load_events)
 
     def _load_events(self):
+        """Pide los eventos al backend aplicando los filtros activos.
+
+        Propósito: construir los params (horas, límite, cámara, tipo) y traer la
+        lista; al volver, repuebla tabla (y galería si toca). Async (callback en
+        hilo UI). Llamado por: filtros, botón Refrescar, `_silent_refresh`,
+        carga inicial. Llama a: GET /events/ → `_populate_table`."""
         params = {"hours": self.spin_hours.value(), "limit": 200}
         cam = self.cmb_camera.currentData()
         if cam is not None:
@@ -359,6 +451,13 @@ class EventsView(QWidget):
         return self._events
 
     def _populate_table(self):
+        """Repinta la tabla de eventos desde `_events` (aplicando el filtro).
+
+        Propósito: una fila por evento (hora, cámara, tipo coloreado, confianza,
+        estado), resaltando los no revisados, actualizando el contador y
+        restaurando la selección pendiente; si la galería está activa, también la
+        repuebla. Llamado por: `_load_events` (callback), filtro "solo sin
+        revisar". Llama a: `_visible_events`, `_populate_gallery`."""
         self.table.setRowCount(0)
         for ev in self._visible_events():
             r = self.table.rowCount()
@@ -518,6 +617,13 @@ class EventsView(QWidget):
     # Detalle de evento seleccionado
     # ------------------------------------------------------------------
     def _on_select(self):
+        """Slot de selección en la tabla: pinta el detalle del evento.
+
+        Propósito: volcar metadatos (ID/tipo/cámara/confianza + extras) en el
+        panel, habilitar "Marcar revisado"/"Ver en Playback" y disparar la
+        descarga del snapshot grande. Llamado por:
+        `table.itemSelectionChanged` (y la galería sincroniza vía
+        `_on_gallery_select`). Llama a: `_load_snapshot`."""
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             self.lbl_snapshot.setText("Selecciona un evento")
@@ -611,6 +717,10 @@ class EventsView(QWidget):
     # Acciones
     # ------------------------------------------------------------------
     def _acknowledge_selected(self):
+        """Marca el evento seleccionado como revisado.
+
+        Llamado por: botón "Marcar como revisado". Llama a:
+        PATCH /events/{id}/acknowledge → `_load_events`."""
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             return
@@ -653,6 +763,11 @@ class EventsView(QWidget):
         self._jump_selected()
 
     def _jump_selected(self):
+        """Salta a la reproducción del evento seleccionado en su instante exacto.
+
+        Propósito: resolver cámara + timestamp del evento y pedir a MainWindow que
+        abra la reproducción ahí. Señales: EMITE `jump_to_playback(camera_id, dt)`.
+        Llamado por: botón "Ver en Playback" y doble clic en tabla/galería."""
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             return
@@ -677,10 +792,10 @@ class EventsView(QWidget):
     def showEvent(self, event):
         if not self._refresh_timer.isActive():
             self._refresh_timer.start(10000)
-        self.lbl_auto.setText("Auto-refresh: ON")
+        self.lbl_auto.setText("Auto-actualización: activada")
         super().showEvent(event)
 
     def hideEvent(self, event):
         self._refresh_timer.stop()
-        self.lbl_auto.setText("Auto-refresh: OFF")
+        self.lbl_auto.setText("Auto-actualización: desactivada")
         super().hideEvent(event)

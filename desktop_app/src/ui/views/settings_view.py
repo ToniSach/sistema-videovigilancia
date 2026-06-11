@@ -1,6 +1,47 @@
 # desktop_app/src/ui/views/settings_view.py
 """
-Vista de configuración del sistema.
+================================================================================
+MÓDULO: ui.views.settings_view — Ajustes del sistema (almacenamiento, IA, Telegram)
+================================================================================
+
+PROPÓSITO
+    Pantalla de configuración global del sistema (solo admin en la práctica),
+    organizada en pestañas: General (IA), Notificaciones (estado de Telegram +
+    atajo) y Almacenamiento (ruta de grabaciones, límites, limpieza). Lee y
+    escribe la configuración persistida en el backend (`SystemConfig` clave→valor)
+    y la ruta real de grabaciones en disco.
+
+RESPONSABILIDAD
+    - Cargar la config actual al mostrarse (showEvent → `_load_settings`).
+    - Editar y GUARDAR ajustes: el grueso va a SystemConfig (clave→valor); la
+      ruta de grabaciones usa un endpoint dedicado que mueve el path en disco.
+    - Seguimiento de "cambios sin guardar" (dirty tracking) con barra pegajosa
+      de acciones (Guardar / Descartar).
+    - Almacenamiento: mostrar uso de disco, cambiar carpeta y lanzar limpieza
+      manual.
+    - Telegram: solo mostrar el estado del bot y enviar a Notificaciones (la
+      vinculación NO se hace aquí; es por código en notifications_view).
+
+DEPENDENCIAS (endpoints consumidos)
+    - GET  system/config ......... configuración actual (key→value).
+    - PUT  system/config ......... guarda los ajustes (strings).
+    - GET  storage/info .......... uso de disco (usado/total/%).
+    - POST storage/config ........ fija la ruta real de grabaciones en disco.
+    - POST storage/cleanup ....... limpieza manual de grabaciones antiguas.
+    - GET  telegram/bot-info ..... estado del bot (banner informativo).
+
+COMPONENTES RELACIONADOS
+    main_window la instancia (índice VIEW_SETTINGS=9) — su import es opcional
+    (SETTINGS_AVAILABLE). Usa HelpButton, toast y QFileDialog. El primer arranque
+    también pregunta la carpeta de grabaciones desde MainWindow.
+
+PUNTO DE ENTRADA (en la app)
+    Sidebar «Ajustes» (solo admin) → MainWindow._switch_view(VIEW_SETTINGS).
+
+PIPELINE(S)
+    Transversal: alimenta almacenamiento (grabación), IA (umbral/modelo) y
+    enlaza con #13 Notificaciones (estado de Telegram).
+================================================================================
 """
 import logging
 from typing import Optional
@@ -21,8 +62,25 @@ logger = logging.getLogger(__name__)
 
 
 class SettingsView(QWidget):
-    """Vista de configuración general."""
-    
+    """Vista de ajustes del sistema (pestañas General / Notificaciones / Almacenamiento).
+
+    RESPONSABILIDAD / ROL
+        Página del content_stack que lee y persiste la configuración global del
+        sistema, con dirty-tracking y barra de acciones pegajosa.
+
+    QUIÉN LA INSTANCIA
+        main_window (índice VIEW_SETTINGS=9), import opcional. Carga sus datos de
+        forma perezosa en `showEvent` (necesita JWT, que no existe en __init__).
+
+    SEÑALES QT
+        No define señales propias. Conecta valueChanged/toggled/textEdited de
+        todos los controles a `_mark_dirty` para activar «Guardar».
+
+    ESTADO
+        _dirty / _loading: control de cambios sin guardar (evita marcar dirty
+        durante la propia carga).
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -354,10 +412,13 @@ class SettingsView(QWidget):
         self._clear_dirty()
 
     def _save_settings(self):
-        """
-        Guarda configuración en backend.
-        TODO se guarda en SystemConfig (clave→valor) vía PUT /system/config.
-        El path de almacenamiento usa POST /storage/config (path real en disco).
+        """Persiste todos los ajustes en el backend (acción «Guardar Cambios»).
+
+        Dos destinos: la ruta de grabaciones va a POST storage/config (mueve el
+        path real en disco) y el resto (límites de almacenamiento, umbral/modelo
+        de IA, snapshots) va a PUT system/config como SystemConfig (clave→valor,
+        strings). Al éxito limpia el estado dirty y refresca el uso de disco.
+        Llamado por: botón «Guardar Cambios».
         """
         # 1) Storage path → endpoint dedicado (modifica path real en disco)
         new_path = self.txt_storage_path.text().strip()
@@ -443,7 +504,10 @@ class SettingsView(QWidget):
             self.txt_storage_path.setText(path)
     
     def _cleanup_storage(self):
-        """Inicia limpieza manual."""
+        """Lanza la limpieza manual de grabaciones antiguas (POST storage/cleanup).
+
+        Pide confirmación, ejecuta la limpieza, informa de cuántos archivos se
+        borraron y refresca el uso de disco. Llamado por: botón «Limpiar Ahora»."""
         reply = QMessageBox.question(
             self,
             "Confirmar Limpieza",

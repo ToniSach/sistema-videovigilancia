@@ -1,0 +1,1 @@
+"""Paquete `streaming`: capa de medios del NVR. go2rtc (go2rtc_manager) es la ÚNICA fuente de directo (RTSP/WebRTC/HLS, -c copy); webrtc_signaling hace de proxy SDP; stream_keepalive mantiene calientes los streams. frame_buffer y hls_service son LEGACY (fuera del pipeline activo)."""

@@ -1,10 +1,42 @@
 """
-Audio bidireccional vía ONVIF + FFmpeg RTP.
+================================================================================
+MÓDULO: audio_controller — Audio bidireccional (escuchar / hablar) vía ONVIF+RTP
+================================================================================
 
-Reescrito para:
-- Multi-puerto ONVIF (80, 8000, 8080, 8899) + fallback WSSE.
-- Logs detallados (qué dispositivo de micrófono usa, qué codec, qué URL RTP).
-- AudioManager singleton para cachear controladores.
+PROPÓSITO
+    Audio de DOS sentidos con la cámara:
+      - ESCUCHAR (listen): reproducir en los altavoces locales el audio que
+        capta el micrófono de la cámara, leyéndolo del RTSP con ffplay.
+      - HABLAR (talk-back): enviar el micrófono local hacia el altavoz de la
+        cámara, transmitiendo por RTP (PCM A-law 8 kHz mono) con ffmpeg.
+
+    ONVIF se usa solo para DETECTAR capacidades (¿tiene micro? ¿tiene altavoz?)
+    consultando los perfiles; el transporte real del audio es FFmpeg/ffplay.
+
+QUÉ ROL JUEGA ONVIF AQUÍ
+    GetProfiles devuelve, por perfil, AudioEncoderConfiguration (= micro de la
+    cámara, para escuchar) y AudioOutputConfiguration (= altavoz, para hablar).
+    OJO: muchas cámaras NO anuncian su salida de audio aunque acepten el
+    backchannel → is_talk_supported() es best-effort (basta con que ONVIF
+    responda).
+
+RESPONSABILIDAD
+    - list_input_audio_devices(): enumerar micrófonos del SO (dshow/ALSA/
+      avfoundation) — necesario porque en Windows no existe un device genérico
+      "Microphone"; hay que pasar el nombre EXACTO a ffmpeg.
+    - AudioController: ciclo de vida de los procesos talk/listen por cámara.
+    - AudioManager: singleton que cachea controladores y los apaga en atexit
+      para no dejar ffplay/ffmpeg huérfanos sonando.
+
+DEPENDENCIAS: onvif-zeep (detección), .onvif_common, FFmpeg/ffplay en PATH.
+QUIÉN LO CONSUME: api/routes/cameras.py (endpoints de audio).
+PIPELINE: #7 ONVIF (detección de capacidades de audio).
+
+INCOMPATIBILIDADES TÍPICAS
+    - Cámaras que no anuncian AudioOutputConfiguration pero sí aceptan talk.
+    - Nombres de micrófono con caracteres no-ASCII en Windows: se decodifica la
+      salida de ffmpeg en UTF-8 para que coincidan con el device dshow.
+================================================================================
 """
 from __future__ import annotations
 
@@ -101,7 +133,18 @@ def list_input_audio_devices() -> list[str]:
 
 
 class AudioController:
-    """Stream de audio del micrófono local hacia la cámara (talk-back)."""
+    """
+    Ciclo de vida del audio bidireccional de UNA cámara. (Pipeline #7 ONVIF.)
+
+    ROL
+        Detecta por ONVIF si la cámara tiene micro/altavoz y gestiona los dos
+        procesos externos: el de talk (ffmpeg, atributo _process) y el de listen
+        (ffplay, atributo _listen_process). Ambos son de INSTANCIA (no de clase)
+        para que stop_talk/stop_listen actúen sobre el proceso correcto al
+        recrear el controller.
+
+    Cacheado por AudioManager. Lo consume api/routes/cameras.py.
+    """
 
     def __init__(self, camera: Camera):
         self._camera = camera
@@ -194,8 +237,18 @@ class AudioController:
 
     def start_talk(self, mic_device: Optional[str] = None) -> bool:
         """
-        Empieza a transmitir el micrófono local hacia la cámara vía RTP.
-        mic_device: nombre del dispositivo (Windows: 'Microphone'; Linux: 'default').
+        Inicia talk-back: micrófono local → altavoz de la cámara (RTP).
+
+        Lanza un ffmpeg que captura el micro del SO (dshow/ALSA/avfoundation),
+        lo recodifica a PCM A-law 8 kHz mono y lo envía por RTP a la cámara
+        (rtp://ip:5004). Auto-detecta el primer micrófono real si no se
+        especifica uno (en Windows "Microphone"/"default" no son devices dshow
+        válidos).
+
+        Inputs:  mic_device (nombre exacto del dispositivo; opcional → auto).
+        Outputs: True si el ffmpeg arrancó y sobrevivió 0.5s; False si no.
+        Excepciones: capturadas (FileNotFoundError si falta FFmpeg → False).
+        Llamado por: endpoint de audio "hablar".
         """
         if not self.is_talk_supported():
             logger.warning(
@@ -382,7 +435,18 @@ class AudioController:
 
 
 class AudioManager:
-    """Cache de AudioControllers por camera_id."""
+    """
+    SINGLETON que cachea un AudioController por camera_id. (Pipeline #7.)
+
+    ROL
+        Reusa SIEMPRE el controller que esté en uso (escuchando/hablando) para
+        que stop_listen/stop_talk actúen sobre el MISMO proceso que se inició
+        (si no, el ffplay/ffmpeg anterior quedaría huérfano sonando). stop_all()
+        se registra en atexit para apagar todo el audio al cerrar el backend.
+
+    Estado de proceso (procesos externos vivos) → debe ser único. Instancia
+    global expuesta como `audio_manager`. Lo consume api/routes/cameras.py.
+    """
     _instance: "Optional[AudioManager]" = None
     _instance_lock = threading.Lock()
 

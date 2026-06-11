@@ -1,13 +1,45 @@
 """
-Dashboard de inicio — pantalla de bienvenida con un resumen del sistema.
+================================================================================
+MÓDULO: ui.views.dashboard_view — Pantalla de inicio / panel de control
+================================================================================
 
-Lo que muestra de un vistazo (estilo apps comerciales tipo Reolink / UniFi):
-  - Saludo + fecha.
-  - Tarjetas KPI: cámaras activas, eventos hoy, salud (CPU/RAM/Disco), tiempo activo.
-  - Lista de últimos eventos (clic → Reproducción).
-  - Accesos rápidos a las secciones más usadas.
+PROPÓSITO
+    Primera pantalla tras el login (índice VIEW_DASHBOARD del content_stack):
+    un resumen "de un vistazo" del sistema, al estilo de apps comerciales
+    (Reolink / UniFi). Muestra:
+      - Saludo personalizado + fecha.
+      - Tarjetas KPI: cámaras activas, eventos hoy, carga del servidor
+        (CPU/RAM/Disco), tiempo activo.
+      - Lista de actividad reciente (últimos eventos; clic → Eventos).
+      - Accesos rápidos a las secciones más usadas (En vivo, Grabaciones,
+        Eventos, Cámaras).
 
-No introduce endpoints nuevos: reutiliza /system/health, /cameras/, /events/.
+RESPONSABILIDAD
+    - Sondear periódicamente (cada 8s mientras es visible) tres endpoints de
+      solo-lectura y volcar los datos en las tarjetas KPI / lista de eventos.
+    - NO navega por sí misma: emite señales `open_*` que MainWindow traduce en
+      cambios de página. Es una pantalla puramente informativa + lanzadera.
+
+DEPENDENCIAS (endpoints que consume vía api_client)
+    - GET /system/health  → KPIs de cámaras sanas, CPU/RAM/Disco, uptime.
+    - GET /events/?hours=24&limit=50 → eventos de hoy + sin revisar + actividad.
+    - GET /storage/info   → uso de disco y estimación de días restantes.
+    NO introduce endpoints nuevos (reutiliza los de otras vistas).
+
+COMPONENTES RELACIONADOS
+    - ui/components/glass_card.GlassCard : superficie de las tarjetas (y base de
+      la tarjeta KPI interna `_KpiCard`).
+    - ui/icons.icon : iconos de los botones de acceso rápido.
+
+PUNTO DE ENTRADA
+    La instancia MainWindow._create_main_view (import diferido). MainWindow
+    conecta sus 4 señales `open_*` a `_switch_view(...)` y llama a `set_user`
+    tras el login para personalizar el saludo.
+
+PIPELINE(S)
+    Transversal a #3 Live / #10 Eventos (solo como lanzadera de navegación);
+    no participa en la captura ni en el procesamiento, solo agrega métricas.
+================================================================================
 """
 import logging
 from datetime import datetime
@@ -24,6 +56,24 @@ from desktop_app.src.ui.components.glass_card import GlassCard
 from desktop_app.src.ui.icons import icon
 
 logger = logging.getLogger(__name__)
+
+# Nombres en español sin depender de `locale` (poco fiable en Windows).
+_DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+_MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+
+def _fecha_es(dt: datetime) -> str:
+    """Devuelve la fecha en español, p.ej. 'domingo, 07 de junio de 2026'."""
+    try:
+        dia = _DIAS_ES[dt.weekday()].capitalize()
+        mes = _MESES_ES[dt.month - 1]
+        return f"{dia}, {dt.day:02d} de {mes} de {dt.year}"
+    except Exception:
+        # Nunca debe romper el arranque del panel por un fallo de formato.
+        return dt.strftime("%d/%m/%Y")
 
 
 class _KpiCard(GlassCard):
@@ -64,7 +114,32 @@ class _KpiCard(GlassCard):
 
 
 class DashboardView(QWidget):
-    """Pantalla de inicio. Emite señales para que MainWindow navegue."""
+    """
+    Pantalla de inicio: resumen del sistema + lanzadera de navegación.
+
+    RESPONSABILIDAD / ROL
+        Agregar métricas de salud, eventos y almacenamiento en tarjetas KPI y
+        ofrecer accesos directos. No ejecuta lógica de negocio: solo lee y
+        navega.
+
+    QUIÉN LA INSTANCIA
+        MainWindow._create_main_view (índice VIEW_DASHBOARD del content_stack).
+
+    SEÑALES QT
+        EMITE (las escucha MainWindow para conmutar de vista):
+          - open_live      → ir a "En vivo".
+          - open_events    → ir a "Eventos".
+          - open_cameras   → ir a "Cámaras".
+          - open_playback  → ir a "Reproducción".
+        No escucha señales externas.
+
+    CICLO DE VIDA
+        `showEvent` arranca un QTimer de 8s que llama a `_poll`; `hideEvent` lo
+        detiene (no sondear en background).
+
+    DEPENDENCIAS
+        api_client (GET /system/health, /events/, /storage/info), GlassCard.
+    """
 
     open_live = Signal()
     open_events = Signal()
@@ -73,7 +148,7 @@ class DashboardView(QWidget):
 
     EVENT_LABELS = {
         "person": "Persona", "vehicle": "Vehículo", "motion": "Movimiento",
-        "camera_offline": "Cámara desconectada", "tampering": "Sabotaje",
+        "camera_offline": "Cámara desconectada",
     }
 
     def __init__(self, parent=None):
@@ -94,7 +169,7 @@ class DashboardView(QWidget):
         self.lbl_hello.setStyleSheet(
             f"color: {config.THEME_TEXT}; font-size: 24px; font-weight: bold;"
         )
-        self.lbl_date = QLabel(datetime.now().strftime("%A, %d de %B de %Y"))
+        self.lbl_date = QLabel(_fecha_es(datetime.now()))
         self.lbl_date.setStyleSheet(f"color: {config.THEME_TEXT_MUTED}; font-size: 13px;")
         head.addWidget(self.lbl_hello)
         head.addWidget(self.lbl_date)
@@ -187,6 +262,13 @@ class DashboardView(QWidget):
 
     # ------------------------------------------------------------------
     def _poll(self):
+        """Refresca TODOS los KPIs disparando 3 peticiones async en paralelo.
+
+        Propósito: actualizar tarjetas + actividad reciente desde el backend.
+        Cada callback corre en el hilo UI y pinta su parte (cámaras/CPU/uptime,
+        eventos hoy/sin revisar + lista, almacenamiento). Llamado por: `showEvent`
+        y el QTimer de 8s. Llama a: GET /system/health, GET /events/,
+        GET /storage/info."""
         # Salud del sistema
         def on_health(resp):
             if not resp.success:
@@ -322,17 +404,23 @@ class DashboardView(QWidget):
         return f"{mm}m"
 
     def set_user(self, username: str):
+        """Personaliza el saludo de cabecera según la hora y el usuario.
+
+        Inputs: `username`. Output: actualiza `lbl_hello` ("Buenos días, X").
+        Llamado por: MainWindow._on_login_success tras autenticar."""
         hour = datetime.now().hour
         greet = "Buenos días" if hour < 12 else ("Buenas tardes" if hour < 20 else "Buenas noches")
         self.lbl_hello.setText(f"{greet}, {username}" if username else "Panel de control")
 
     # ------------------------------------------------------------------
     def showEvent(self, event):
+        """Al hacerse visible: refresco inmediato + arranque del polling de 8s."""
         self._poll()
         if not self._timer.isActive():
             self._timer.start(8000)
         super().showEvent(event)
 
     def hideEvent(self, event):
+        """Al ocultarse: detiene el polling para no consumir CPU/red en background."""
         self._timer.stop()
         super().hideEvent(event)

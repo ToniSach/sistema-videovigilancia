@@ -1,6 +1,38 @@
 """
-Repositorio base genérico que implementa operaciones CRUD básicas.
-Utiliza tipos genéricos para type safety.
+================================================================================
+MÓDULO: base_repository — Repositorio genérico (patrón Repository) sobre la BD
+================================================================================
+
+PROPÓSITO
+    Implementar el patrón Repository de forma GENÉRICA: una clase base que
+    encapsula el CRUD estándar (get_by_id, get_all, create, update, delete)
+    sobre cualquier modelo SQLAlchemy, ocultando el manejo de sesiones y el
+    desacople de objetos de la sesión (`expunge`).
+
+RESPONSABILIDAD PRINCIPAL
+    Abstraer el acceso a datos para que los servicios trabajen con objetos del
+    dominio sin tocar `Session` directamente, y garantizar que las entidades
+    devueltas estén DESVINCULADAS de la sesión (no lazy-loading fuera del `with`).
+
+PATRÓN CLAVE — expunge + sesión por operación
+    Cada método abre su propia `db_manager.get_session()`, ejecuta la operación
+    y hace `session.expunge(obj)` antes de retornar. Así el objeto sobrevive
+    fuera del context manager (la sesión ya se cerró) sin disparar errores de
+    "DetachedInstanceError" en accesos posteriores.
+
+DEPENDENCIAS IMPORTANTES
+    database.connection.db_manager — abre las sesiones transaccionales.
+
+COMPONENTES RELACIONADOS (quién lo consume)
+    Lo extienden los repos concretos: CameraRepository, EventRepository,
+    RecordingRepository (y cualquier otro). Estos heredan el CRUD y añaden
+    consultas específicas.
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    Capa de acceso a datos, intermedia entre servicios (lógica de negocio) y
+    `connection`/`models` (persistencia). Participa en todos los pipelines que
+    leen/escriben entidades.
+================================================================================
 """
 import logging
 from typing import TypeVar, Generic, Type, List, Optional
@@ -14,11 +46,23 @@ T = TypeVar('T')
 
 class BaseRepository(Generic[T]):
     """
-    Clase base abstracta para todos los repositorios.
-    Proporciona métodos CRUD estándar con manejo de sesiones automático.
-    
+    Base genérica de todos los repositorios (patrón Repository).
+
+    ROL
+        Provee el CRUD estándar (get_by_id, get_all, create, update, delete) para
+        el modelo `T`, abriendo una sesión por operación y desvinculando
+        (`expunge`) las entidades devueltas para que sean seguras fuera del `with`.
+
+    QUIÉN LA INSTANCIA/CONSUME
+        No se usa directa: la subclasifican los repos concretos (CameraRepository,
+        EventRepository, RecordingRepository), cada uno pasando su modelo en
+        `super().__init__(Modelo)`. Los servicios consumen esos repos concretos.
+
+    DEPENDENCIAS
+        database.connection.db_manager (sesiones).
+
     Type Parameters:
-        T: Tipo del modelo SQLAlchemy
+        T: Tipo del modelo SQLAlchemy gestionado por el repositorio.
     """
     
     def __init__(self, model_class: Type[T]):
@@ -72,10 +116,13 @@ class BaseRepository(Generic[T]):
     def create(self, obj: T) -> T:
         """
         Crea una nueva entidad en la base de datos.
-        
+
+        Hace `flush()` (no commit) para que la BD asigne el ID antes de salir, y
+        `expunge()` para devolver el objeto ya desvinculado. El COMMIT real lo
+        realiza el context manager `get_session()` al cerrar sin error.
+
         Args:
             obj: Instancia del modelo a crear
-            
         Returns:
             Instancia creada con ID asignado
         """
@@ -92,10 +139,13 @@ class BaseRepository(Generic[T]):
     def update(self, obj: T) -> T:
         """
         Actualiza una entidad existente.
-        
+
+        Usa `merge()` para RECONECTAR a la sesión un objeto que venía desvinculado
+        (típico tras un get previo con expunge); copia su estado a la instancia
+        gestionada y la devuelve también desvinculada.
+
         Args:
             obj: Instancia del modelo con cambios
-            
         Returns:
             Instancia actualizada
         """

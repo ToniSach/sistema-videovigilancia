@@ -1,5 +1,40 @@
 """
-Servicio de gestión de permisos por cámara.
+================================================================================
+MÓDULO: services.permission_service — Autorización por cámara (multi-tenancy)
+================================================================================
+
+PROPÓSITO
+    Capa de autorización granular: decide si un usuario puede ver/controlar una
+    cámara concreta. Gestiona la tabla UserCameraPermission (cámaras compartidas)
+    y resuelve la jerarquía admin > propietario > permiso explícito.
+
+RESPONSABILIDAD PRINCIPAL
+    Ser el ÚNICO árbitro de "¿puede este usuario hacer X sobre esta cámara?".
+    REGLA CLAVE: comprobar SIEMPRE el permiso vía este servicio; owner_id NO
+    basta, porque existen cámaras compartidas con otros usuarios mediante
+    UserCameraPermission (con flags por acción: view, PTZ, LEDs, audio, descargas).
+
+DEPENDENCIAS
+    database.models ........... User, Camera, UserCameraPermission, UserRole
+    database.connection ....... db_manager.get_session()
+    flask_jwt_extended ........ get_jwt_identity (en el decorador)
+
+COMPONENTES RELACIONADOS
+    Lo INSTANCIA: se construye bajo demanda (`PermissionService()`) en las rutas
+        y en el decorador; es ligero y sin estado (no es singleton del contenedor).
+    Lo CONSUME: blueprint `permissions_bp` (grant/revoke/listar) y, vía el
+        decorador `require_camera_permission`, cualquier ruta que opere sobre una
+        cámara (cameras_bp, recordings_bp, etc.).
+
+PUNTO DE ENTRADA
+    `check_permission(user_id, camera_id, permission_type)` y el decorador
+    `require_camera_permission(...)` que lo envuelve para endpoints Flask.
+
+PIPELINE(S)
+    Transversal — guardia de autorización presente en los pipelines de cara al
+    usuario (#3 Live, #8 PTZ, #12 Clips, #14 Reproducción): valida el acceso
+    antes de ejecutar la acción.
+================================================================================
 """
 import logging
 from typing import Optional, List
@@ -13,18 +48,35 @@ logger = logging.getLogger(__name__)
 
 
 class PermissionService:
-    """Gestiona permisos granulares de usuarios sobre cámaras."""
-    
+    """
+    Gestiona permisos granulares de usuarios sobre cámaras (autorización).
+
+    Rol: árbitro de acceso multi-tenant. Sin estado propio (abre una sesión por
+    operación), por lo que se instancia ad-hoc donde haga falta.
+
+    Lo instancia/consume: permissions_bp y el decorador require_camera_permission.
+    Dependencias: modelos User/Camera/UserCameraPermission + db_manager.
+    """
+
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-    
-    def grant_permission(self, user_id: int, camera_id: int, 
+
+    def grant_permission(self, user_id: int, camera_id: int,
                         can_view: bool = True,
                         can_control_ptz: bool = False,
                         can_control_leds: bool = False,
                         can_control_audio: bool = False,
                         can_download_recordings: bool = False) -> UserCameraPermission:
-        """Otorga permisos a un usuario sobre una cámara."""
+        """
+        Otorga (o actualiza) los permisos de un usuario sobre una cámara
+        compartida — upsert: si ya existe la fila, sobreescribe los flags.
+
+        Inputs: user_id, camera_id y los flags por acción (view/PTZ/LEDs/audio/
+            descargas).
+        Outputs: la UserCameraPermission creada o actualizada (desligada de la
+            sesión vía expunge).
+        Llamado por: POST de compartición en permissions_bp (solo admin/owner).
+        """
         try:
             with db_manager.get_session() as session:
                 # Verificar si ya existe
@@ -64,7 +116,9 @@ class PermissionService:
             raise
     
     def revoke_permission(self, user_id: int, camera_id: int) -> bool:
-        """Revoca todos los permisos de un usuario sobre una cámara."""
+        """Revoca (borra la fila) todos los permisos de un usuario sobre una
+        cámara compartida. Outputs: True si existía y se borró; False si no.
+        Llamado por: endpoint de revocación de permissions_bp."""
         try:
             with db_manager.get_session() as session:
                 perm = session.query(UserCameraPermission).filter_by(
@@ -81,7 +135,8 @@ class PermissionService:
             raise
     
     def get_user_permissions(self, user_id: int) -> List[UserCameraPermission]:
-        """Obtiene todos los permisos de un usuario."""
+        """Lista los permisos explícitos de un usuario (filas UserCameraPermission
+        desligadas de la sesión). Llamado por: permissions_bp."""
         try:
             with db_manager.get_session() as session:
                 perms = session.query(UserCameraPermission).filter_by(user_id=user_id).all()
@@ -123,10 +178,19 @@ class PermissionService:
     
     def check_permission(self, user_id: int, camera_id: int, permission_type: str) -> bool:
         """
-        Verifica si un usuario tiene un permiso específico.
-        
-        Args:
-            permission_type: 'view', 'control_ptz', 'control_leds', 'control_audio', 'download'
+        Núcleo de autorización: ¿puede `user_id` hacer `permission_type` sobre
+        `camera_id`? Resuelve la jerarquía en orden de cortocircuito:
+            1) admin  → True (acceso total).
+            2) owner de la cámara → True.
+            3) permiso explícito (UserCameraPermission) según el flag pedido.
+        Si ninguno aplica → False. Cualquier excepción también devuelve False
+        (fail-closed: ante la duda, denegar).
+
+        Inputs: user_id, camera_id, permission_type ∈ {'view','control_ptz',
+            'control_leds','control_audio','download'}.
+        Outputs: True/False.
+        Llamado por: el decorador require_camera_permission y rutas que validan
+            acceso a una cámara concreta.
         """
         try:
             with db_manager.get_session() as session:
@@ -165,7 +229,13 @@ class PermissionService:
             return False
     
     def get_accessible_cameras(self, user_id: int) -> List[int]:
-        """Obtiene IDs de cámaras a las que el usuario tiene acceso."""
+        """
+        IDs de cámaras visibles para el usuario = (propias ∪ compartidas con
+        can_view). Admin recibe TODAS. Sirve para filtrar listados por usuario.
+
+        Outputs: lista de camera_id (sin duplicados).
+        Llamado por: rutas que listan cámaras/eventos acotadas al usuario actual.
+        """
         try:
             with db_manager.get_session() as session:
                 user = session.get(User, user_id)
@@ -193,10 +263,16 @@ class PermissionService:
 
 def require_camera_permission(permission_type: str):
     """
-    Decorador para endpoints Flask que requieren permisos sobre cámara.
-    
-    Args:
-        permission_type: Tipo de permiso requerido
+    Decorador de ruta Flask que exige un permiso de cámara antes de ejecutar.
+
+    Lee el user_id del JWT (get_jwt_identity) y el camera_id de los kwargs de la
+    ruta (debe llamarse `camera_id` en la URL), y llama a
+    PermissionService.check_permission. Respuestas:
+        400 si falta camera_id · 403 si el permiso se deniega · si pasa, ejecuta f.
+
+    Inputs: permission_type ∈ {'view','control_ptz','control_leds',
+        'control_audio','download'}.
+    Uso: apilar BAJO @jwt_required() en los endpoints que tocan una cámara.
     """
     def decorator(f):
         @wraps(f)

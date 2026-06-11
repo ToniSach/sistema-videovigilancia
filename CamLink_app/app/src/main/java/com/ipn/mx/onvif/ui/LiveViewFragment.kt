@@ -1,3 +1,50 @@
+/*
+ * ============================================================================
+ * MÓDULO: LiveViewFragment — Pantalla de directo en vivo (CamLink Android)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Reproducir EN VIVO una cámara (o un lente de una dual-lens) a la menor
+ *   latencia posible y ofrecer los controles de operación sobre ella: navegar
+ *   entre feeds, grabar manualmente, alternar modo noche (IR-Cut), pantalla
+ *   completa y mover la cámara por PTZ con un joystick.
+ *
+ * RESPONSABILIDAD
+ *   - Cargar las cámaras del usuario (/cameras) y aplanarlas en "feeds": una
+ *     cámara mono = 1 feed; una dual-lens = 2 feeds (L1/L2).
+ *   - Reproducir cada feed con una estrategia de DOS reproductores:
+ *       1) Primario WebRTC en un WebView (go2rtc, ~sub-segundo de latencia).
+ *       2) Fallback ExoPlayer HLS→RTSP (~5-7s de buffer) si WebRTC no arranca.
+ *   - Enviar acciones de control al backend por REST (grabación, LED, PTZ).
+ *   - Gestionar con cuidado el ciclo de vida de ambos reproductores para no
+ *     filtrar CPU/red en segundo plano.
+ *
+ * DEPENDENCIAS
+ *   - ExoPlayer / Media3 (HLS + RTSP) como reproductor de respaldo.
+ *   - WebView + asset go2rtc_webrtc.html como reproductor WebRTC primario.
+ *   - RetrofitClient + ApiService — endpoints REST de control y /cameras.
+ *   - go2rtc (sidecar de medios): expone WebRTC (ws://host:1984/api/ws),
+ *     HLS (stream.m3u8) y RTSP del MISMO H264 ya ingerido por el backend.
+ *   - BaseMenuFragment — aporta el menú compartido (Grabaciones/Notif/Telegram).
+ *
+ * COMPONENTES RELACIONADOS
+ *   - CameraListFragment — rejilla 2-up; al tocar un tile navega aquí pasando
+ *     cameraId + lens (argumentos de entrada de este fragment).
+ *   - QrScanFragment — login por QR; destino final tras vincular es este live.
+ *   - MainActivity — host de navegación; aloja el toolbar/barra inferior que
+ *     este fragment oculta al entrar en pantalla completa.
+ *
+ * PUNTO DE ENTRADA
+ *   Destino de Navigation R.id.liveViewFragment (pestaña inferior y action
+ *   desde la lista de cámaras). Argumentos opcionales: "cameraId", "lens".
+ *
+ * PIPELINE(S)
+ *   #3 Live (reproducción del directo) — etapa cliente/render.
+ *   #5 go2rtc / #6 WebRTC — consumidor del restream del sidecar.
+ *   #8 PTZ — origen del comando (joystick → REST → ONVIF en el backend).
+ *   #11 Grabación — dispara start/stop de grabación manual.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.annotation.SuppressLint
@@ -38,6 +85,40 @@ import com.ipn.mx.onvif.network.RetrofitClient
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
+/**
+ * Fragment de directo en vivo de una cámara/lente.
+ *
+ * ROL Y RESPONSABILIDAD
+ *   Pantalla principal de visualización: reproduce un único feed a pantalla
+ *   (no rejilla) priorizando la mínima latencia, y concentra los controles de
+ *   operación de la cámara activa (grabar, modo noche, PTZ, fullscreen).
+ *
+ * QUIÉN LA INSTANCIA / CONSUME
+ *   La instancia el Navigation Component (host MainActivity) como destino
+ *   R.id.liveViewFragment. Recibe argumentos opcionales "cameraId" y "lens"
+ *   desde CameraListFragment (o sin ellos cuando se entra por la pestaña).
+ *
+ * ESTRATEGIA DE REPRODUCCIÓN (clave de este fragment)
+ *   Mantiene DOS vistas de vídeo hijas del mismo FrameLayout y alterna su
+ *   visibilidad:
+ *     - WebView (WebRTC, primario): baja latencia; lo arma webRtcWsUrl()/
+ *       startWebRtc(). Un watchdog de 7s cae a ExoPlayer si no entrega frame.
+ *     - SurfaceView + ExoPlayer (fallback): HLS preferido, RTSP de respaldo.
+ *
+ * CICLO DE VIDA ANDROID RELEVANTE
+ *   - onViewCreated: crea SurfaceView + WebView, cablea botones y joystick.
+ *   - onPause: detiene WebRTC (stop()) y pausa ExoPlayer/WebView (libera red).
+ *   - onResume: re-arranca el directo (WebRTC NO sobrevive a un stop()).
+ *   - onDestroyView: libera ExoPlayer, destruye el WebView y restaura el chrome
+ *     del sistema si quedó en pantalla completa (evita dejar la app "rota").
+ *
+ * DEPENDENCIAS
+ *   ExoPlayer/Media3, WebView (asset go2rtc_webrtc.html), RetrofitClient/
+ *   ApiService (control + /cameras), go2rtc (WebRTC/HLS/RTSP), BaseMenuFragment.
+ *
+ * PIPELINE
+ *   #3 Live · #5 go2rtc · #6 WebRTC · #8 PTZ · #11 Grabación.
+ */
 class LiveViewFragment : BaseMenuFragment() {
 
     // ── Estado: "feeds" ───────────────────────────────────────────────────────
@@ -61,7 +142,15 @@ class LiveViewFragment : BaseMenuFragment() {
     // Para no entrar en bucle de fallback HLS→RTSP→HLS por feed en ExoPlayer.
     private var triedFallback = false
 
-    /** Construye la lista de feeds: dual-lens → 2 (L1/L2); mono → 1. */
+    /**
+     * Aplana las cámaras del usuario en la lista de feeds reproducibles:
+     * una dual-lens válida (con ambos streamUrl) genera DOS feeds (L1 y L2);
+     * cualquier otra cámara genera UN feed mono.
+     *
+     * @param cams cámaras devueltas por GET /cameras (modelo CameraResponse).
+     * @return lista ordenada de [Feed] sobre la que cicla prev/next.
+     * Llamado por: loadCameras (tras la respuesta de /cameras).
+     */
     private fun buildFeeds(cams: List<CameraResponse>): List<Feed> {
         val out = mutableListOf<Feed>()
         for (c in cams) {
@@ -347,8 +436,16 @@ class LiveViewFragment : BaseMenuFragment() {
         btnFullscreen.setOnClickListener { toggleFullscreen() }
     }
 
-    /** Aplica la calidad al stream: high = url tal cual; medium/low → añade el
-     *  sufijo al nombre del substream de go2rtc (cam_X[_lY] → cam_X[_lY]_low). */
+    /**
+     * Aplica la calidad a una URL de ExoPlayer (HLS/RTSP): "high" devuelve la
+     * URL tal cual; "medium"/"low" añaden el sufijo al nombre del substream de
+     * go2rtc (cam_X[_lY] → cam_X[_lY]_medium), que apunta a su transcode ligero.
+     *
+     * @param url URL HLS o RTSP del feed (puede ser null/vacía → se devuelve igual).
+     * @param q calidad activa ("high" no transforma; cualquier otra añade "_q").
+     * @return URL con el substream de la calidad pedida.
+     * Llamado por: startExoPlayer.
+     */
     private fun applyQuality(url: String?, q: String): String? {
         if (url.isNullOrBlank() || q == "high") return url
         return "${url}_$q"
@@ -480,7 +577,14 @@ class LiveViewFragment : BaseMenuFragment() {
 
     // ── Reproducción: WebRTC primario, ExoPlayer (HLS→RTSP) de fallback ───────
 
-    /** Punto de entrada: intenta WebRTC; si no hay URL derivable, va a ExoPlayer. */
+    /**
+     * Punto de entrada de la reproducción del feed actual (currentFeed).
+     * Deriva la URL de signaling WebRTC; si existe (y hay WebView), arranca
+     * WebRTC; si no es derivable, cae directo a ExoPlayer (HLS→RTSP).
+     *
+     * Llamado por: navegación prev/next, loadCameras (feed inicial) y onResume.
+     * Llama a: webRtcWsUrl, startWebRtc, startExoPlayer.
+     */
     private fun playCurrentCamera() {
         val feed = currentFeed ?: return
         val wsUrl = webRtcWsUrl(feed, currentQuality)
@@ -492,9 +596,19 @@ class LiveViewFragment : BaseMenuFragment() {
         Toast.makeText(requireContext(), feed.label, Toast.LENGTH_SHORT).show()
     }
 
-    /** Deriva la URL de signaling WebRTC de go2rtc a partir del HLS:
-     *  http://IP:PORT/api/stream.m3u8?src=cam_X  →  ws://IP:PORT/api/ws?src=cam_X
-     *  Aplica la calidad al nombre del stream (cam_X → cam_X_low). */
+    /**
+     * Deriva la URL de signaling WebRTC de go2rtc REUTILIZANDO la URL HLS del
+     * feed (mismo host/puerto/src), de modo que no se hardcodea nada del sidecar:
+     *   http://IP:PORT/api/stream.m3u8?src=cam_X  →  ws://IP:PORT/api/ws?src=cam_X
+     * Si la calidad no es "high", añade el sufijo al nombre del substream
+     * (cam_X → cam_X_medium) para apuntar al transcode ligero de go2rtc.
+     *
+     * @param feed feed a reproducir (de él se toma hlsUrl como semilla).
+     * @param quality "high" | "medium" | "low" (sufijo del substream go2rtc).
+     * @return URL WebSocket de signaling ws://… o null si el HLS no es parseable
+     *         o no trae query "src" (en cuyo caso se usa ExoPlayer).
+     * Llamado por: playCurrentCamera.
+     */
     private fun webRtcWsUrl(feed: Feed, quality: String): String? {
         val hls = feed.hlsUrl?.takeIf { it.isNotBlank() } ?: return null
         val uri = runCatching { Uri.parse(hls) }.getOrNull() ?: return null
@@ -505,7 +619,19 @@ class LiveViewFragment : BaseMenuFragment() {
         return "ws://$host:$port/api/ws?src=$src"
     }
 
-    /** Arranca (o reinicia) la sesión WebRTC en el WebView. */
+    /**
+     * Arranca (o reinicia) la sesión WebRTC en el WebView, que pasa a ser el
+     * reproductor activo. Libera ExoPlayer, carga el HTML del reproductor con
+     * baseUrl http://host:1984 (mismo origen que el ws:// → evita el bloqueo
+     * mixed-content de Chromium) e inyecta start(wsUrl) en onPageFinished.
+     * Programa un watchdog de 7s que cae a HLS si no llega el primer frame.
+     *
+     * @param wsUrl URL de signaling ws://host:port/api/ws?src=… (de webRtcWsUrl).
+     * @param feed feed reproducido; se pasa al fallback para reanudar por HLS.
+     * Llamado por: playCurrentCamera.
+     * Llama a: webRtcHtml, cancelWebRtcWatchdog, fallbackToExo (vía watchdog),
+     *          updateControlsForCamera.
+     */
     private fun startWebRtc(wsUrl: String, feed: Feed) {
         val wv = webView ?: return startExoPlayer(feed)
         // Liberar ExoPlayer y mostrar el WebView.
@@ -609,7 +735,15 @@ class LiveViewFragment : BaseMenuFragment() {
         }
     }
 
-    /** Demota la reproducción de WebRTC a ExoPlayer (HLS→RTSP) para este feed. */
+    /**
+     * Demota la reproducción de WebRTC a ExoPlayer (HLS→RTSP) para este feed:
+     * marca webRtcFellBack (para no oscilar WebRTC↔HLS), oculta el WebView y
+     * muestra el SurfaceView de ExoPlayer.
+     *
+     * @param feed feed a reanudar por ExoPlayer.
+     * Llamado por: el watchdog de startWebRtc y handleWebRtcState("error").
+     * Llama a: startExoPlayer.
+     */
     private fun fallbackToExo(feed: Feed) {
         webRtcFellBack = true
         usingWebRtc = false
@@ -627,7 +761,16 @@ class LiveViewFragment : BaseMenuFragment() {
         webRtcWatchdog = null
     }
 
-    /** Reproduce con ExoPlayer: HLS preferido, RTSP como respaldo. */
+    /**
+     * Reproduce el feed con ExoPlayer sobre el SurfaceView: HLS preferido y, si
+     * falla la preparación, reintenta UNA vez con la URL RTSP de respaldo (el
+     * tipo se detecta por la extensión/esquema: .m3u8 → HLS, rtsp:// → RTSP).
+     * Es el reproductor de fallback cuando WebRTC no está disponible o cayó.
+     *
+     * @param feed feed a reproducir; aporta hlsUrl (primario) y rtspUrl (respaldo).
+     * Llamado por: playCurrentCamera y fallbackToExo.
+     * Llama a: applyQuality, updateControlsForCamera.
+     */
     @OptIn(UnstableApi::class)
     private fun startExoPlayer(feed: Feed) {
         val surfaceView = surfaceViewRef ?: return
@@ -675,7 +818,16 @@ class LiveViewFragment : BaseMenuFragment() {
 
     // ── PTZ ───────────────────────────────────────────────────────────────────
 
-    /** Envía un movimiento PTZ por dirección (up/down/left/right/stop). */
+    /**
+     * Envía un movimiento PTZ de la cámara activa por REST. El backend traduce
+     * la dirección a un ContinuousMove ONVIF (Pipeline #8) y el joystick manda
+     * "stop" al soltar. Es best-effort: los fallos no críticos no spamean toasts
+     * (un 423 = ocupado por otro cliente se ignora, igual que un stop fallido).
+     *
+     * @param direction "up" | "down" | "left" | "right" | "stop".
+     * Endpoint: POST /cameras/{id}/ptz/move (ApiService.ptzMove).
+     * Llamado por: el onTouchListener del joystick en onViewCreated.
+     */
     private fun sendPtzDirection(direction: String) {
         val camera = currentCamera ?: return
         val baseUrl = RetrofitClient.buildBaseUrl(requireContext()) ?: return

@@ -1,5 +1,47 @@
 """
-Servicio de playback de grabaciones usando VLC.
+================================================================================
+MÓDULO: desktop_app.services.playback_service — Reproducción de grabaciones (VLC)
+================================================================================
+
+PROPÓSITO
+    Reproducir grabaciones HISTÓRICAS (pipeline #14) en el cliente desktop:
+    descargar el .mp4 desde el backend (/recordings/play/<id>) y reproducirlo
+    con libVLC, exponiendo controles de transporte (play/pausa/seek/velocidad)
+    y el progreso al timeline de la vista de playback.
+
+RESPONSABILIDAD
+    - VLCPlayer: wrapper Qt sobre un media_player de libVLC. Emite señales de
+      estado/posición/tiempo/fin/error y el primer frame (TTFF). Reproduce
+      tanto URLs (http/file) como archivos locales.
+    - DownloadThread: descarga la grabación a un temporal con barra de progreso
+      antes de reproducir (evita el streaming progresivo inestable de VLC).
+    - PlaybackService: orquesta descarga + reproducción, gestiona el recorte de
+      lente (dual-lens) pidiéndolo SERVER-SIDE y cachea por (grabación, lente).
+    - Comparte UNA sola vlc.Instance global (varias instancias con render por
+      HWND en Windows provocan crashes nativos).
+
+DEPENDENCIAS
+    - python-vlc / libVLC (decodificación y render del vídeo).
+    - PySide6.QtCore (QObject/Signal/QThread/QTimer) para señales y timers.
+    - requests (descarga del .mp4 en DownloadThread).
+
+COMPONENTES RELACIONADOS
+    - Lo consume ui/views/playback_view (timeline + panel de vídeo). El mismo
+      VLCPlayer se reutiliza para el directo en otras vistas (rtsp_video.py),
+      pero el directo va por go2rtc/RTSP, no por este servicio.
+    - El token JWT y la URL base provienen de services/api_client (el caller los
+      pasa a play_recording).
+
+PUNTO DE ENTRADA
+    Singleton global `playback_service = PlaybackService()` al final del módulo.
+    Flujo típico: play_recording(id, api_url, token[, lens]) → DownloadThread
+    → _on_download_finished → VLCPlayer.play_file.
+
+COMUNICACIÓN CON EL BACKEND
+    - #14 Reproducción histórica: GET /recordings/play/<id>[?lens=l1|l2] con
+      header Authorization: Bearer <token>. El recorte de lente es server-side
+      (el backend devuelve solo ese lente, transcodificado y cacheado).
+================================================================================
 """
 import logging
 import os
@@ -8,10 +50,21 @@ import threading
 from typing import Optional, Callable
 from dataclasses import dataclass
 
-import vlc
 from PySide6.QtCore import QObject, Signal, QThread, QTimer
 
 logger = logging.getLogger(__name__)
+
+# Importar libVLC de forma DEFENSIVA: si falta la DLL/paquete, NO queremos que
+# se caiga toda la app de escritorio al importar este módulo (que ocurre al
+# construir la ventana). En su lugar, dejamos vlc=None y las funciones de
+# reproducción avisan con un error claro cuando se intenten usar.
+try:
+    import vlc
+    _VLC_IMPORT_ERROR = None
+except Exception as _e:  # pragma: no cover - depende del entorno
+    vlc = None
+    _VLC_IMPORT_ERROR = str(_e)
+    logger.error(f"No se pudo cargar libVLC (reproducción no disponible): {_e}")
 
 
 # ── Instancia VLC ÚNICA compartida ──────────────────────────────────────────
@@ -23,6 +76,11 @@ _shared_vlc_instance = None
 
 def _get_shared_vlc_instance():
     global _shared_vlc_instance
+    if vlc is None:
+        raise RuntimeError(
+            "El reproductor de vídeo (libVLC) no está disponible. "
+            f"Detalle: {_VLC_IMPORT_ERROR or 'módulo vlc no encontrado'}"
+        )
     if _shared_vlc_instance is None:
         _shared_vlc_instance = vlc.Instance(["--quiet", "--no-video-title-show"])
     return _shared_vlc_instance
@@ -39,7 +97,20 @@ class PlaybackState:
 
 
 class VLCPlayer(QObject):
-    """Wrapper de VLC para Qt."""
+    """
+    NIVEL 2 — Wrapper Qt sobre un media_player de libVLC.
+
+    Rol: encapsular un único media_player (de la instancia VLC compartida) y
+    traducir su estado a señales Qt (state_changed/position_changed/
+    time_changed/ended/error/first_frame) que la vista conecta a su UI. Provee
+    play/pausa/seek/velocidad y el binding de la superficie de render (HWND en
+    Windows, XWindow en Linux).
+
+    Lo instancia: PlaybackService (y otras vistas que necesiten un player VLC).
+    Detalles delicados: comparte la vlc.Instance global; el QTimer de polling y
+    el swap de media en hilo de fondo son lazy/serializados para no crashear ni
+    bloquear el hilo de UI en el mutex interno de libVLC (ver is_swapping()).
+    """
 
     state_changed = Signal(PlaybackState)
     position_changed = Signal(float)  # 0.0 - 1.0
@@ -208,39 +279,61 @@ class VLCPlayer(QObject):
     
     def pause(self):
         """Pausa/Resume."""
-        self.player.pause()
-    
+        try:
+            self.player.pause()
+        except Exception as e:
+            logger.warning(f"VLC pause falló: {e}")
+
     def stop(self):
         """Detiene."""
-        self.player.stop()
-    
+        try:
+            self.player.stop()
+        except Exception as e:
+            logger.warning(f"VLC stop falló: {e}")
+
     def seek(self, position: float):
         """
         Seek a posición (0.0 - 1.0).
         """
-        if self.player.is_seekable():
-            self._is_seeking = True
-            self.player.set_position(position)
+        try:
+            if self.player.is_seekable():
+                self._is_seeking = True
+                self.player.set_position(position)
+                self._is_seeking = False
+        except Exception as e:
             self._is_seeking = False
-    
+            logger.warning(f"VLC seek falló: {e}")
+
     def seek_time(self, seconds: int):
         """Seek a tiempo específico en segundos."""
-        if self.player.is_seekable():
-            self.player.set_time(seconds * 1000)  # VLC usa milisegundos
-    
+        try:
+            if self.player.is_seekable():
+                self.player.set_time(int(seconds) * 1000)  # VLC usa milisegundos
+        except Exception as e:
+            logger.warning(f"VLC seek_time falló: {e}")
+
     def set_speed(self, speed: float):
         """Cambia velocidad (0.5, 1.0, 2.0, 4.0)."""
-        self.player.set_rate(speed)
-    
+        try:
+            self.player.set_rate(speed)
+        except Exception as e:
+            logger.warning(f"VLC set_speed falló: {e}")
+
     def get_duration(self) -> int:
         """Duración en segundos."""
-        length_ms = self.player.get_length()
-        return length_ms // 1000 if length_ms > 0 else 0
-    
+        try:
+            length_ms = self.player.get_length()
+            return length_ms // 1000 if length_ms and length_ms > 0 else 0
+        except Exception:
+            return 0
+
     def get_time(self) -> int:
         """Tiempo actual en segundos."""
-        time_ms = self.player.get_time()
-        return time_ms // 1000 if time_ms > 0 else 0
+        try:
+            time_ms = self.player.get_time()
+            return time_ms // 1000 if time_ms and time_ms > 0 else 0
+        except Exception:
+            return 0
     
     def set_hwnd(self, hwnd: int):
         """Establece ventana para renderizado (Windows)."""
@@ -279,7 +372,16 @@ class VLCPlayer(QObject):
 
 
 class DownloadThread(QThread):
-    """Thread para descargar grabación antes de reproducir."""
+    """
+    NIVEL 2 — Hilo de descarga de una grabación a un archivo temporal.
+
+    Rol: bajar el .mp4 desde /recordings/play/<id> por chunks (sin bloquear la
+    UI) emitiendo `progress` (0-100), y al terminar `finished_download(path)` o
+    `error(msg)`. Se descarga ENTERO antes de reproducir porque el streaming
+    progresivo de VLC sobre HTTP resultaba inestable. Cancelable con cancel().
+
+    Lo instancia y consume: PlaybackService.play_recording.
+    """
     
     progress = Signal(int)  # 0-100
     finished_download = Signal(str)  # path
@@ -295,7 +397,14 @@ class DownloadThread(QThread):
     def run(self):
         try:
             import requests
-            response = requests.get(self.url, headers=self.headers, stream=True, timeout=30)
+            # timeout = (conexión, lectura). La lectura es GENEROSA (180s) porque
+            # en cámaras dual-lens el servidor RECORTA el lente con ffmpeg al vuelo
+            # antes de enviar el primer byte; con 30s daba "Read timed out" en
+            # segmentos largos. (El recorte ahora usa QSV y es rápido, pero un
+            # arranque en frío de un continuo de 2 min puede pasar de 30s.)
+            response = requests.get(
+                self.url, headers=self.headers, stream=True, timeout=(10, 180)
+            )
             
             if response.status_code != 200:
                 self.error.emit(f"HTTP {response.status_code}")
@@ -327,7 +436,18 @@ class DownloadThread(QThread):
 
 
 class PlaybackService(QObject):
-    """Servicio de playback con gestión de descargas."""
+    """
+    NIVEL 2 — Servicio de playback (orquesta descarga + reproducción).
+
+    Rol: fachada que usa la vista de playback. Decide entre reproducir un
+    archivo local ya descargado o lanzar un DownloadThread; reexpone el progreso
+    de descarga como señales; gestiona el cambio de lente (dual-lens) volviendo
+    a pedir al servidor el segmento recortado y cacheando por (grabación, lente).
+
+    Singleton de facto: el módulo crea `playback_service = PlaybackService()`
+    global; la vista de playback lo comparte. Posee un único VLCPlayer (se
+    obtiene con get_player() para conectar sus señales).
+    """
     
     download_progress = Signal(int)
     download_finished = Signal(str)
@@ -339,6 +459,9 @@ class PlaybackService(QObject):
         self._download_thread: Optional[DownloadThread] = None
         self._temp_dir = tempfile.gettempdir()
         self._current_recording_id: Optional[int] = None
+        # Guardados para re-descargar al cambiar de lente (recorte server-side).
+        self._api_url: Optional[str] = None
+        self._token: Optional[str] = None
     
     def play_recording(self, recording_id: int, api_url: str, token: str,
                       local_file: Optional[str] = None, lens: Optional[str] = None):
@@ -350,17 +473,29 @@ class PlaybackService(QObject):
 
         lens: "l1"/"l2" para recortar un lente de una grabación dual-lens (la
         grabación es el frame completo); None/"main" = sin recorte.
+
+        El recorte es SERVER-SIDE: se pide `?lens=` y el backend devuelve solo
+        ese lente (transcodificado y cacheado). Es fiable en cualquier build de
+        VLC (el recorte cliente con video_set_crop_geometry era inestable).
         """
         self._current_recording_id = recording_id
-        self._pending_lens = lens  # se aplica el recorte tras cargar el vídeo
+        self._api_url = api_url
+        self._token = token
+        # El servidor ya recorta → el cliente NO debe recortar (evita doble crop).
+        self._pending_lens = None
 
         if local_file and os.path.exists(local_file):
             self.player.play_file(local_file)
-            self._schedule_lens_crop()
+            self.player.set_crop(None)
         else:
-            # Descargar primero
+            # Descargar el lente recortado (o el combinado si lens es None).
             url = f"{api_url}/recordings/play/{recording_id}"
-            output_path = os.path.join(self._temp_dir, f"recording_{recording_id}.mp4")
+            suffix = lens if lens in ("l1", "l2") else "full"
+            if lens in ("l1", "l2"):
+                url += f"?lens={lens}"
+            # Nombre de caché por lente: no reutilizar el combinado para un lente.
+            output_path = os.path.join(
+                self._temp_dir, f"recording_{recording_id}_{suffix}.mp4")
 
             headers = {"Authorization": f"Bearer {token}"}
 
@@ -371,12 +506,14 @@ class PlaybackService(QObject):
             self._download_thread.start()
 
     def set_lens(self, lens: Optional[str]):
-        """Cambia el lente recortado SIN re-descargar ni reiniciar el vídeo.
-        El recorte es del lado CLIENTE (VLC video_set_crop_geometry), así que
-        basta re-aplicarlo al vídeo en curso. Re-pedir el segmento completo al
-        cambiar de lente durante la reproducción congelaba el reproductor."""
-        self._pending_lens = lens
-        self._apply_lens_crop()
+        """Cambia el lente RE-DESCARGANDO el segmento recortado del servidor.
+        El recorte cliente (VLC video_set_crop_geometry) era inestable y a menudo
+        no aplicaba → se veía el frame combinado. El recorte server-side es fiable
+        en cualquier build de VLC."""
+        if self._current_recording_id is None or not self._api_url:
+            return
+        self.play_recording(
+            self._current_recording_id, self._api_url, self._token or "", lens=lens)
 
     def _schedule_lens_crop(self):
         """Programa la aplicación del recorte de lente cuando el vídeo cargue."""
@@ -389,7 +526,7 @@ class PlaybackService(QObject):
         lens = getattr(self, "_pending_lens", None)
         try:
             if not lens or lens not in ("l1", "l2"):
-                self.set_crop(None)
+                self.player.set_crop(None)
                 return
             w, h = self.get_video_size()
             if not w or not h:
@@ -399,14 +536,15 @@ class PlaybackService(QObject):
             half = h // 2
             # l1 = mitad inferior (offset y=half), l2 = mitad superior (y=0).
             top = 0 if lens == "l2" else half
-            self.set_crop(f"{w}x{half}+0+{top}")
+            self.player.set_crop(f"{w}x{half}+0+{top}")
         except Exception as e:
             logger.debug(f"_apply_lens_crop: {e}")
 
     def _on_download_finished(self, path: str):
         self.download_finished.emit(path)
         self.player.play_file(path)
-        self._schedule_lens_crop()
+        # El recorte ya viene aplicado por el servidor → asegurar SIN crop cliente.
+        self.player.set_crop(None)
     
     def play_local_file(self, file_path: str):
         """Reproduce archivo local directamente."""

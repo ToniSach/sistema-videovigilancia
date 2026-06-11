@@ -1,5 +1,62 @@
 """
-Cliente HTTP para API backend con manejo de JWT y refresh automático.
+================================================================================
+MÓDULO: desktop_app.services.api_client — Cliente HTTP (COLUMNA VERTEBRAL)
+================================================================================
+
+PROPÓSITO
+    Único punto de contacto del cliente desktop con el backend Flask. Expone un
+    singleton `api_client` (instancia de `APIClient`) que TODAS las vistas usan
+    para hablar REST con la API: autenticación, cámaras, usuarios, permisos,
+    eventos, IA, grabaciones, ajustes… Centraliza la gestión del JWT (set/clear
+    de tokens, refresh automático en 401, refresh proactivo para streaming) y
+    ejecuta cada petición de forma asíncrona sin bloquear el hilo de UI de Qt.
+
+RESPONSABILIDAD
+    - Mantener la sesión `requests` con cabeceras y pool de conexiones.
+    - Guardar los `AuthTokens` vivos y poner/quitar el header `Authorization`.
+    - Refrescar el access_token cuando el backend responde 401 (transparente)
+      y proactivamente para los tokens que viajan en streams (`?token=...`).
+    - Ejecutar requests en un QThreadPool y marshallear el resultado al hilo
+      main vía Qt.QueuedConnection (los callbacks tocan widgets Qt y DEBEN
+      correr en el hilo main; ver `_CallbackDispatcher`).
+    - Normalizar toda respuesta a `APIResponse(success/data/error/status_code)`.
+
+DEPENDENCIAS
+    - requests (HTTP + Session + HTTPAdapter para el pool).
+    - PySide6.QtCore (QObject/Signal/QThreadPool/QRunnable/Qt) para async + señales.
+    - desktop_app.src.config.config → API_BASE_URL y TIMEOUT.
+    - desktop_app.src.models.user → AuthTokens (DTO de tokens) y User.
+
+COMPONENTES RELACIONADOS
+    - Lo consumen TODAS las ui/views/* (login, dashboard, live, playback,
+      cámaras, usuarios, permisos, eventos, ajustes) y varios diálogos.
+    - El directo en vivo NO pasa por aquí: rtsp_video.py reproduce el restream
+      RTSP de go2rtc con VLC. Pero los tokens de stream (HLS/snapshots con
+      `?token=...`) SÍ se obtienen aquí con `get_stream_token()`.
+    - playback_service.py descarga grabaciones con su propio request, pero usa
+      el token que este cliente mantiene.
+
+PUNTO DE ENTRADA
+    Se crea el singleton `api_client = APIClient()` al final del módulo, al
+    importarlo (antes de que exista QApplication). Por eso el dispatcher Qt se
+    crea de forma PEREZOSA (lazy) en el primer uso; ver `_get_dispatcher`.
+
+COMUNICACIÓN CON EL BACKEND (pipelines del sistema)
+    - #2 Auth: login()/setup_admin()/register() (sin token previo),
+      set_tokens()/clear_tokens(), _refresh_token_if_needed() (en 401).
+    - #3 Live: get_stream_token() entrega un access_token con ≥2 min de vida
+      para los streams que van por HTTP directo.
+    - #14 Reproducción histórica: los GET a /recordings y el token los usa
+      playback_service; este cliente provee la sesión/token.
+    - #13 Notificaciones: las vistas consultan preferencias/Telegram/FCM por
+      REST a través de este cliente.
+
+PATRÓN ASÍNCRONO (clave)
+    Vista → api_client.get/post/... → APIWorker (QRunnable en QThreadPool)
+          → _make_request (síncrono, en hilo de fondo)
+          → _CallbackDispatcher.dispatch (Signal Qt.QueuedConnection)
+          → callback(APIResponse) ejecutado en el HILO MAIN.
+================================================================================
 """
 import json
 import logging
@@ -76,8 +133,29 @@ class APIWorker(QRunnable):
 
 
 class APIClient(QObject):
-    """Cliente API singleton con manejo de tokens."""
-    
+    """
+    NIVEL 2 — Cliente API singleton (COLUMNA VERTEBRAL del cliente desktop).
+
+    Rol: única puerta de salida hacia el backend Flask. Mantiene la sesión
+    `requests`, los `AuthTokens` y orquesta el patrón asíncrono (QThreadPool +
+    dispatcher al hilo main). Toda vista/diálogo del cliente lo usa.
+
+    Singleton (`__new__`): hay UNA sola instancia por proceso —el módulo crea
+    `api_client = APIClient()` al importarse y todas las vistas la comparten,
+    de modo que el token vive en un único lugar y un refresh beneficia a todos.
+    El guard `_initialized` en `__init__` evita re-inicializar la sesión si se
+    vuelve a llamar `APIClient()`.
+
+    Lo instancia: el propio módulo (instancia global al final del archivo).
+    Lo consume: ui/views/* y ui/dialogs/*.
+
+    Señales (notifican a la UI de forma global):
+      - auth_error: emitida cuando el refresh falla → la MainWindow debe forzar
+        re-login.
+      - request_error: error general (reservada para avisos no atados a un
+        callback concreto).
+    """
+
     # Señales
     auth_error = Signal()  # Token inválido, requerir re-login
     request_error = Signal(str)  # Error general
@@ -133,17 +211,40 @@ class APIClient(QObject):
         return self._dispatcher
     
     def set_tokens(self, tokens: AuthTokens):
-        """Establece tokens de autenticación."""
+        """
+        Propósito: registrar la sesión autenticada tras un login exitoso
+            (pipeline #2 Auth), fijando el header Authorization para todas las
+            peticiones posteriores que salgan por `session`.
+        Inputs: tokens (AuthTokens con access_token + refresh_token).
+        Outputs: ninguno (muta estado interno).
+        Llamado por: login_view tras recibir el JSON de /auth/login.
+        Llama a: ninguno relevante.
+        """
         self.tokens = tokens
         self.session.headers["Authorization"] = f"Bearer {tokens.access_token}"
-    
+
     def clear_tokens(self):
-        """Limpia tokens (logout)."""
+        """
+        Propósito: cerrar sesión (logout) — descartar tokens y quitar el header
+            Authorization para que las peticiones siguientes vayan sin credenciales.
+        Llamado por: la lógica de logout de la MainWindow y el manejador de
+            auth_error (re-login).
+        """
         self.tokens = None
         self.session.headers.pop("Authorization", None)
-    
+
     def _refresh_token_if_needed(self) -> bool:
-        """Intenta refrescar token si es necesario."""
+        """
+        Propósito: renovar el access_token usando el refresh_token contra
+            /auth/refresh (pipeline #2 Auth). Es el corazón del refresh
+            transparente que dispara `_make_request` al recibir un 401.
+        Inputs: ninguno (usa self.tokens.refresh_token).
+        Outputs: True si renovó y actualizó el header; False si no hay sesión
+            o el refresh falló.
+        Excepciones: capturadas internamente (se logean y devuelven False).
+        Llamado por: _make_request (en 401) y get_stream_token (proactivo).
+        Llama a: session.post(/auth/refresh).
+        """
         if not self.tokens:
             return False
 
@@ -226,7 +327,23 @@ class APIClient(QObject):
                      data: Dict = None, 
                      params: Dict = None,
                      stream: bool = False) -> APIResponse:
-        """Ejecuta request síncrono."""
+        """
+        Propósito: ejecutar UNA petición HTTP síncrona (corre en el hilo de
+            fondo del APIWorker, nunca en el main) y normalizar la respuesta a
+            APIResponse. Maneja el 401 con refresh transparente y un único
+            reintento; si el refresh falla emite auth_error.
+        Inputs: method ("GET"/"POST"/"PUT"/"PATCH"/"DELETE"), endpoint relativo
+            (se le antepone API_BASE_URL), data (cuerpo JSON), params (query
+            string), stream (si True devuelve el objeto Response crudo para leer
+            por chunks, p.ej. descargas).
+        Outputs: APIResponse. Con stream=True el campo .data es el Response sin
+            parsear; si no, .data/.error/.success se extraen del JSON de la API.
+        Excepciones: requests.RequestException se captura y devuelve como
+            APIResponse(success=False, status_code=0).
+        Llamado por: request_async (vía el lambda del APIWorker) y, en el 401,
+            por sí mismo (reintento único tras refrescar).
+        Llama a: session.<verbo>(), _refresh_token_if_needed(), auth_error.emit().
+        """
         url = f"{self._base_url}/{endpoint.lstrip('/')}"
         
         try:
@@ -278,7 +395,16 @@ class APIClient(QObject):
                      data: Dict = None,
                      params: Dict = None,
                      stream: bool = False):
-        """Ejecuta request asíncrono. El callback corre en el main thread."""
+        """
+        Propósito: lanzar `_make_request` en el QThreadPool (no bloquea la UI) y
+            garantizar que `callback(APIResponse)` se ejecute en el HILO MAIN.
+            Es la primitiva que envuelven get/post/put/patch/delete.
+        Inputs: method, endpoint, callback (recibe el APIResponse), data, params,
+            stream.
+        Outputs: ninguno; el resultado llega por callback.
+        Llamado por: get/post/put/patch/delete y, por extensión, todas las vistas.
+        Llama a: QThreadPool.start(APIWorker(...)), _get_dispatcher().
+        """
         worker = APIWorker(
             lambda: self._make_request(method, endpoint, data, params, stream),
             callback,
@@ -362,6 +488,28 @@ class APIClient(QObject):
                 return APIResponse(
                     success=False,
                     error=data.get("error", "No se pudo crear el administrador"),
+                    status_code=r.status_code,
+                )
+            except Exception as e:
+                return APIResponse(success=False, error=str(e))
+        self._thread_pool.start(APIWorker(do, callback, self._get_dispatcher()))
+
+    def register(self, username: str, password: str,
+                 callback: Callable[[APIResponse], None]):
+        """Registra un usuario normal (sin token). Callback en main thread."""
+        def do():
+            try:
+                r = requests.post(
+                    f"{self._base_url}/auth/register",
+                    json={"username": username, "password": password},
+                    timeout=10,
+                )
+                data = r.json() if r.content else {}
+                if r.status_code in (200, 201) and data.get("success"):
+                    return APIResponse(success=True, data=data.get("data"))
+                return APIResponse(
+                    success=False,
+                    error=data.get("error", "No se pudo crear la cuenta"),
                     status_code=r.status_code,
                 )
             except Exception as e:

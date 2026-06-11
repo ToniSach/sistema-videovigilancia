@@ -1,5 +1,47 @@
 """
-API Endpoints para gestión de permisos de cámaras.
+================================================================================
+MÓDULO: api.routes.permissions — Permisos de acceso por cámara (capa HTTP)
+================================================================================
+
+PROPÓSITO
+    Blueprint REST que gestiona UserCameraPermission: el mecanismo de
+    compartición que permite a un usuario distinto del dueño ver/controlar una
+    cámara concreta con flags granulares (ver, PTZ, LEDs, audio, descargar
+    grabaciones). También expone la lista de cámaras accesibles del usuario.
+
+RESPONSABILIDAD
+    SOLO contrato HTTP + control de acceso de quién PUEDE administrar permisos
+    (admin). La persistencia y la evaluación efectiva de permisos viven en
+    PermissionService. Recordar (ver CLAUDE.md): owner_id por sí solo NO basta;
+    el resto del sistema debe consultar PermissionService porque existen
+    cámaras compartidas vía esta tabla.
+
+DEPENDENCIAS
+    services.permission_service.PermissionService  CRUD de UserCameraPermission
+    services.user_service.UserService.is_admin()   gating de administración
+    flask_jwt_extended ............................ identidad + @jwt_required
+
+COMPONENTES RELACIONADOS
+    routes/users.py ........ /me también devuelve accessible_cameras
+    database.models.UserCameraPermission  modelo ORM con los flags can_*
+    require_camera_permission (en permission_service) decorator usado por las
+        rutas que SÍ consumen estos permisos (cameras/ptz/leds/recordings...).
+
+PUNTO DE ENTRADA
+    Registrado en main.create_app() vía safe_register(permissions_bp).
+    Prefijo: /api/v1/permissions. Best-effort.
+
+PIPELINE(S)
+    Pipeline #2 (Autenticación/autorización) — etapa de autorización por
+    recurso. Es transversal a #3 Live, #8 PTZ, #11 Grabación y #12 Clips: los
+    flags que aquí se conceden son los que esas rutas verifican.
+
+ENDPOINTS
+    GET    /camera/<camera_id>                       → get_camera_permissions() [admin]
+    POST   /camera/<camera_id>/user/<target_user_id> → grant_permission()       [admin]
+    DELETE /camera/<camera_id>/user/<target_user_id> → revoke_permission()      [admin]
+    GET    /my-cameras                               → get_my_cameras()         [auth]
+================================================================================
 """
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -15,7 +57,20 @@ user_service = UserService()
 @permissions_bp.route("/camera/<int:camera_id>", methods=["GET"])
 @jwt_required()
 def get_camera_permissions(camera_id):
-    """Obtiene permisos sobre una cámara (solo admin o owner)."""
+    """
+    Lista qué usuarios tienen permisos sobre una cámara y con qué flags.
+
+    Método+Ruta: GET /api/v1/permissions/camera/<camera_id>
+    Permiso: JWT válido + role=admin (verificado en código con
+        UserService.is_admin; NO usa el decorator @admin_required).
+    Inputs: Path camera_id (int).
+    Outputs:
+        200 {success:true, data:[{user_id, username, can_view, can_control_ptz,
+             can_control_leds, can_control_audio, can_download_recordings}, ...]}
+        403 {success:false, error:"Admin requerido"} si no es admin.
+        500 ante fallo interno.
+    Llama a: UserService.is_admin() + PermissionService.get_camera_permissions().
+    """
     try:
         user_id = int(get_jwt_identity())
         
@@ -43,15 +98,33 @@ def get_camera_permissions(camera_id):
 @permissions_bp.route("/camera/<int:camera_id>/user/<int:target_user_id>", methods=["POST"])
 @jwt_required()
 def grant_permission(camera_id, target_user_id):
-    """Otorga permisos a un usuario sobre una cámara."""
+    """
+    Concede (o actualiza) permisos de un usuario sobre una cámara.
+
+    Método+Ruta: POST /api/v1/permissions/camera/<camera_id>/user/<target_user_id>
+    Permiso: JWT válido. NOTA: el check de admin está presente pero NO bloquea
+        (TODO pendiente: debería exigir admin o ser owner de la cámara). Hoy
+        cualquier usuario autenticado puede otorgar — punto a endurecer.
+    Inputs:
+        Path: camera_id (int), target_user_id (int) = beneficiario.
+        Body JSON (todos opcionales, default seguro):
+            can_view (bool, default True), can_control_ptz (default False),
+            can_control_leds (default False), can_control_audio (default False),
+            can_download_recordings (default False).
+    Outputs:
+        201 {success:true, data:{id, user_id, camera_id, permissions:{view, ptz,
+             leds, audio, download}}}
+        500 ante fallo interno.
+    Llama a: PermissionService.grant_permission(...).
+    """
     try:
         user_id = int(get_jwt_identity())
-        
-        # Solo admin o owner pueden otorgar permisos
+
+        # TODO de seguridad: este check NO restringe (cae en pass). Debería
+        # exigir admin o ser owner de la cámara antes de conceder permisos.
         if not user_service.is_admin(user_id):
-            # TODO: Verificar si es owner de la cámara
             pass
-        
+
         data = request.get_json() or {}
         
         perm = permission_service.grant_permission(
@@ -86,7 +159,19 @@ def grant_permission(camera_id, target_user_id):
 @permissions_bp.route("/camera/<int:camera_id>/user/<int:target_user_id>", methods=["DELETE"])
 @jwt_required()
 def revoke_permission(camera_id, target_user_id):
-    """Revoca permisos."""
+    """
+    Revoca TODOS los permisos de un usuario sobre una cámara (borra la fila).
+
+    Método+Ruta: DELETE /api/v1/permissions/camera/<camera_id>/user/<target_user_id>
+    Permiso: JWT válido + role=admin (verificado en código; aquí SÍ bloquea).
+    Inputs: Path camera_id (int), target_user_id (int).
+    Outputs:
+        200 {success:true, message} si se revocó.
+        403 {success:false, error:"Admin requerido"} si no es admin.
+        404 {success:false, error} si no existía permiso.
+        500 ante fallo interno.
+    Llama a: PermissionService.revoke_permission(target_user_id, camera_id) → bool.
+    """
     try:
         user_id = int(get_jwt_identity())
         
@@ -103,7 +188,18 @@ def revoke_permission(camera_id, target_user_id):
 @permissions_bp.route("/my-cameras", methods=["GET"])
 @jwt_required()
 def get_my_cameras():
-    """Obtiene cámaras accesibles para el usuario actual."""
+    """
+    Devuelve los IDs de cámaras accesibles para el usuario autenticado
+    (propias como owner + compartidas vía UserCameraPermission).
+
+    Método+Ruta: GET /api/v1/permissions/my-cameras
+    Permiso: JWT válido (cualquier rol).
+    Inputs: ninguno (user_id = get_jwt_identity()).
+    Outputs:
+        200 {success:true, data:[camera_ids]}
+        500 ante fallo interno.
+    Llama a: PermissionService.get_accessible_cameras(user_id).
+    """
     try:
         user_id = int(get_jwt_identity())
         cameras = permission_service.get_accessible_cameras(user_id)

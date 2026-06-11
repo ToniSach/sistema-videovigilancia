@@ -1,3 +1,39 @@
+/*
+ * ============================================================================
+ * MÓDULO: NotificationWsClient — cliente WebSocket del canal de notificaciones
+ *         (Pipeline #13 Notificaciones, lado móvil)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Encapsular la conexión OkHttp WebSocket contra /ws/notifications: handshake
+ *   con token en la query, mensajería ping/pong, reconexión con backoff
+ *   exponencial y parseo del JSON de eventos a NotificationEvent. No tiene nada
+ *   de Android UI: es código de red puro reutilizable.
+ *
+ * RESPONSABILIDAD
+ *   - Abrir/cerrar el socket y mantener una única conexión viva.
+ *   - Reconectar con backoff (1,2,4,8,16,30s) cuando la red o el servidor caen.
+ *   - Responder "pong" a los pings del servidor (keep-alive a nivel de protocolo).
+ *   - Despachar cada mensaje "event" como NotificationEvent vía callback onEvent.
+ *   - Informar conexión/desconexión vía callback onConnectionChange.
+ *
+ * DEPENDENCIAS
+ *   - OkHttp (WebSocket) y org.json (parseo).
+ *   - network/RetrofitClient provee la baseUrl http(s) y el token (los pasa el
+ *     llamador, este cliente sólo los recibe en el constructor).
+ *
+ * COMPONENTES RELACIONADOS
+ *   - service/NotificationWebSocketService lo instancia y lo aloja en background.
+ *   - Backend WSNotificationBroker._serialize_event produce el JSON que parsea
+ *     NotificationEvent.fromJson.
+ *
+ * PUNTO DE ENTRADA
+ *   Constructor + start()/stop(). Los callbacks se ejecutan en un hilo de OkHttp.
+ *
+ * PIPELINE(S)
+ *   #13 Notificaciones — transporte (capa WebSocket entre backend y dispositivo).
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.network
 
 import android.util.Log
@@ -23,6 +59,15 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * Callbacks ([onEvent] / [onConnectionChange]) se invocan en un hilo de OkHttp;
  * el caller debe re-postear al main thread si toca UI o NotificationManager.
+ *
+ * Quién lo instancia: NotificationWebSocketService.connectWs() (un único cliente
+ * por sesión, vivo mientras el foreground service exista).
+ *
+ * @property baseHttpUrl URL http(s) del backend ("http://192.168.1.10:5000"); se
+ *           convierte a ws(s) internamente.
+ * @property accessToken JWT de acceso que se envía como query param `token`.
+ * @property onEvent callback por cada mensaje "event" (NotificationEvent).
+ * @property onConnectionChange callback (conectado, mensajeError?) en cada cambio.
  */
 class NotificationWsClient(
     private val baseHttpUrl: String,    // "http://192.168.1.10:5000"
@@ -52,6 +97,11 @@ class NotificationWsClient(
     private var reconnectAttempt = 0
     private val reconnectThread = Object()
 
+    /**
+     * Arranca el loop de conexión en un hilo daemon dedicado ("NotifWS-Loop").
+     * Idempotente: una segunda llamada mientras ya corre se ignora.
+     * Llamado por: NotificationWebSocketService.connectWs.
+     */
     fun start() {
         if (shouldRun.getAndSet(true)) {
             Log.d(TAG, "start() ignorado: ya está corriendo")
@@ -60,6 +110,11 @@ class NotificationWsClient(
         Thread({ runLoop() }, "NotifWS-Loop").apply { isDaemon = true; start() }
     }
 
+    /**
+     * Detiene el loop, cierra el socket (código 1000 "client_stop") y despierta el
+     * hilo de espera de backoff para que termine sin reintentar.
+     * Llamado por: NotificationWebSocketService.onDestroy.
+     */
     fun stop() {
         shouldRun.set(false)
         try { ws?.close(1000, "client_stop") } catch (_: Exception) {}
@@ -67,11 +122,17 @@ class NotificationWsClient(
         synchronized(reconnectThread) { reconnectThread.notifyAll() }
     }
 
+    /** @return true si el socket está actualmente conectado (handshake OK). */
     fun isAlive(): Boolean = isConnected.get()
 
     // ------------------------------------------------------------------
     // Loop con reconexión
     // ------------------------------------------------------------------
+    /**
+     * Bucle principal del hilo daemon: abre el socket (bloqueante hasta que muere),
+     * y al volver espera el backoff correspondiente antes de reintentar, mientras
+     * shouldRun siga activo. Llama a: openSocket. Llamado por: start (en su hilo).
+     */
     private fun runLoop() {
         while (shouldRun.get()) {
             try {
@@ -94,6 +155,12 @@ class NotificationWsClient(
         }
     }
 
+    /**
+     * Abre el WebSocket (deriva la URL ws(s) y añade ?token=) y BLOQUEA en un
+     * CountDownLatch hasta que la conexión muere (onClosed/onFailure), para que el
+     * runLoop sepa cuándo aplicar el backoff. Llama a: handleTextMessage por cada
+     * mensaje. Conecta a: /ws/notifications. Llamado por: runLoop.
+     */
     private fun openSocket() {
         val wsUrl = baseHttpUrl
             .replaceFirst("http://", "ws://")
@@ -148,6 +215,12 @@ class NotificationWsClient(
         }
     }
 
+    /**
+     * Despacha un mensaje de texto del servidor según su campo `type`:
+     * ping→responde "pong", hello→log, event→onEvent(NotificationEvent), error→log.
+     * @param webSocket socket origen (para responder pong).
+     * @param text payload JSON crudo. Llamado por: el WebSocketListener (onMessage).
+     */
     private fun handleTextMessage(webSocket: WebSocket, text: String) {
         try {
             val json = JSONObject(text)
@@ -181,6 +254,9 @@ class NotificationWsClient(
 /**
  * Modelo de notificación recibido por WS desde el backend.
  * Coincide con el JSON producido por WSNotificationBroker._serialize_event.
+ *
+ * Es el DTO de transporte del Pipeline #13: lo construye [fromJson] y lo consumen
+ * NotificationWebSocketService (push) y, vía broadcast, NotificationsPanelFragment.
  */
 data class NotificationEvent(
     val eventType: String,
@@ -191,6 +267,12 @@ data class NotificationEvent(
     val metadataJson: String,
 ) {
     companion object {
+        /**
+         * Construye un NotificationEvent desde el JSON del backend, con defaults
+         * seguros para cada campo ausente.
+         * @param j objeto JSON del mensaje "event".
+         * @return el evento parseado. Llamado por: NotificationWsClient.handleTextMessage.
+         */
         fun fromJson(j: JSONObject): NotificationEvent = NotificationEvent(
             eventType = j.optString("event_type", "unknown"),
             cameraId = j.optInt("camera_id", -1),
@@ -201,7 +283,11 @@ data class NotificationEvent(
         )
     }
 
-    /** Texto humano para mostrar en la notificación de Android. */
+    /**
+     * Título legible para la notificación de Android según el tipo de evento.
+     * @return texto traducido (p. ej. "Persona detectada"); para tipos no mapeados
+     *         capitaliza el eventType. Llamado por: NotificationWebSocketService.handleEvent.
+     */
     fun displayTitle(): String = when (eventType) {
         "person" -> "Persona detectada"
         "vehicle" -> "Vehículo detectado"
@@ -212,6 +298,12 @@ data class NotificationEvent(
         else -> eventType.replace('_', ' ').replaceFirstChar { it.uppercase() }
     }
 
+    /**
+     * Cuerpo legible: nombre de cámara (o "Cámara N") más el porcentaje de
+     * confianza si lo hay.
+     * @return texto para el cuerpo de la notificación. Llamado por:
+     *         NotificationWebSocketService.handleEvent.
+     */
     fun displayBody(): String {
         val cam = if (cameraName.isNotBlank()) cameraName else "Cámara $cameraId"
         val conf = if (confidence > 0) " (${(confidence * 100).toInt()}%)" else ""

@@ -1,6 +1,26 @@
 """
-Prometheus Metrics Endpoint - Exporta métricas para monitoreo.
-Requiere instalación: pip install prometheus-client
+MÓDULO: api.routes.metrics — Exporta métricas del sistema en formato Prometheus.
+
+PROPÓSITO
+    Expone `GET /metrics/` con el formato de texto que un servidor Prometheus
+    puede "scrapear" para monitoreo/alertas externas (FPS por cámara, estado
+    online/offline, almacenamiento usado, CPU/RAM del host).
+
+RESPONSABILIDAD
+    Refrescar los Gauges/Counters de prometheus_client con los valores ACTUALES
+    (leídos de metrics_collector, CameraManager y RecordingRepository) y
+    serializarlos. No persiste nada; es una foto puntual por petición.
+
+DEPENDENCIAS
+    infrastructure.metrics.collector (metrics_collector) · cameras.camera_manager
+    · database.repositories.recording_repository · prometheus_client · psutil.
+
+PUNTO DE ENTRADA / PIPELINES
+    Blueprint `metrics_bp` (url_prefix=/metrics), registrado en main. Transversal
+    a observabilidad; consume datos del Pipeline #1 (salud) sin pertenecer a él.
+
+NOTA: requiere `pip install prometheus-client`. El endpoint va protegido con JWT;
+en despliegue se recomienda exponerlo sin auth pero restringido por IP de red.
 """
 from flask import Blueprint, Response
 from flask_jwt_extended import jwt_required

@@ -1,16 +1,42 @@
 """
-Diálogo "Vincular móvil" — genera y muestra un QR para que la app del
-celular pueda escanear y registrarse contra el backend del NVR.
+================================================================================
+MÓDULO: desktop_app.ui.dialogs.qr_link_dialog — Vinculación de móvil por QR
+================================================================================
 
-Flujo:
-  1. El diálogo hace POST /api/v1/qr/generate
-  2. El backend crea un link_token (1 solo uso, 5 min de validez) y devuelve un PNG.
+PROPÓSITO
+    Diálogo modal «Vincular móvil»: pide un QR al backend y lo muestra para que
+    la app del celular lo escanee y se registre contra el NVR sin teclear nada.
+    Forma parte del Pipeline #13 (vinculación de dispositivos para
+    notificaciones / acceso desde el móvil).
+
+RESPONSABILIDAD
+    - Descargar el PNG del QR en un hilo aparte (no bloquear el UI).
+    - Mostrarlo escalado, con cuenta atrás de validez y botón «Regenerar».
+    - Avisar cuando expira o falla.
+
+FLUJO DE VINCULACIÓN (extremo a extremo)
+  1. Este diálogo hace POST /api/v1/qr/generate.
+  2. El backend crea un link_token (1 solo uso, 5 min) y devuelve un PNG.
   3. El usuario escanea el QR desde la app móvil.
-  4. La app móvil hace POST /api/v1/devices/register con el link_token + sus datos.
-  5. El backend devuelve JWT real al móvil, que puede consumir TODA la API existente.
+  4. La app móvil hace POST /api/v1/devices/register con el link_token + datos.
+  5. El backend devuelve JWT real al móvil → consume TODA la API existente.
 
-Como el link_token caduca en 5 min, hay un timer que muestra cuánto queda y un
-botón para regenerar sin cerrar el diálogo.
+    Como el link_token caduca en 5 min, hay un timer que muestra cuánto queda y
+    un botón para regenerar sin cerrar el diálogo.
+
+DEPENDENCIAS
+    - services/api_client.py (singleton) — petición autenticada con refresh JWT.
+    - config — no se usa directamente aquí (importado por consistencia).
+    - PySide6 (QThread para la descarga, QTimer para la cuenta atrás).
+
+COMPONENTES RELACIONADOS
+    - main_window.py — botón «Vincular móvil» del menú lateral
+      (`_open_qr_link_dialog`).
+    - Backend: routes de `qr/` y `devices/` que cierran el ciclo.
+
+QUIÉN LO ABRE
+    MainWindow, desde el botón «Vincular móvil» del sidebar.
+================================================================================
 """
 from __future__ import annotations
 
@@ -65,7 +91,23 @@ class _QRFetchWorker(QThread):
 
 
 class QRLinkDialog(QDialog):
-    """Diálogo modal con el QR de vinculación de móvil."""
+    """Diálogo modal que muestra el QR de vinculación de móvil.
+
+    ROL
+        Orquestar: lanzar `_QRFetchWorker`, pintar el QR, llevar la cuenta atrás
+        de validez y permitir regenerar. La descarga ocurre en el worker; este
+        diálogo solo coordina UI + timers.
+
+    QUIÉN LO INSTANCIA
+        MainWindow (`_open_qr_link_dialog`).
+
+    RESULTADO
+        Informativo; se cierra con accept(). La vinculación real la confirma el
+        móvil contra el backend, no este diálogo.
+
+    DEPENDENCIAS
+        api_client (vía el worker), QTimer (cuenta atrás), QThread (descarga).
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -164,7 +206,14 @@ class QRLinkDialog(QDialog):
 
     # ------------------------------------------------------------------
     def _fetch_qr(self):
-        """Solicita un nuevo QR al backend en un thread aparte."""
+        """Solicita un nuevo QR al backend en un thread aparte.
+
+        Inputs: ninguno (usa api_client.tokens para validar sesión).
+        Outputs: lanza `_QRFetchWorker`; el resultado llega por señal a
+            `_on_qr_fetched` / `_on_qr_failed`.
+        Llamado por: __init__ (carga inicial) y el botón «Regenerar QR».
+        Llama a (backend): POST /api/v1/qr/generate (dentro del worker).
+        """
         # AuthTokens es un dataclass con atributos access_token/refresh_token,
         # NO un dict. Antes accedíamos con .get(...) y [...] como si fuera
         # un dict → AttributeError 'AuthTokens' object has no attribute 'get'.
@@ -184,6 +233,9 @@ class QRLinkDialog(QDialog):
         self._worker.start()
 
     def _on_qr_fetched(self, png_bytes: bytes):
+        # Slot de la señal `fetched`: decodifica el PNG recibido, lo escala al
+        # frame manteniendo aspecto y arranca la cuenta atrás de validez.
+        # Llamado por: _QRFetchWorker.fetched (Qt.QueuedConnection → hilo UI).
         try:
             image = QImage.fromData(QByteArray(png_bytes), "PNG")
             if image.isNull():
@@ -219,6 +271,8 @@ class QRLinkDialog(QDialog):
         self._countdown.stop()
 
     def _tick(self):
+        # Slot del QTimer de 1s: actualiza «Válido por M:SS» y, al llegar a 0,
+        # marca el QR como expirado (hay que pulsar «Regenerar QR»).
         if self._remaining_s <= 0:
             self._countdown.stop()
             self.lbl_status.setText("Código expirado. Pulsa «Regenerar QR».")
@@ -231,8 +285,19 @@ class QRLinkDialog(QDialog):
 
     # ------------------------------------------------------------------
     def closeEvent(self, event):
-        self._countdown.stop()
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.requestInterruption()
-            self._worker.wait(1000)
+        # Limpieza al cerrar: detiene la cuenta atrás y, si el worker sigue
+        # descargando, lo interrumpe y espera (máx. 1s) para no dejar hilos
+        # huérfanos accediendo a widgets ya destruidos.
+        try:
+            self._countdown.stop()
+        except Exception:
+            pass
+        # El worker (objeto C++) puede haber sido ya destruido por Qt al cerrar
+        # rápido; acceder a .isRunning() lanzaría RuntimeError. Lo envolvemos.
+        try:
+            if self._worker is not None and self._worker.isRunning():
+                self._worker.requestInterruption()
+                self._worker.wait(1000)
+        except RuntimeError:
+            pass
         super().closeEvent(event)

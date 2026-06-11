@@ -1,6 +1,42 @@
 """
-Servicio de autenticación y gestión de usuarios.
-Maneja login, creación de usuarios y gestión de tokens JWT.
+================================================================================
+MÓDULO: services.auth_service — Servicio de autenticación (Pipeline #2)
+================================================================================
+
+PROPÓSITO
+    Capa de lógica de negocio para autenticación: valida credenciales contra la
+    BD, emite tokens JWT (access + refresh) y administra el ciclo de vida básico
+    de las cuentas (alta, cambio de contraseña, baja lógica).
+
+RESPONSABILIDAD PRINCIPAL
+    Ser el ÚNICO punto que verifica password_hash y genera tokens firmados.
+    Las rutas API nunca tocan hashing ni JWT directamente: delegan aquí para que
+    la política de credenciales (longitudes mínimas, estado is_active, claims)
+    viva en un solo sitio.
+
+DEPENDENCIAS
+    flask_jwt_extended ........ create_access_token / create_refresh_token
+    core.security ............. hash_password / verify_password (bcrypt)
+    database.connection ....... db_manager.get_session() (sesión transaccional)
+    database.models.User ...... entidad de usuario
+    config.settings ........... duraciones de token (JWT_ACCESS_TOKEN_MINUTES,
+                                JWT_REFRESH_TOKEN_DAYS)
+
+COMPONENTES RELACIONADOS
+    Lo INSTANCIA: DependencyContainer (container.py) como singleton
+        `auth_service`; también se importa directamente desde algunas rutas.
+    Lo CONSUME: blueprint `auth_bp` (api/routes/auth.py) — login, refresh,
+        registro y cambio de contraseña. Coexiste con UserService, que cubre el
+        CRUD multiusuario más amplio.
+
+PUNTO DE ENTRADA
+    `AuthService().login(username, password)` es la entrada del Pipeline #2.
+
+PIPELINE(S)
+    #2 Autenticación — etapa central: credenciales válidas → tokens JWT que el
+    resto de los endpoints exigen vía @jwt_required. El blocklist de logout y los
+    loaders de error JWT se configuran aparte en main.create_app().
+================================================================================
 """
 import logging
 from datetime import timedelta
@@ -19,26 +55,50 @@ logger = logging.getLogger(__name__)
 
 class AuthService:
     """
-    Servicio centralizado para operaciones de autenticación.
-    Gestiona ciclo de vida de sesiones y credenciales.
+    Servicio centralizado de autenticación (capa de negocio del Pipeline #2).
+
+    Rol: traduce "usuario + contraseña" en una sesión con tokens JWT y mantiene
+    la política de credenciales. No guarda estado de sesión en memoria — la
+    sesión vive en el token firmado; la revocación (logout) la lleva el blocklist
+    JWT configurado en main.py.
+
+    Lo instancia: container.py (singleton `auth_service`).
+    Lo consume: api/routes/auth.py (auth_bp). Para CRUD multiusuario completo ver
+        UserService.
+    Dependencias: BaseRepository[User], db_manager, core.security, settings.
     """
-    
+
     def __init__(self):
-        """Inicializa el servicio con repositorio de usuarios."""
+        # BaseRepository genérico sobre User: usado por get_user_by_id; el resto
+        # de métodos abre su propia sesión transaccional con db_manager.
         self.user_repository = BaseRepository[User](User)
         self.logger = logging.getLogger(__name__)
-    
+
     def login(self, username: str, password: str) -> Optional[dict]:
         """
-        Autentica un usuario y genera tokens JWT.
-        
-        Args:
-            username: Nombre de usuario
-            password: Contraseña en texto plano
-            
-        Returns:
-            Dict con tokens y datos de usuario, o None si credenciales inválidas
-            
+        Autentica un usuario y genera tokens JWT — etapa central del Pipeline #2.
+
+        Verifica, en orden: existencia del usuario, password (bcrypt) y estado
+        is_active. Solo si los tres pasan emite tokens. Embebe el `role` como
+        claim adicional para que los endpoints puedan autorizar por rol sin un
+        roundtrip extra a BD.
+
+        Inputs:
+            username: nombre de usuario.
+            password: contraseña en texto plano (se compara contra el hash).
+
+        Outputs:
+            dict con access_token, refresh_token y user.to_dict(); o None si las
+            credenciales son inválidas o la cuenta está inactiva (las tres causas
+            devuelven None a propósito, sin revelar cuál falló).
+
+        Excepciones:
+            RuntimeError ante fallo interno (p.ej. error de BD) — distingue
+            "credenciales malas" (None) de "error del sistema" (excepción).
+
+        Llamado por: POST /api/v1/auth/login (auth_bp).
+        Llama a: verify_password, create_access_token/refresh_token.
+
         Example return:
             {
                 "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
@@ -92,13 +152,11 @@ class AuthService:
     
     def get_user_by_id(self, user_id: int) -> Optional[User]:
         """
-        Obtiene un usuario por su ID.
-        
-        Args:
-            user_id: ID numérico del usuario
-            
-        Returns:
-            Instancia de User o None si no existe
+        Obtiene un usuario por su ID (vía BaseRepository, no abre sesión propia).
+
+        Inputs: user_id numérico (normalmente el `sub` del JWT).
+        Outputs: instancia de User o None si no existe.
+        Llamado por: endpoints que resuelven el usuario actual desde el token.
         """
         try:
             return self.user_repository.get_by_id(user_id)
@@ -108,18 +166,21 @@ class AuthService:
     
     def create_user(self, username: str, password: str, role: str = "viewer") -> User:
         """
-        Crea un nuevo usuario en el sistema.
-        
-        Args:
-            username: Nombre de usuario único
-            password: Contraseña en texto plano (se hashea internamente)
-            role: Rol del usuario (admin o viewer)
-            
-        Returns:
-            Instancia de User creada
-            
-        Raises:
-            ValueError: Si el username ya existe o datos inválidos
+        Crea un nuevo usuario, hasheando la contraseña antes de persistir.
+
+        Valida longitudes mínimas y rol permitido; comprueba unicidad del
+        username dentro de la misma sesión. Tras flush hace expunge para devolver
+        un objeto desligado (usable tras cerrar la sesión sin DetachedInstance).
+
+        Inputs: username (único, >=3), password (texto plano, >=6), role
+            ('admin'|'viewer' — distinto del CRUD de UserService, que usa 'user').
+        Outputs: instancia de User creada (desligada de la sesión).
+        Excepciones: ValueError si el username ya existe o los datos no validan;
+            RuntimeError ante fallo interno.
+
+        Nota: este método usa el par de roles admin/viewer; el alta multiusuario
+        general vive en UserService.create_user (admin/user). Mantener en mente la
+        divergencia al elegir cuál llamar.
         """
         try:
             # Validaciones básicas
@@ -161,18 +222,17 @@ class AuthService:
     
     def change_password(self, user_id: int, old_password: str, new_password: str) -> bool:
         """
-        Cambia la contraseña de un usuario verificando la anterior.
-        
-        Args:
-            user_id: ID del usuario
-            old_password: Contraseña actual
-            new_password: Nueva contraseña
-            
-        Returns:
-            True si se cambió exitosamente, False si contraseña anterior incorrecta
-            
-        Raises:
-            ValueError: Si nueva contraseña no cumple requisitos
+        Cambia la contraseña verificando la anterior (defensa contra secuestro
+        de sesión: aunque el atacante tenga el token, sin la contraseña actual no
+        puede cambiarla).
+
+        Inputs: user_id, old_password (debe coincidir con el hash actual),
+            new_password (>=6 chars y distinta de la anterior).
+        Outputs: True si se actualizó; False si old_password no coincide.
+        Excepciones: ValueError si la nueva no cumple requisitos; RuntimeError
+            ante fallo interno.
+        Llamado por: endpoint de cambio de contraseña (auth_bp).
+        Llama a: verify_password (validar) + hash_password (persistir).
         """
         try:
             if not new_password or len(new_password) < 6:
@@ -204,13 +264,14 @@ class AuthService:
     
     def deactivate_user(self, user_id: int) -> bool:
         """
-        Desactiva un usuario (soft delete).
-        
-        Args:
-            user_id: ID del usuario a desactivar
-            
-        Returns:
-            True si se desactivó, False si no existía
+        Desactiva un usuario (baja lógica: is_active=False, NO borra la fila).
+
+        Tras esto, login() rechazará a ese usuario aunque las credenciales sean
+        correctas. No revoca tokens ya emitidos: estos caducan por su exp natural
+        (o por logout explícito vía blocklist).
+
+        Inputs: user_id a desactivar.
+        Outputs: True si se desactivó; False si el usuario no existía.
         """
         try:
             with db_manager.get_session() as session:

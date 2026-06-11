@@ -1,3 +1,41 @@
+/*
+ * ============================================================================
+ * MÓDULO: EventConfigFragment — preferencias de notificaciones por evento
+ *         (Pipeline #13 Notificaciones, configuración, lado móvil)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Pantalla CRUD de las preferencias de notificación del usuario contra el
+ *   backend: por cada tipo de evento (persona, vehículo, movimiento, cámara
+ *   desconectada) el usuario activa/desactiva la alerta, elige canales (app/
+ *   Telegram), días de la semana y un horario opcional. Auto-guardado debounced.
+ *
+ * RESPONSABILIDAD
+ *   - Renderizar una fila por EventType con sus controles.
+ *   - Cargar las preferencias globales (camera_id=null) y reflejarlas en la UI.
+ *   - Crear (POST) o actualizar (PUT) la preferencia al cambiar cualquier control,
+ *     colapsando ráfagas de toques en una sola llamada (debounce 400ms).
+ *   - Bloquear la edición si no hay ninguna cámara con IA activa (regla de
+ *     producto): consulta /ai/status y muestra un aviso.
+ *
+ * DEPENDENCIAS
+ *   - network/ApiService + RetrofitClient (getNotificationPreferences,
+ *     create/updateNotificationPreference, getAiStatus).
+ *   - model/NotificationPreferenceDto, model/PreferenceMutation.
+ *   - ui/BaseMenuFragment (toolbar), Material TimePicker/Chip.
+ *
+ * COMPONENTES RELACIONADOS
+ *   - NotificationsPanelFragment (lo abre desde su botón de configuración).
+ *   - TelegramLinkFragment (el canal "telegram" sólo entrega si está vinculado).
+ *   - Backend NotificationPreference + NotificationRouter (consumen estas prefs).
+ *
+ * PUNTO DE ENTRADA
+ *   Destino de navegación R.id.eventConfigFragment; sin argumentos.
+ *
+ * PIPELINE(S)
+ *   #13 Notificaciones — configuración de preferencias del usuario.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.os.Bundle
@@ -37,6 +75,10 @@ import kotlinx.coroutines.launch
  *
  * Cambios: auto-guardado al toque (debounced 400ms para colapsar múltiples
  * clicks en un único PATCH). No requiere botón "Guardar".
+ *
+ * Ciclo de vida: en onViewCreated pinta las filas y arranca checkAiThenLoad.
+ * Quién lo instancia: el Navigation Component al abrirse desde el panel de
+ * notificaciones. Pipeline: #13 Notificaciones (configuración).
  */
 class EventConfigFragment : BaseMenuFragment() {
 
@@ -104,6 +146,11 @@ class EventConfigFragment : BaseMenuFragment() {
 
     // ── UI ────────────────────────────────────────────────────────────────────
 
+    /**
+     * Infla una fila (item_event_pref) por cada tipo de EVENT_TYPES con estado
+     * inicial neutro (desactivado) y engancha sus listeners.
+     * Llamado por: onViewCreated.
+     */
     private fun renderRows() {
         container.removeAllViews()
         val inflater = LayoutInflater.from(requireContext())
@@ -126,6 +173,13 @@ class EventConfigFragment : BaseMenuFragment() {
         R.id.chipThu to 4, R.id.chipFri to 5, R.id.chipSat to 6, R.id.chipSun to 0,
     )
 
+    /**
+     * Engancha los listeners de todos los controles de una fila para que cualquier
+     * cambio dispare saveFromRow (guardado debounced). El checkbox de horario
+     * habilita/deshabilita los botones de hora.
+     * @param row vista de la fila. @param type event_type asociado.
+     * Llamado por: renderRows y bindRowFromDto.
+     */
     private fun attachListeners(row: View, type: String) {
         val swEnabled = row.findViewById<SwitchCompat>(R.id.switchEnabled)
         val cbPush    = row.findViewById<CheckBox>(R.id.cbPush)
@@ -164,6 +218,13 @@ class EventConfigFragment : BaseMenuFragment() {
         picker.show(parentFragmentManager, "time")
     }
 
+    /**
+     * Vuelca un DTO del servidor (o valores por defecto si es null) en los
+     * controles de una fila. Suprime los listeners mientras setea para no disparar
+     * guardados espurios, y los re-engancha al final.
+     * @param row vista de la fila. @param dto preferencia del servidor o null.
+     * Llamado por: loadPreferences.
+     */
     private fun bindRowFromDto(row: View, dto: NotificationPreferenceDto?) {
         val swEnabled = row.findViewById<SwitchCompat>(R.id.switchEnabled)
         val cbPush    = row.findViewById<CheckBox>(R.id.cbPush)
@@ -206,7 +267,12 @@ class EventConfigFragment : BaseMenuFragment() {
         attachListeners(row, row.tag as String)
     }
 
-    /** Lee TODOS los controles de la fila y dispara el guardado debounced. */
+    /**
+     * Lee TODOS los controles de la fila (enabled, canales, días, horario) y
+     * dispara el guardado debounced.
+     * @param row vista de la fila. @param type event_type.
+     * Llamado por: los listeners enganchados en attachListeners. Llama a: scheduleSave.
+     */
     private fun saveFromRow(row: View, type: String) {
         val enabled = row.findViewById<SwitchCompat>(R.id.switchEnabled).isChecked
         val push    = row.findViewById<CheckBox>(R.id.cbPush).isChecked
@@ -220,6 +286,12 @@ class EventConfigFragment : BaseMenuFragment() {
 
     // ── Red ───────────────────────────────────────────────────────────────────
 
+    /**
+     * Descarga las preferencias del usuario, se queda con las globales
+     * (camera_id=null), las indexa por event_type y las vuelca en las filas.
+     * Endpoint: GET /notifications/preferences.
+     * Llamado por: checkAiThenLoad (sólo si hay IA activa). Llama a: bindRowFromDto.
+     */
     private fun loadPreferences() {
         val api = buildApi() ?: return
         loading.visibility = View.VISIBLE
@@ -257,6 +329,15 @@ class EventConfigFragment : BaseMenuFragment() {
         }
     }
 
+    /**
+     * Programa el guardado de una preferencia con debounce: cancela el job pendiente
+     * de ese event_type y lanza uno nuevo que espera DEBOUNCE_MS antes de persistir,
+     * colapsando ráfagas de toques en una única llamada de red.
+     * @param eventType tipo de evento. @param enabled alerta activa.
+     * @param push canal app. @param telegram canal Telegram. @param days días (0-6).
+     * @param start/@param end horario "HH:mm" o null. Llama a: savePreference.
+     * Llamado por: saveFromRow.
+     */
     private fun scheduleSave(
         eventType: String, enabled: Boolean, push: Boolean, telegram: Boolean,
         days: List<Int>, start: String?, end: String?,
@@ -272,15 +353,33 @@ class EventConfigFragment : BaseMenuFragment() {
         }
     }
 
+    /**
+     * Persiste la preferencia: si no existía hace CREATE, si existía hace UPDATE, y
+     * actualiza el mapa `current` con el resultado. Normaliza canales (al menos
+     * "app") y días (vacío → todos) para evitar silencio total accidental.
+     * Endpoints: POST /notifications/preferences | PUT /notifications/preferences/{id}.
+     * @param eventType tipo de evento. @param enabled alerta activa.
+     * @param push canal app. @param telegram canal Telegram. @param days días (0-6).
+     * @param start/@param end horario "HH:mm" o null. Llamado por: scheduleSave.
+     */
     private suspend fun savePreference(
         eventType: String, enabled: Boolean, push: Boolean, telegram: Boolean,
         days: List<Int>, start: String?, end: String?,
     ) {
-        val api = buildApi() ?: return
+        // Antes un buildApi() nulo (sin URL de servidor) salía en silencio: el
+        // usuario creía que se había guardado. Ahora avisa.
+        val api = buildApi() ?: run { toastIfVisible(R.string.pref_save_no_server); return }
+        // Canales EXACTOS que marcó el usuario. Si desmarca ambos, se manda lista
+        // vacía = "sin entrega" (el backend respeta el desmarcado). Antes había un
+        // `.ifEmpty { listOf("app") }` que reforzaba 'app' al desmarcar Push → el
+        // in-app no se podía apagar y el checkbox "revivía" al reentrar.
         val channels = buildList {
             if (push)     add("app")        // recibir en la app (WebSocket LAN)
             if (telegram) add("telegram")
-        }.ifEmpty { listOf("app") }
+        }
+        // Si el usuario activa Telegram, el guardado OK incluye un recordatorio de
+        // vincular Telegram (sin vínculo, el backend no tiene a dónde enviar).
+        val okMsg = if (telegram) R.string.pref_save_ok_telegram else R.string.pref_save_ok
         // Si no hay días marcados, lo tratamos como "todos" (evitar silencio total accidental).
         val daysFinal = days.ifEmpty { listOf(0, 1, 2, 3, 4, 5, 6) }
         val existing = current[eventType]
@@ -307,7 +406,7 @@ class EventConfigFragment : BaseMenuFragment() {
                             scheduleStart = start, scheduleEnd = end,
                         )
                     }
-                    toastIfVisible(R.string.pref_save_ok)
+                    toastIfVisible(okMsg)
                 } else toastIfVisible(R.string.pref_save_failed)
             } else {
                 // UPDATE
@@ -326,7 +425,7 @@ class EventConfigFragment : BaseMenuFragment() {
                         enabled = enabled, channels = channels, days = daysFinal,
                         scheduleStart = start, scheduleEnd = end,
                     )
-                    toastIfVisible(R.string.pref_save_ok)
+                    toastIfVisible(okMsg)
                 } else toastIfVisible(R.string.pref_save_failed)
             }
         } catch (e: Exception) {

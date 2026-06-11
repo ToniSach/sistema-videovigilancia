@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile backend/app/workers/ffmpeg_worker.py)",
+      "Bash(python -m py_compile backend/app/streaming/mjpeg_streamer.py backend/app/config.py backend/app/cameras/audio_controller.py backend/app/services/camera_service.py backend/app/api/routes/cameras.py backend/tests/test_camera_ai_ptz.py)",
+      "Bash(python -m py_compile backend/app/cameras/onvif_discovery.py backend/app/services/camera_service.py backend/app/api/routes/cameras.py backend/tests/test_camera_ai_ptz.py)",
+      "Bash(python -m py_compile backend/app/config.py backend/app/cameras/dual_lens_splitter.py backend/app/cameras/onvif_discovery.py backend/app/main.py backend/tests/test_camera_ai_ptz.py)",
+      "Bash(ffmpeg -hide_banner -loglevel error -rtsp_transport tcp -timeout 10000000 -fflags nobuffer -flags low_delay -i \"rtsp://admin:admin@192.168.255.255:554/stream01\" -vsync passthrough -vf \"scale=960:1080\" -f rawvideo -pix_fmt bgr24 -t 0.1 pipe:1)",
+      "Bash(echo \"---exit $?---\")",
+      "Bash(python -m py_compile backend/app/workers/ffmpeg_worker.py backend/app/streaming/mjpeg_streamer.py backend/tests/test_camera_ai_ptz.py)",
+      "Bash(python -m py_compile backend/app/cameras/onvif_discovery.py backend/app/api/routes/cameras.py desktop_app/src/services/video_streamer.py desktop_app/src/ui/views/live_view.py desktop_app/src/ui/views/camera_management_view.py desktop_app/src/ui/components/camera_control_panel.py)",
+      "Bash(python -m py_compile backend/app/api/routes/system.py desktop_app/src/ui/components/ptz_joystick.py desktop_app/src/ui/views/live_view.py desktop_app/src/ui/views/camera_management_view.py desktop_app/src/ui/views/settings_view.py)"
+    ]
+  }
+}

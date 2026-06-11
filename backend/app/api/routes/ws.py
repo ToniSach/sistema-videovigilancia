@@ -5,6 +5,15 @@ Diseñado para que el cliente Android (CamLink_app) reciba eventos del backend
 en tiempo real sin depender de FCM/Internet. Pensado para uso LAN domestic
 (1-10 clientes simultáneos).
 
+ROL EN LA ARQUITECTURA (Pipeline #13 Notificaciones — entrega push)
+    Es el canal de SALIDA WebSocket del bus de eventos. EventManager publica un
+    EventData → NotificationRouter decide destinatarios → ws_broker
+    (notifications/ws_broker.py) serializa y empuja por este socket a los
+    clientes registrados con permiso. Este módulo solo gestiona la CONEXIÓN
+    (handshake JWT, ping/pong, alta/baja en el broker); el fan-out de mensajes
+    lo hace ws_broker. El blueprint `ws_bp` es un placeholder: el objeto `sock`
+    global se enlaza a la app en main.create_app() vía `sock.init_app(app)`.
+
 Wire format
 -----------
 - URL:     ws(s)://<host>:5000/ws/notifications?token=<jwt_access>
@@ -62,17 +71,24 @@ WS_IDLE_TIMEOUT = 60          # cierre si no llega ni un ping en 60s
 WS_PING_INTERVAL = 25         # cada N s mandamos un ping de salud
 
 
-def _auth_user_id() -> int | None:
-    """Extrae user_id del JWT en ?token=...; devuelve None si inválido."""
+def _auth_identity() -> tuple[int | None, int | None]:
+    """
+    Extrae (user_id, device_id) del JWT en ?token=...; (None, None) si inválido.
+    device_id viene en el token móvil (las notis in-app son POR DISPOSITIVO); en
+    el de escritorio no está → None (alcance "de cuenta").
+    """
     token = request.args.get("token", "")
     if not token:
-        return None
+        return None, None
     try:
         decoded = decode_token(token)
-        return int(decoded.get("sub"))
+        user_id = int(decoded.get("sub"))
+        dev = decoded.get("device_id")
+        device_id = int(dev) if dev is not None else None
+        return user_id, device_id
     except Exception as e:
         logger.warning(f"[WS-Notif] Token inválido: {e}")
-        return None
+        return None, None
 
 
 @sock.route("/ws/notifications")
@@ -84,7 +100,7 @@ def notifications_ws(ws):
     Cuando el cliente se desconecta o lanza una excepción, el broker se limpia
     automáticamente en el finally.
     """
-    user_id = _auth_user_id()
+    user_id, device_id = _auth_identity()
     if user_id is None:
         try:
             ws.send(json.dumps({"type": "error", "code": "AUTH",
@@ -106,8 +122,8 @@ def notifications_ws(ws):
         logger.warning(f"[WS-Notif] No pude enviar hello a user_id={user_id}: {e}")
         return
 
-    ws_broker.register(ws, user_id)
-    logger.info(f"[WS-Notif] WebSocket abierto user_id={user_id}")
+    ws_broker.register(ws, user_id, device_id)
+    logger.info(f"[WS-Notif] WebSocket abierto user_id={user_id} device_id={device_id}")
 
     last_ping_sent = time.time()
     try:

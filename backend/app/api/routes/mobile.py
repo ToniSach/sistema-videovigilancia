@@ -1,6 +1,32 @@
 """
-Mobile API Routes - Endpoints optimizados para aplicaciones móviles.
-Incluye dashboard agregado, historial de notificaciones, y detección de HLS.
+MÓDULO: api.routes.mobile — API optimizada para el cliente Android (CamLink).
+
+PROPÓSITO
+    Endpoints "gordos" pensados para minimizar la latencia y el número de
+    peticiones en móvil: un dashboard agregado (cámaras + eventos + storage en
+    UNA respuesta), historial de notificaciones con paginación por cursor,
+    thumbnails y listado/descarga de grabaciones.
+
+RESPONSABILIDAD
+    Componer datos de varios subsistemas (permisos, métricas, eventos,
+    grabaciones) en DTOs compactos; SIEMPRE filtrar por cámaras accesibles del
+    usuario (PermissionService) y blindar la descarga contra path-traversal
+    (resolver bajo RECORDINGS_PATH).
+
+DEPENDENCIAS
+    services.permission_service · infrastructure.metrics.collector ·
+    repositories.event_repository / recording_repository · cameras.camera_manager.
+
+PUNTO DE ENTRADA / PIPELINES
+    Blueprint `mobile_bp` (url_prefix=/api/v1/mobile), registrado en main.
+    Participa en #3 (referencia HLS/stream), #10/#13 (historial de eventos) y
+    #14 (listado/descarga de grabaciones). El directo real lo entrega go2rtc
+    (RTSP/WebRTC); aquí solo se exponen URLs de referencia.
+
+ENDPOINTS
+    GET /version · GET /dashboard · GET /notifications/history
+    GET /cameras/<id>/thumbnail · GET /cameras/<id>/recordings
+    GET /recordings/<id>/download
 """
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -146,7 +172,7 @@ def get_notifications_history():
         limit = min(request.args.get("limit", 20, type=int), 50)  # Max 50 por request
         
         event_repo = EventRepository()
-        
+
         # FIX F2.2: Obtener eventos de cámaras accesibles
         if not accessible_cameras:
             return jsonify({
@@ -154,25 +180,21 @@ def get_notifications_history():
                 "data": [],
                 "pagination": {"has_more": False}
             }), 200
-        
-        # Construir query base
-        base_time = datetime.fromtimestamp(cursor) if cursor else datetime.utcnow()
+
+        # Cursor: datetime tope (None en la primera página). Paginación por
+        # cursor a NIVEL BD (filtra cámaras + created_at < cursor, ordena y
+        # limita en la consulta). Antes se cacheaban los 200 eventos más
+        # recientes GLOBALES y se filtraban en Python → con muchos eventos
+        # (p.ej. movimiento) los más antiguos NUNCA aparecían al hacer scroll.
+        base_time = datetime.fromtimestamp(cursor) if cursor else None
         hours_back = 168  # 7 días de historial máximo
-        
-        from datetime import timedelta
-        since = base_time - timedelta(hours=hours_back)
-        
-        # Obtener eventos recientes (usando método existente y filtrando)
-        all_recent = event_repo.get_recent(hours=hours_back, limit=200)
-        
-        # Filtrar por cámaras accesibles y tiempo cursor
-        events = [
-            e for e in all_recent 
-            if e.camera_id in accessible_cameras and e.created_at < base_time
-        ]
-        
-        # Ordenar por fecha descendente y limitar
-        events = sorted(events, key=lambda x: x.created_at, reverse=True)[:limit]
+
+        events = event_repo.get_history_page(
+            camera_ids=accessible_cameras,
+            before=base_time,
+            limit=limit,
+            hours=hours_back,
+        )
         
         # Preparar respuesta con URLs de thumbnails
         results = []

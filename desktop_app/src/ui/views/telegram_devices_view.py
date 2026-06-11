@@ -1,13 +1,39 @@
 """
-Vista dedicada: Dispositivos conectados a Telegram.
+================================================================================
+MÓDULO: ui.views.telegram_devices_view — Dispositivos Telegram vinculados (Pipeline #13)
+================================================================================
 
-Muestra, en una pestaña propia del menú lateral (solo administradores), la
-tabla de TODOS los chats/dispositivos de Telegram vinculados al sistema: a qué
-usuario pertenecen, su @usuario de Telegram, desde cuándo están vinculados y
-cuántas reglas de notificación activas tiene ese usuario.
+PROPÓSITO
+    Vista dedicada (solo administradores) que lista, en una tabla, TODOS los
+    dispositivos vinculados del sistema —chats de Telegram y móviles— por
+    usuario: rol, @alias de Telegram, móviles, resumen de preferencias y nº de
+    reglas activas. Es la versión "pantalla completa" del resumen que también
+    aparece embebido en notifications_view.
 
-Fuente de datos: GET /api/v1/telegram/admin/overview (requiere rol admin).
-Cada chat vinculado es una fila (un usuario con 2 chats ocupa 2 filas).
+RESPONSABILIDAD
+    - Pedir el panorama de dispositivos al backend y poblar la tabla.
+    - Mostrar solo usuarios con ALGÚN dispositivo vinculado; si no hay ninguno
+      (o no hay permisos), enseñar un mensaje vacío claro.
+    - Refrescarse automáticamente al mostrarse (showEvent) y bajo demanda.
+
+DEPENDENCIAS (endpoints consumidos)
+    - GET telegram/admin/overview ... panorama por usuario (requiere rol admin;
+      un 403 se traduce en el mensaje "¿tienes permisos de administrador?").
+
+COMPONENTES RELACIONADOS
+    main_window la instancia (índice VIEW_TELEGRAM_DEVICES=11, solo admin).
+    Reutiliza `_TABLE_STYLE` de users_view e icons.icon. Comparte fuente de
+    datos con la tabla admin de notifications_view.
+
+PUNTO DE ENTRADA (en la app)
+    Sidebar «Dispositivos Telegram» (solo admin) →
+    MainWindow._switch_view(VIEW_TELEGRAM_DEVICES).
+
+PIPELINE(S)
+    #13 Notificaciones (consulta administrativa): muestra el estado de
+    vinculación que habilita el envío de alertas por Telegram/móvil. La
+    vinculación en sí se hace desde la app móvil / notifications_view.
+================================================================================
 """
 import logging
 
@@ -25,7 +51,19 @@ logger = logging.getLogger(__name__)
 
 
 class TelegramDevicesView(QWidget):
-    """Tabla de dispositivos Telegram vinculados (vista admin)."""
+    """Tabla de dispositivos Telegram/móviles vinculados (vista admin; Pipeline #13).
+
+    RESPONSABILIDAD / ROL
+        Página del content_stack que consulta y muestra (solo lectura) el
+        panorama de dispositivos por usuario.
+
+    QUIÉN LA INSTANCIA
+        main_window (índice VIEW_TELEGRAM_DEVICES=11, solo admin).
+
+    SEÑALES QT
+        No define señales propias. Se autorrefresca en `showEvent`; I/O por
+        callback async del api_client.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -76,7 +114,18 @@ class TelegramDevicesView(QWidget):
         self.table.setHorizontalHeaderLabels([
             "Usuario", "Rol", "Telegram", "Móviles", "Preferencias", "Reglas",
         ])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # Columnas cortas se ajustan al contenido; las largas (Telegram, Móviles,
+        # Preferencias) se estiran Y permiten varias líneas (word-wrap), de modo
+        # que el texto completo se ve sin recortar en "…". Las filas crecen de
+        # alto según el contenido (resizeRowsToContents tras poblar).
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Usuario
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Rol
+        hdr.setSectionResizeMode(2, QHeaderView.Stretch)           # Telegram
+        hdr.setSectionResizeMode(3, QHeaderView.Stretch)           # Móviles
+        hdr.setSectionResizeMode(4, QHeaderView.Stretch)           # Preferencias
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Reglas
+        self.table.setWordWrap(True)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         try:
@@ -99,6 +148,11 @@ class TelegramDevicesView(QWidget):
     # Datos
     # ------------------------------------------------------------------
     def refresh(self):
+        """Recarga el panorama de dispositivos desde el backend.
+
+        Llama a GET telegram/admin/overview y delega en `_populate`. Si falla
+        (403 sin permisos o red), muestra el mensaje vacío. Llamado por:
+        `showEvent` y el botón de recargar."""
         def on_overview(response):
             if not response.success:
                 # 403 (no admin) o error de red.
@@ -129,13 +183,21 @@ class TelegramDevicesView(QWidget):
             self.table.insertRow(r)
             rows_shown += 1
 
-            self.table.setItem(r, 0, QTableWidgetItem(u.get("username", "")))
-            self.table.setItem(r, 1, QTableWidgetItem(u.get("role", "user")))
+            def _cell(text: str) -> QTableWidgetItem:
+                # Tooltip con el texto completo, por si el usuario prefiere verlo
+                # de un vistazo al pasar el ratón (además del word-wrap en celda).
+                it = QTableWidgetItem(text)
+                if text and text not in ("—", ""):
+                    it.setToolTip(text)
+                return it
+
+            self.table.setItem(r, 0, _cell(u.get("username", "")))
+            self.table.setItem(r, 1, _cell(u.get("role", "user")))
 
             # Telegram: lista de @alias (o "No vinculado").
             if chats:
                 names = ", ".join("@" + (c.get("username") or "?") for c in chats)
-                tg_item = QTableWidgetItem(names)
+                tg_item = _cell(names)
                 tg_item.setIcon(icon("ok", "#22c55e"))
             else:
                 tg_item = QTableWidgetItem("No vinculado")
@@ -144,13 +206,17 @@ class TelegramDevicesView(QWidget):
 
             # Móviles vinculados.
             mob_label = ", ".join(mobiles) if mobiles else "—"
-            self.table.setItem(r, 3, QTableWidgetItem(mob_label))
+            self.table.setItem(r, 3, _cell(mob_label))
 
             # Resumen de preferencias (tipos de evento que recibe).
-            self.table.setItem(r, 4, QTableWidgetItem(u.get("preferences_summary", "—")))
+            self.table.setItem(r, 4, _cell(u.get("preferences_summary", "—")))
 
             # Nº de reglas activas.
-            self.table.setItem(r, 5, QTableWidgetItem(str(u.get("active_preferences", 0))))
+            self.table.setItem(r, 5, _cell(str(u.get("active_preferences", 0))))
+
+        # Ajustar el alto de cada fila al contenido (las celdas con varias líneas
+        # por word-wrap necesitan más alto para mostrarse completas).
+        self.table.resizeRowsToContents()
 
         if rows_shown == 0:
             self.lbl_empty.setText(
@@ -169,5 +235,6 @@ class TelegramDevicesView(QWidget):
     # Refresco automático al mostrar la vista
     # ------------------------------------------------------------------
     def showEvent(self, event):
+        """Al navegar a esta vista, recarga la tabla (datos siempre frescos)."""
         super().showEvent(event)
         self.refresh()

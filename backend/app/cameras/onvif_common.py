@@ -1,10 +1,38 @@
 """
-Utilidades ONVIF compartidas por los controladores PTZ / LED / Audio.
+================================================================================
+MÓDULO: onvif_common — Utilidades ONVIF compartidas (onvif-zeep / WSDL)
+================================================================================
 
-Antes, `_resolve_wsdl_dir`, la lista de puertos, `_candidate_ports`, `_build_cam`
-y `_persist_onvif_port` estaban DUPLICADOS (idénticos) en ptz_controller.py,
-led_controller.py y audio_controller.py (~250 líneas repetidas). Aquí viven una
-sola vez; cada controlador las usa pasando su `log_prefix` ("PTZ"/"LED"/"AUDIO").
+PROPÓSITO
+    Centraliza la conexión ONVIF basada en onvif-zeep (carga WSDL) que usan los
+    controladores de CONTROL de cámara: PTZ, LED/IR-cut, audio y sync de hora.
+    Resuelve el directorio WSDL una sola vez, decide qué puertos ONVIF probar y
+    persiste en BD el puerto que funcionó.
+
+POR QUÉ EXISTE
+    `_resolve_wsdl_dir`, la lista de puertos, `candidate_ports`, `build_onvif_cam`
+    y `persist_onvif_port` estaban DUPLICADOS (idénticos) en ptz_controller.py,
+    led_controller.py y audio_controller.py (~250 líneas repetidas). Aquí viven
+    una sola vez; cada controlador las usa pasando su `log_prefix`
+    ("PTZ"/"LED"/"AUDIO"/"TIME").
+
+DIFERENCIA CON onvif_soap
+    onvif_soap = FAST PATH para DESCUBRIMIENTO (SOAP a mano, sin WSDL).
+    onvif_common = onvif-zeep (con WSDL) para el CONTROL de cámara ya dada de
+    alta, donde se necesita la API completa (ContinuousMove, SetImagingSettings,
+    SetSystemDateAndTime...). El kwarg `wsse` no existe en esta versión de
+    onvif-zeep, así que se usa auth PasswordText por defecto.
+
+DEPENDENCIAS: onvif (onvif-zeep), zeep, database (Camera + persistencia).
+COMPONENTES RELACIONADOS: ptz_controller, led_controller, audio_controller,
+    time_sync (todos importan estas helpers).
+PIPELINES: #7 ONVIF (conexión), #8 PTZ (control).
+
+PUERTOS ONVIF
+    Muchas cámaras (XiongMai, TP-Link, etc.) NO exponen ONVIF en :80 sino en
+    :8000 / :8899. Se prueban en orden; el primero que valide GetCapabilities
+    se persiste en camera.onvif_url para no reiterar en la próxima conexión.
+================================================================================
 """
 from __future__ import annotations
 
@@ -60,9 +88,18 @@ def candidate_ports(camera: Camera) -> list[int]:
 
 def build_onvif_cam(camera: Camera, port: int, log_prefix: str) -> Optional[ONVIFCamera]:
     """
-    Construye un cliente onvif-zeep contra ip:port y valida con GetCapabilities.
-    Devuelve la cámara conectada o None si falla. El kwarg `wsse` no existe en
-    esta versión de onvif-zeep, así que NO se pasa (auth PasswordText por defecto).
+    Construye y valida un cliente onvif-zeep contra ip:port. (Pipeline #7 ONVIF.)
+
+    Validación: tras construir el ONVIFCamera, llama GetCapabilities(Category=All)
+    como prueba de vida; si responde sin Fault, la conexión sirve.
+
+    Solicitud SOAP: GetCapabilities (Category=All).
+    Respuesta esperada: capacidades del dispositivo (no se parsean aquí, solo
+        se usa el éxito de la llamada como validación).
+    Servicio ONVIF: device_service.
+    Inputs:  camera (IP/credenciales), port, log_prefix ("PTZ"/"LED"/...).
+    Outputs: ONVIFCamera conectada o None si falla (Fault/red/timeout).
+    Llamado por: los _build_cam() de ptz/led/audio/time_sync.
     """
     kwargs = {"encrypt": False, "no_cache": True}
     if WSDL_DIR:

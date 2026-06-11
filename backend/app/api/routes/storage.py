@@ -1,5 +1,27 @@
 """
-API Endpoints para gestión de almacenamiento.
+MÓDULO: api.routes.storage — Gestión del almacenamiento de grabaciones (HTTP).
+
+PROPÓSITO
+    Endpoints para consultar el uso de disco/grabaciones, cambiar la ruta de
+    almacenamiento (persistida y aplicada en caliente) y disparar una limpieza
+    manual por cuota. Soporta el Pipeline #11 (Grabación) desde el lado de
+    administración del espacio.
+
+RESPONSABILIDAD
+    Validar admin donde corresponde, blindar contra path-traversal al cambiar la
+    ruta (lista de rutas de sistema prohibidas multiplataforma) y delegar la
+    limpieza en StorageManager.
+
+DEPENDENCIAS
+    config.settings (RECORDINGS_PATH) · services.user_service (is_admin) ·
+    recording.storage_manager (run_cleanup) · database.models.SystemConfig
+    (persistir la ruta nueva) · recording_repository.
+
+PUNTO DE ENTRADA / ENDPOINTS
+    Blueprint `storage_bp` (url_prefix=/api/v1/storage), registrado en main.
+      GET  /info     uso de disco + grabaciones
+      POST /config   cambia y persiste RECORDINGS_PATH (solo admin)
+      POST /cleanup  ejecuta rotación por cuota manualmente (solo admin)
 """
 import os
 from pathlib import Path

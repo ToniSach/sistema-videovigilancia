@@ -1,0 +1,134 @@
+classDiagram
+  class AIService {
+    activate_ai(camera_id: int, lens: str, mode: str) bool
+    change_mode(camera_id: int, mode: str, lens: str) bool
+    deactivate_ai(camera_id: int, lens: str) bool
+    get_ai_status() dict
+    is_active(camera_id: int, lens: str) bool
+    set_event_callback(callback: Callable[[int, str, str, float, dict], None]) None
+    stop_all() None
+  }
+  class AuthService {
+    logger : NoneType, RootLogger
+    user_repository
+    change_password(user_id: int, old_password: str, new_password: str) bool
+    create_user(username: str, password: str, role: str) User
+    deactivate_user(user_id: int) bool
+    get_user_by_id(user_id: int) Optional[User]
+    login(username: str, password: str) Optional[dict]
+  }
+  class CameraService {
+    add_camera(data: dict) dict
+    audio_listen_start(camera_id: int) dict
+    audio_listen_stop(camera_id: int) dict
+    audio_status(camera_id: int) dict
+    audio_stop(camera_id: int) dict
+    audio_talk(camera_id: int, data: dict | None) dict
+    delete_camera(camera_id: int) bool
+    discover_cameras(timeout: int, subnet_scan: bool) list[dict]
+    get_all_cameras() list[dict]
+    get_camera(camera_id: int) dict | None
+    get_camera_status(camera_id: int) dict
+    list_audio_input_devices() list[str]
+    ptz_control(camera_id: int, direction: str, speed: float) dict
+    ptz_goto_preset(camera_id: int, preset_token: str) dict
+    ptz_presets(camera_id: int) list[dict]
+    ptz_save_preset(camera_id: int, name: str) dict
+    set_ai_camera(camera_id: int) bool
+    set_led_state(camera_id: int, state: str) dict
+    toggle_camera(camera_id: int, active: bool) dict | None
+    update_camera(camera_id: int, data: dict) dict | None
+  }
+  class CircuitBreaker {
+    failure_threshold : int
+    failures : int
+    last_failure_time : NoneType
+    recovery_timeout : int
+    state : str
+    call(func)
+  }
+  class DeviceService {
+    logger : NoneType, RootLogger
+    deactivate_device(device_id: int) bool
+    get_user_devices(user_id: int) List[MobileDevice]
+    register_device(user_id: int, device_uuid: str, device_name: str, platform: str) tuple[MobileDevice, str, str]
+    validate_refresh_token(device_uuid: str, refresh_token: str) Optional[MobileDevice]
+  }
+  class EventService {
+    acknowledge_event(event_id: int) bool
+    get_events(camera_id: Optional[int], event_type: Optional[str], hours: int, limit: int) List[Dict[str, Any]]
+    get_stats() Dict[str, Any]
+    update_event_clip_path(event_id: int, clip_path: str) bool
+  }
+  class LockInfo {
+    acquired_at : datetime
+    expires_at : datetime
+    user_id : int
+    username : str
+  }
+  class NotificationPreferenceService {
+    logger : NoneType, RootLogger
+    create_preference(user_id: int, event_type: str, camera_id: Optional[int], enabled: bool, channels: List[str], schedule_start: Optional[time], schedule_end: Optional[time], days_of_week: List[int]) NotificationPreference
+    delete_preference(pref_id: int) bool
+    get_user_preferences(user_id: int) List[NotificationPreference]
+    update_preference(pref_id: int) Optional[NotificationPreference]
+  }
+  class NotificationRouter {
+    permission_service
+    route_event(event: Event, event_data)
+    shutdown()
+  }
+  class PTZLockService {
+    DEFAULT_TIMEOUT : int
+    acquire_lock(camera_id: int, user_id: int, username: str, timeout_seconds: int) Tuple[bool, Optional[str]]
+    extend_lock(camera_id: int, user_id: int, extra_seconds: int) bool
+    force_unlock(camera_id: int, admin_user_id: int) bool
+    get_lock_status(camera_id: int) Optional[dict]
+    release_lock(camera_id: int, user_id: int) bool
+    shutdown()
+  }
+  class PermissionService {
+    logger : NoneType, RootLogger
+    check_permission(user_id: int, camera_id: int, permission_type: str) bool
+    get_accessible_cameras(user_id: int) List[int]
+    get_camera_permissions(camera_id: int) List[UserCameraPermission]
+    get_user_permissions(user_id: int) List[UserCameraPermission]
+    grant_permission(user_id: int, camera_id: int, can_view: bool, can_control_ptz: bool, can_control_leds: bool, can_control_audio: bool, can_download_recordings: bool) UserCameraPermission
+    revoke_permission(user_id: int, camera_id: int) bool
+  }
+  class QRService {
+    TOKEN_EXPIRY_MINUTES : int
+    device_service
+    logger : NoneType, RootLogger
+    consume_link_token(token: str) Optional[int]
+    generate_link_token(user_id: int, server_host: str, server_port: int) Tuple[str, bytes]
+    validate_link_token(token: str) Optional[int]
+  }
+  class SignedUrlService {
+    query_param(resource: str, ttl_seconds: Optional[int]) str
+    sign(resource: str, ttl_seconds: Optional[int]) str
+    verify(resource: str, token: Optional[str]) bool
+  }
+  class TelegramLinkService {
+    CODE_EXPIRY_MINUTES : int
+    CODE_LENGTH : int
+    MAX_ATTEMPTS_PER_HOUR : int
+    logger : NoneType, RootLogger
+    generate_code(user_id: int) str
+    get_user_chats(user_id: int) list
+    unlink_telegram(user_id: int, chat_id: int) bool
+    verify_code(code: str, telegram_chat_id: str, telegram_username: Optional[str]) bool
+  }
+  class UserService {
+    logger : NoneType, RootLogger
+    count_users() int
+    create_user(username: str, password: str, role: str) User
+    delete_user(user_id: int) bool
+    get_all_users() List[User]
+    get_user_by_id(user_id: int) Optional[User]
+    get_user_by_username(username: str) Optional[User]
+    is_admin(user_id: int) bool
+    update_user(user_id: int) Optional[User]
+  }
+  class _NullCM {
+  }

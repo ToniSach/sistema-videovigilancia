@@ -1,0 +1,1 @@
+"""Paquete `workers` — contiene `FFmpegWorker`, el decode local LEGACY del antiguo pipeline RTSP→buffer (ELIMINADO del flujo activo; hoy el directo va por go2rtc). Conservado como referencia/fallback. Ver `ffmpeg_worker.py`."""

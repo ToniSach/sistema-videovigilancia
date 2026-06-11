@@ -1,6 +1,64 @@
 # desktop_app/src/ui/views/camera_management_view.py
 """
-Vista de gestión de cámaras (agregar, editar, configurar IA).
+================================================================================
+MÓDULO: ui.views.camera_management_view — CRUD + descubrimiento de cámaras
+================================================================================
+
+PROPÓSITO
+    Pantalla de administración del inventario de cámaras: listar, agregar,
+    editar, eliminar y activar/desactivar cámaras, además de DESCUBRIR cámaras
+    ONVIF en la red y darlas de alta. Es donde se define todo lo que el resto
+    del sistema (captura, IA, grabación, notificaciones) consumirá después.
+
+    Contiene TRES clases:
+      - CameraEditDialog : formulario de alta/edición (datos de conexión,
+        credenciales, capacidades PTZ/LEDs/audio/dual-lens, IA y qué notificar).
+        Incluye "Probar conexión" (sondeo ONVIF) y autocompletado de URLs
+        RTSP/ONVIF a partir de la IP.
+      - CameraDiscoveryThread : QThread que llama al backend para descubrir
+        cámaras ONVIF (WS-Discovery + escaneo de subnet) sin bloquear la UI.
+      - CameraManagementView : la vista (lista + panel de detalle con preview
+        en vivo + botones de acción).
+
+RESPONSABILIDAD
+    - CRUD de cámaras contra el backend y refresco de la lista con semáforo de
+      estado (🟢 en línea / 🟡 reconectando / 🔴 caída/inactiva).
+    - Descubrimiento ONVIF, distinguiendo cámaras alcanzables de las que anuncian
+      una IP de otra subred (no alcanzables), y preguntando por cada nueva si es
+      dual-lens (el backend no puede deducirlo de forma fiable).
+    - Mostrar un preview en vivo (go2rtc) de la cámara seleccionada.
+    - Sincronizar las casillas de notificación del diálogo con las preferencias
+      de notificación del usuario para esa cámara.
+
+DEPENDENCIAS (endpoints que consume vía api_client)
+    - GET    /cameras/                     → lista + worker_status (semáforo).
+    - GET    /cameras/{id}                 → (indirecto, no aquí) datos completos.
+    - POST   /cameras/                     → alta (manual o desde discovery).
+    - PUT    /cameras/{id}                 → edición.
+    - DELETE /cameras/{id}                 → borrado.
+    - PATCH  /cameras/{id}/toggle          → activar/desactivar.
+    - POST   /cameras/test-connection      → "Probar conexión" (ONVIF).
+    - POST   /cameras/discover             → descubrimiento (vía QThread, con
+                                             requests directo + JWT).
+    - GET/POST/PUT /notifications/preferences → sincronizar qué notificar por
+                                             cámara (persona/vehículo/desconexión).
+
+COMPONENTES RELACIONADOS
+    - ui/components/rtsp_video.RtspVideoWidget : preview en vivo del panel.
+    - ui/components/glass_card.GlassCard , ui/components/help_button.HelpButton.
+    - models/camera.Camera (from_dict tolera campos extra del backend).
+
+PUNTO DE ENTRADA
+    La instancia MainWindow._create_main_view (índice VIEW_CAMERAS=4). Emite
+    `camera_updated` tras cualquier alta/edición/borrado, que MainWindow conecta
+    a `_reload_cameras` para refrescar el resto de vistas (live, playback…).
+    NO carga cámaras en __init__ (se ejecuta antes del login → 401); lo hace en
+    `showEvent` si ya hay sesión.
+
+PIPELINE(S)
+    #1 Inicio (alta/configuración de las cámaras que el backend arrancará) y
+    #7 ONVIF (descubrimiento y prueba de conexión por ONVIF/WS-Discovery).
+================================================================================
 """
 import logging
 from typing import Optional, List
@@ -24,8 +82,30 @@ logger = logging.getLogger(__name__)
 
 
 class CameraEditDialog(QDialog):
-    """Diálogo para agregar/editar cámara - AHORA CON SCROLL."""
-    
+    """
+    Formulario modal de alta/edición de una cámara (con scroll).
+
+    RESPONSABILIDAD / ROL
+        Recoger y validar todos los datos de una cámara: nombre/IP,
+        credenciales, URLs RTSP/ONVIF (sección "Avanzado" colapsable que se
+        autocompleta desde la IP), capacidades (PTZ/LEDs/audio/dual-lens),
+        resolución/FPS (autodetectados, sin control manual) e IA +
+        notificaciones (persona/vehículo/desconexión). Permite "Probar conexión"
+        antes de guardar.
+
+    QUIÉN LO INSTANCIA
+        CameraManagementView._add_camera (nuevo) y `_edit_selected` (con `camera`
+        precargada).
+
+    SALIDA
+        Al aceptar, el llamador lee `get_camera_data()` (payload de la cámara) y
+        `get_notification_prefs()` (estado deseado de notificación por evento).
+
+    ENDPOINTS QUE TOCA
+        POST /cameras/test-connection (probar), GET /notifications/preferences
+        (precargar casillas al editar).
+    """
+
     def __init__(self, camera: Optional[Camera] = None, parent=None):
         super().__init__(parent)
         
@@ -479,7 +559,25 @@ class CameraEditDialog(QDialog):
 
 
 class CameraDiscoveryThread(QThread):
-    """Thread para descubrir cámaras ONVIF usando el backend."""
+    """
+    Hilo de descubrimiento ONVIF (no bloquea la UI).
+
+    RESPONSABILIDAD / ROL
+        Llamar a POST /cameras/discover con requests directo (no api_client,
+        porque corre fuera del hilo de UI) y emitir el resultado por señal. El
+        backend hace WS-Discovery (multicast) y, opcionalmente, escaneo de
+        subnet cuando el firewall bloquea el multicast.
+
+    SEÑALES QT (las conecta CameraManagementView._discover_cameras)
+        - cameras_found(list): lista de cámaras descubiertas.
+        - error(str): mensaje de fallo (timeout, conexión, etc.).
+        - finished_search(): siempre al terminar (cierra el diálogo de progreso).
+
+    DETALLE
+        El read-timeout HTTP (≥180s) es MAYOR que el cap interno del backend
+        (~90s) para que el backend devuelva resultados parciales antes de que el
+        cliente corte la conexión.
+    """
 
     cameras_found = Signal(list)
     error = Signal(str)
@@ -546,8 +644,38 @@ class CameraDiscoveryThread(QThread):
 
 
 class CameraManagementView(QWidget):
-    """Vista principal de gestión de cámaras."""
-    
+    """
+    Vista de gestión de cámaras: lista + detalle/preview + CRUD + discovery.
+
+    RESPONSABILIDAD / ROL
+        Administrar el inventario de cámaras y disparar el descubrimiento ONVIF.
+        Es la fuente de verdad de qué cámaras existen; sus cambios se propagan al
+        resto de la app vía la señal `camera_updated`.
+
+    QUIÉN LA INSTANCIA
+        MainWindow._create_main_view (índice VIEW_CAMERAS=4).
+
+    SEÑALES QT
+        EMITE:
+          - camera_updated(): tras alta/edición/borrado/toggle. La escucha
+            MainWindow → `_reload_cameras` (refresca live/playback/etc.).
+          - camera_selected(int): selección en la lista (informativa).
+        No escucha señales externas; recibe órdenes por los botones de la UI.
+
+    ESTADO
+        - `cameras`: lista de DTOs Camera cargada del backend.
+        - `_preview_camera*`: cámara/lente del preview en vivo del panel derecho.
+        - `discovery_thread`: hilo de descubrimiento en vuelo (si lo hay).
+
+    CICLO DE VIDA
+        NO carga en __init__ (pre-login → 401). Carga en `showEvent` si hay
+        sesión, y detiene el preview en `hideEvent`.
+
+    DEPENDENCIAS
+        CameraEditDialog, CameraDiscoveryThread, RtspVideoWidget (preview),
+        api_client (CRUD + test + discover + notifications/preferences).
+    """
+
     camera_selected = Signal(int)
     camera_updated = Signal()
     
@@ -755,7 +883,12 @@ class CameraManagementView(QWidget):
         self._preview_camera = None  # objeto Camera actual (para stream_url por lente)
     
     def _load_cameras(self):
-        """Carga lista de cámaras desde API."""
+        """Recarga la lista de cámaras y la pinta con semáforo de estado.
+
+        Propósito: traer las cámaras del backend, reconstruir el QListWidget
+        (icono 🟢/🟡/🔴 según worker_status, en gris si inactiva) y refrescar
+        `self.cameras`. Async (callback en hilo UI). Llamado por: `showEvent` y
+        tras cada operación CRUD. Llama a: GET /cameras/."""
         def on_response(response):
             if not response.success:
                 logger.warning(f"No se pudieron cargar cámaras: {response.error}")
@@ -793,6 +926,13 @@ class CameraManagementView(QWidget):
         return "🟢", "Activa"
     
     def _on_camera_selected(self, current, previous):
+        """Slot de selección en la lista: rellena el panel de detalle + preview.
+
+        Propósito: al elegir una cámara, habilitar los botones de acción, arrancar
+        su preview en vivo (go2rtc) y volcar nombre/IP/estado/capacidades/IA en el
+        panel. Inputs: item actual/previo del QListWidget. Señales: EMITE
+        `camera_selected(id)`. Llamado por: `list_cameras.currentItemChanged`.
+        Llama a: `_start_preview`."""
         if not current:
             self.btn_edit.setEnabled(False)
             self.btn_delete.setEnabled(False)
@@ -928,6 +1068,12 @@ class CameraManagementView(QWidget):
         super().hideEvent(event)
 
     def _add_camera(self):
+        """Abre el formulario de alta y crea la cámara en el backend.
+
+        Propósito: tras aceptar el diálogo, enviar el alta y, con el id devuelto,
+        sincronizar sus preferencias de notificación. Señales: EMITE
+        `camera_updated`. Llamado por: botón "Agregar Cámara". Llama a:
+        POST /cameras/ → `_sync_camera_notifications`, `_load_cameras`."""
         dialog = CameraEditDialog(parent=self)
         if dialog.exec() == QDialog.Accepted:
             data = dialog.get_camera_data()
@@ -973,13 +1119,18 @@ class CameraManagementView(QWidget):
         api_client.get("notifications/preferences", on_prefs)
     
     def _edit_selected(self):
+        """Edita la cámara seleccionada con el formulario precargado.
+
+        Señales: EMITE `camera_updated` al guardar. Llamado por: botón "Editar".
+        Llama a: PUT /cameras/{id} → `_sync_camera_notifications`,
+        `_load_cameras`."""
         current = self.list_cameras.currentItem()
         if not current:
             return
-        
+
         camera_id = current.data(Qt.UserRole)
         camera = next((c for c in self.cameras if c.id == camera_id), None)
-        
+
         if camera:
             dialog = CameraEditDialog(camera=camera, parent=self)
             if dialog.exec() == QDialog.Accepted:
@@ -997,13 +1148,17 @@ class CameraManagementView(QWidget):
                 api_client.put(f"cameras/{camera_id}", on_updated, data=data)
     
     def _delete_selected(self):
+        """Elimina la cámara seleccionada (con confirmación).
+
+        Señales: EMITE `camera_updated` al borrar. Llamado por: botón "Eliminar".
+        Llama a: DELETE /cameras/{id} → `_load_cameras`."""
         current = self.list_cameras.currentItem()
         if not current:
             return
-        
+
         camera_id = current.data(Qt.UserRole)
         camera = next((c for c in self.cameras if c.id == camera_id), None)
-        
+
         reply = QMessageBox.question(
             self, 
             "Confirmar Eliminación",
@@ -1022,13 +1177,17 @@ class CameraManagementView(QWidget):
             api_client.delete(f"cameras/{camera_id}", on_deleted)
     
     def _toggle_selected(self):
+        """Activa/desactiva la cámara seleccionada (arranca o para su worker).
+
+        Señales: EMITE `camera_updated`. Llamado por: botón "Activar/Desactivar".
+        Llama a: PATCH /cameras/{id}/toggle → `_load_cameras`."""
         current = self.list_cameras.currentItem()
         if not current:
             return
-        
+
         camera_id = current.data(Qt.UserRole)
         camera = next((c for c in self.cameras if c.id == camera_id), None)
-        
+
         if camera:
             new_state = not getattr(camera, 'is_active', True)
             
@@ -1042,6 +1201,12 @@ class CameraManagementView(QWidget):
             api_client.patch(f"cameras/{camera_id}/toggle", on_toggled, data={"active": new_state})
     
     def _discover_cameras(self):
+        """Lanza el descubrimiento ONVIF en un hilo y muestra progreso modal.
+
+        Propósito: arrancar CameraDiscoveryThread (WS-Discovery + subnet scan) sin
+        congelar la UI, con un QProgressDialog indeterminado. Llamado por: botón
+        "Descubrir Cámaras". Llama a (vía hilo): POST /cameras/discover; sus
+        señales van a `_on_discovered_cameras` / `_on_discovery_error`."""
         from desktop_app.src.services.api_client import api_client
         token = api_client.get_stream_token() or ""
 
@@ -1106,6 +1271,14 @@ class CameraManagementView(QWidget):
         QMessageBox.critical(self, "Error en descubrimiento", error)
 
     def _on_discovered_cameras(self, cameras):
+        """Procesa el resultado del descubrimiento y ofrece dar de alta las nuevas.
+
+        Propósito: separar alcanzables de no alcanzables (IP de otra subred),
+        filtrar las ya existentes por IP, avisar de las problemáticas y, por cada
+        cámara nueva, preguntar si es dual-lens antes de crearla (skip_probe=True
+        porque el discovery ya la probó). Inputs: `cameras` (lista de dicts del
+        backend). Señales: EMITE `camera_updated` por cada alta. Llamado por:
+        `CameraDiscoveryThread.cameras_found`. Llama a: POST /cameras/."""
         if not cameras:
             QMessageBox.information(
                 self, "Descubrimiento",

@@ -1,0 +1,49 @@
+classDiagram
+  class CircularFrameBuffer {
+    camera_id : int
+    dropped_frames : int
+    clear() None
+    get_latest() Optional[FrameData]
+    get_stats() dict
+    put(frame: np.ndarray) bool
+    size() int
+  }
+  class FrameData {
+    camera_id : int
+    frame : ndarray
+    frame_id : int
+    stream_id : str
+    timestamp : float
+  }
+  class Go2RtcManager {
+    cfg
+    public_host : str
+    hls_url(camera_id: int, lens: Optional[str], quality: str) str
+    is_enabled() bool
+    is_running() bool
+    reconcile() None
+    reload(cameras: Iterable[Any]) None
+    rtsp_restream_url(camera_id: int, lens: Optional[str], quality: str) str
+    start(cameras: Iterable[Any]) bool
+    stop() None
+    webrtc_api_base() str
+    write_config(cameras: Iterable[Any]) str
+  }
+  class HLSService {
+    CACHE_TTL_SECONDS : int
+    MAX_CONCURRENT_CONVERSIONS : int
+    SEGMENT_DURATION : int
+    get_hls_manifest(recording_id: int, mp4_path: str) Optional[str]
+    get_segment(recording_id: int, segment_name: str) Optional[str]
+    shutdown()
+  }
+  class StreamKeepAlive {
+    start(rtsp_base: str, env_extra: Optional[List[str]]) bool
+    stop() None
+  }
+  class WebRTCSignalingError {
+  }
+  class WebRTCSignalingService {
+    exchange(camera_id: int, offer_sdp: str, timeout: float) str
+    webrtc_endpoint(camera_id: int) str
+  }

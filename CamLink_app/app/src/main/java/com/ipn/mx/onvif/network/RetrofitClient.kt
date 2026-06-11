@@ -1,3 +1,35 @@
+/*
+ * ============================================================================
+ * MÓDULO: network/RetrofitClient — fábrica del ApiService + gestión del token
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Singleton (object) que construye la instancia de [ApiService] apuntando al
+ *   servidor LAN elegido, inyecta el header `Authorization: Bearer <access>` en
+ *   cada petición y custodia el JWT (en memoria + SharedPreferences).
+ *
+ * RESPONSABILIDAD
+ *   - create(): arma el OkHttpClient (timeouts, logging, interceptor de
+ *     Authorization, [JwtAuthenticator]) y el Retrofit con GsonConverterFactory.
+ *   - saveToken / clearToken / getAccessToken: ciclo de vida del JWT.
+ *   - buildBaseUrl: reconstruye la URL del servidor desde las prefs.
+ *
+ * DEPENDENCIAS
+ *   - network/ApiService ....... interfaz que Retrofit implementa.
+ *   - network/JwtAuthenticator . refresh automático del token ante 401.
+ *   - SharedPreferences "auth_prefs" (token, IP y puerto del servidor).
+ *
+ * COMPONENTES RELACIONADOS
+ *   QrScanFragment llama a saveToken() tras el registro; los fragments crean el
+ *   ApiService con create(buildBaseUrl(ctx), ctx); MainActivity llama
+ *   clearToken() al expirar la sesión.
+ *
+ * PUNTO DE ENTRADA
+ *   [create] (construcción) y [saveToken] (tras login/registro por QR).
+ *
+ * PIPELINE: #2 Auth (lado móvil) — etapa de transporte HTTP autenticado.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.network
 
 import android.content.Context
@@ -7,6 +39,14 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import java.util.concurrent.TimeUnit
 
+/**
+ * Fábrica del [ApiService] y custodia del JWT.
+ *
+ * Rol: única vía por la que la app obtiene un cliente REST autenticado.
+ * Quién lo consume: fragments/servicios (create + getAccessToken) y el flujo de
+ * login/QR (saveToken/clearToken). Mantiene [accessToken] en memoria como caché
+ * del valor persistido en SharedPreferences "auth_prefs".
+ */
 object RetrofitClient {
 
     // Token JWT en memoria — se carga desde SharedPreferences al crear el cliente
@@ -98,7 +138,14 @@ object RetrofitClient {
             .apply()
     }
 
-    /** Construye la base URL a partir de los datos guardados en SharedPreferences. */
+    /**
+     * Construye la base URL a partir de los datos guardados en SharedPreferences.
+     *
+     * @return "http://<ip>:<puerto>" (puerto 5000 por defecto), o null si aún no
+     *         se ha guardado la IP del servidor.
+     * Llamado por: los fragments antes de invocar [create], y para anteponerla a
+     * las URLs relativas firmadas de grabaciones/miniaturas.
+     */
     fun buildBaseUrl(context: Context): String? {
         val prefs = context.getSharedPreferences("auth_prefs", Context.MODE_PRIVATE)
         val ip   = prefs.getString("serverIp", null) ?: return null
@@ -106,6 +153,14 @@ object RetrofitClient {
         return "http://$ip:$port"
     }
 
+    /**
+     * Devuelve el access_token vigente: el de memoria si existe, si no el
+     * persistido en SharedPreferences.
+     *
+     * @return el JWT de acceso, o null si no hay sesión.
+     * Llamado por: componentes que necesitan el token fuera de Retrofit
+     * (p. ej. el WebSocket de notificaciones o las URLs de descarga).
+     */
     fun getAccessToken(context: Context): String? {
         if (accessToken != null) return accessToken
         val prefs = context.getSharedPreferences("auth_prefs", Context.MODE_PRIVATE)

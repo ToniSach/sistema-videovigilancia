@@ -1,9 +1,29 @@
 """
-Sparkline — mini-gráfica de línea para series temporales (CPU, RAM, etc.).
+================================================================================
+MÓDULO: ui.components.sparkline — Mini-gráfica de línea para métricas
+================================================================================
 
-Ligera: se dibuja con QPainter, sin dependencias (matplotlib/pyqtgraph). Mantiene
-una ventana deslizante de los últimos N valores (0-100) y los pinta como una línea
-con relleno suave. Pensada para incrustar dentro de una tarjeta de estadísticas.
+PROPÓSITO
+    Sparkline: mini-gráfica de línea para series temporales (CPU, RAM, FPS,
+    latencia, etc.). Ligera, dibujada con QPainter, sin dependencias externas
+    (no usa matplotlib/pyqtgraph).
+
+RESPONSABILIDAD
+    Mantener una ventana deslizante (deque) de los últimos `capacity` valores en
+    rango 0-100 y pintarlos como una línea con relleno degradado y un punto en
+    el valor más reciente. Pensada para incrustar en una tarjeta de estadísticas.
+
+DEPENDENCIAS
+    PySide6 (QWidget, QPainter y primitivas de pintado), config (color de
+    acento por defecto). collections.deque para la ventana deslizante.
+
+COMPONENTES RELACIONADOS
+    glass_card.py (suele alojar la sparkline), dashboards/vistas de métricas que
+    alimentan add_value() con datos del backend (p.ej. /system/metrics).
+
+DÓNDE SE USA
+    En tarjetas de estadísticas del dashboard y paneles de estado del sistema.
+================================================================================
 """
 from collections import deque
 
@@ -15,7 +35,18 @@ from desktop_app.src.config import config
 
 
 class Sparkline(QWidget):
-    """Gráfica de línea de los últimos `capacity` valores (rango 0-100)."""
+    """Gráfica de línea de los últimos `capacity` valores (rango 0-100).
+
+    Rol: indicador visual ligero de tendencia de una métrica.
+    Quién la instancia/consume: tarjetas de estadísticas/dashboards, que llaman
+        add_value() periódicamente con datos del backend.
+    Señales Qt: ninguna (es solo presentación; ignora el ratón).
+    Dependencias: config (color por defecto), QPainter.
+
+    Parámetros:
+        capacity: nº de muestras de la ventana deslizante (ancho del historial).
+        color: color de la línea (hex); si None usa config.THEME_ACCENT.
+    """
 
     def __init__(self, capacity: int = 60, color: str = None, parent=None):
         super().__init__(parent)
@@ -25,7 +56,12 @@ class Sparkline(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
     def add_value(self, value: float):
-        """Añade un valor (se clampa a 0-100) y repinta."""
+        """Añade una muestra a la ventana deslizante y repinta.
+
+        Inputs: value (numérico; se clampa a 0-100; valores no convertibles → 0).
+        Outputs: ninguno (al superar `capacity`, el deque descarta la más antigua).
+        Llamado por: el código que alimenta la métrica (timer/callback de datos).
+        """
         try:
             v = max(0.0, min(100.0, float(value)))
         except (TypeError, ValueError):

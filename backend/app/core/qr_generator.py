@@ -1,6 +1,23 @@
 """
-Generador de códigos QR para conexión rápida de dispositivos.
-Permite a apps móviles escanear y conectarse automáticamente.
+MÓDULO: core.qr_generator — Utilidad de bajo nivel para generar imágenes QR.
+
+PROPÓSITO
+    Renderizar códigos QR como PNG en memoria: (a) un QR de conexión que codifica
+    {usuario, servidor, token} en JSON para emparejar la app móvil, y (b) un QR
+    WiFi en formato estándar para aprovisionar redes en cámaras/IoT.
+
+RESPONSABILIDAD
+    Pura generación de imagen (qrcode + Pillow). NO gestiona la lógica de
+    vinculación (tokens de un solo uso, caducidad, persistencia): de eso se
+    encarga services.qr_service.QRService, que es el camino usado por el
+    endpoint api/routes/qr.py. Este módulo es la herramienta gráfica reutilizable.
+
+DEPENDENCIAS / COMPONENTES RELACIONADOS
+    qrcode, PIL(Pillow). Relacionado con QRService (lógica de tokens) y el
+    Pipeline #2/#13 (alta del dispositivo móvil).
+
+PUNTO DE ENTRADA
+    Instanciar QRGenerator y llamar a generate_connection_qr / generate_wifi_qr.
 """
 import logging
 import json

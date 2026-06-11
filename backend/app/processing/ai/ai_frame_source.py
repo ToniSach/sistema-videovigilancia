@@ -17,6 +17,37 @@ Diseño:
 
 Esto desacopla la IA del pipeline de captura: funciona aunque la cámara no
 esté "activa" en CameraManager (la IA ya no necesita su FrameDistributor).
+
+--------------------------------------------------------------------------------
+RESPONSABILIDAD PRINCIPAL
+    Mantener UN ffmpeg leyendo el substream bajo de go2rtc, decodificarlo a
+    BGR24 letterbox de tamaño fijo y dejar SIEMPRE el último frame en un slot de
+    tamaño 1 (newest-wins), reconectando con backoff si el stream cae.
+
+DEPENDENCIAS
+    subprocess/ffmpeg ... decodifica RTSP → rawvideo BGR24 por stdout.
+    numpy ............... reconstruye cada frame (frombuffer + reshape).
+    Go2RtcManager ....... provee la URL RTSP del restream (rtsp_restream_url).
+
+COMPONENTES RELACIONADOS
+    AIService.activate_ai .. crea e inicia el AIFrameSource y lo pasa al
+                             AIScheduler.start(frame_source).
+    AIScheduler ............ ÚNICO consumidor: hace polling de get_latest().
+
+PUNTO DE ENTRADA
+    AIFrameSource(camera_id, lens, ...).start()  → lanza el hilo _loop (daemon).
+    El consumidor lee con get_latest(); stop() mata ffmpeg y el hilo.
+
+PIPELINE(S)
+    Pipeline de IA (#9) — ETAPA 2 (fuente de frames). Diagrama:
+
+        go2rtc (cam_X[_lY]_low) ──RTSP──> [ffmpeg -vf scale+pad+fps]
+                                              │ rawvideo BGR24 por stdout
+                                              ▼
+                               _loop: frombuffer+reshape → slot[1] (newest-wins)
+                                              │ get_latest() (seq, frame)
+                                              ▼
+                          AIScheduler worker → MotionDetector → YOLO (etapas 3-4)
 """
 from __future__ import annotations
 
@@ -32,6 +63,23 @@ logger = logging.getLogger(__name__)
 
 
 class AIFrameSource:
+    """
+    Fuente de frames dedicada y mínima para la IA (Pipeline #9, ETAPA 2).
+
+    ROL: reemplaza la cadena FFmpegWorker→CircularFrameBuffer→FrameDistributor
+    cuando el único consumidor es la IA. Lee el substream BAJO de go2rtc con un
+    ffmpeg propio y publica el último frame BGR24 letterbox en un slot de 1.
+
+    QUIÉN LA INSTANCIA / CONSUME
+        Instanciada por AIService.activate_ai (no es singleton: una por cámara/
+        lente activa). Su único consumidor es el worker del AIScheduler, que la
+        sondea con get_latest(). No hay fan-out ni colas.
+
+    THREADING
+        start() lanza un hilo daemon (_loop) que es el ÚNICO escritor del slot;
+        get_latest() es el único lector. Ambos se sincronizan con self._lock.
+    """
+
     def __init__(self, camera_id: int, lens: Optional[str] = None,
                  width: int = 640, height: int = 384, fps: int = 6,
                  quality: str = "low"):
@@ -89,6 +137,18 @@ class AIFrameSource:
 
     # ------------------------------------------------------------------
     def start(self) -> bool:
+        """
+        Arranca el hilo lector (_loop, daemon) que mantiene caliente el slot.
+
+        PROPÓSITO (Pipeline #9, ETAPA 2): abrir la fuente para que el AIScheduler
+        tenga frames que sondear. Idempotente: si ya corre, devuelve True sin
+        relanzar nada.
+
+        Outputs: True (siempre; el éxito real de ffmpeg se verifica dentro del
+            loop con reconexión por backoff).
+        Llamado por: AIService.activate_ai, ANTES de AIScheduler.start(self).
+        Llama a: threading.Thread(_loop).start().
+        """
         if self._running:
             return True
         self._running = True
@@ -103,6 +163,17 @@ class AIFrameSource:
         return True
 
     def _loop(self) -> None:
+        """
+        Bucle del hilo lector: lanza ffmpeg, lee frames y reconecta con backoff.
+
+        PROPÓSITO (Pipeline #9, ETAPA 2): por cada frame raw recibido por stdout,
+        reconstruirlo (frombuffer+reshape) y depositarlo en el slot (newest-wins,
+        incrementando _seq). Si ffmpeg cae (EOF) reconecta con backoff
+        exponencial 1s→15s; si la URL go2rtc aún no existe, reintenta cada 2s.
+
+        Llamado por: el hilo creado en start() (NO invocar directamente).
+        Llama a: _build_url, _ffmpeg_cmd, _read_exact, _kill_proc.
+        """
         backoff = 1.0
         while self._running:
             url = self._build_url()
@@ -169,15 +240,36 @@ class AIFrameSource:
 
     # ------------------------------------------------------------------
     def get_latest(self) -> Tuple[int, Optional[np.ndarray]]:
-        """Devuelve (seq, frame). frame es None si aún no hay. seq permite al
-        consumidor saber si el frame es nuevo (evitar reprocesar el mismo)."""
+        """
+        Devuelve el último frame del slot junto con su número de secuencia.
+
+        PROPÓSITO (Pipeline #9, ETAPA 2→3): entregar al AIScheduler el frame más
+        reciente sin colas. `seq` permite al consumidor saber si el frame es
+        NUEVO (seq distinto del anterior) y así no reprocesar el mismo.
+
+        Outputs: (seq, frame). frame es None si aún no llegó ninguno.
+        Llamado por: AIScheduler._inference_worker (en su bucle de polling).
+        Siguiente etapa: MotionDetector.detect(frame) si seq cambió.
+        """
         with self._lock:
             return self._seq, self._slot
 
     def is_alive(self) -> bool:
+        """
+        True si la fuente está corriendo Y recibió un frame en los últimos 10s.
+
+        Lo usa el AIScheduler para distinguir "fuente sana" de "fuente muerta":
+        si devuelve False, el worker resetea el MotionDetector para no comparar
+        contra un frame stale al reconectar.
+        """
         return self._running and (time.time() - self._last_frame_t) < 10.0
 
     def stop(self) -> None:
+        """
+        Detiene la fuente: corta el bucle, mata ffmpeg, hace join del hilo y
+        vacía el slot. Llamado por AIService al desactivar la IA o al reciclar
+        la fuente. Idempotente.
+        """
         self._running = False
         self._kill_proc()
         if self._thread and self._thread.is_alive():

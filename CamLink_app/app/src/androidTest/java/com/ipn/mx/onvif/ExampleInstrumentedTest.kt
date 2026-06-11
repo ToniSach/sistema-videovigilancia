@@ -1,3 +1,7 @@
+/*
+ * Test instrumentado por defecto generado por el wizard de Android Studio.
+ * Boilerplate de ejemplo (verifica el applicationId); no cubre lógica propia.
+ */
 package com.ipn.mx.onvif
 
 import androidx.test.platform.app.InstrumentationRegistry

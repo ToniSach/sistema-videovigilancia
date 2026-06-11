@@ -1,5 +1,29 @@
 """
-Hardware Detector - Detección automática de capacidades GPU/CPU.
+MÓDULO: core.hardware_detector — Detección de capacidades de cómputo (GPU/CPU).
+
+PROPÓSITO
+    Inspeccionar en runtime si hay GPU CUDA disponible (vía PyTorch) y cuántos
+    núcleos de CPU hay, para RECOMENDAR un backend de inferencia y estimar
+    cuántas cámaras pueden correr IA simultáneamente.
+
+RESPONSABILIDAD
+    Solo diagnóstico/recomendación: no carga modelos ni configura nada. El pool
+    real de YOLO (processing/ai/model_pool.py) decide el device final; este
+    módulo aporta la "foto" del hardware para la UI/configuración y para acotar
+    expectativas (en CPU solo 1 cámara con IA ≈5 fps; con CUDA hasta 4 ≈30 fps).
+
+DEPENDENCIAS / COMPONENTES RELACIONADOS
+    torch (opcional; si falta → solo CPU). Consumido por la capa de sistema/IA
+    para informar al usuario y por endpoints de hardware info.
+
+PIPELINE
+    Apoya el Pipeline #9 (IA): orienta qué backend usar y cuántas inferencias
+    son realistas. Nota: el proyecto suele usar aceleración por hardware en el
+    decode (go2rtc QSV), independiente de esta detección de CUDA para YOLO.
+
+PUNTO DE ENTRADA
+    Instancia global `hardware_detector` al final del módulo; llamar a
+    `.detect()` para obtener el dict de capacidades.
 """
 import logging
 import os
@@ -10,8 +34,11 @@ logger = logging.getLogger(__name__)
 
 class HardwareDetector:
     """
-    Detecta hardware disponible para IA y video.
-    Soporta NVIDIA CUDA y fallback CPU.
+    Detecta el hardware de cómputo disponible para IA y vídeo.
+
+    Rol: utilidad de diagnóstico (no es singleton __new__; se usa la instancia
+    de módulo `hardware_detector`). Soporta GPU NVIDIA CUDA con fallback a CPU.
+    Consumido por la capa de info de sistema/IA para recomendar backend y límites.
     """
     
     def __init__(self):

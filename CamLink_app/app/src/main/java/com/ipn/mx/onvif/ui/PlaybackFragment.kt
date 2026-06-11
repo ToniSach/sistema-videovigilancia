@@ -1,10 +1,53 @@
+/*
+ * ============================================================================
+ * MÓDULO: PlaybackFragment — Reproductor de grabaciones históricas (CamLink)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Pantalla que reproduce grabaciones almacenadas en el backend NVR mediante
+ *   ExoPlayer (Media3). Reproduce desde las URLs FIRMADAS (token HMAC) que
+ *   entrega el backend, encadenando los segmentos de un día para verlos como
+ *   una línea de tiempo continua.
+ *
+ * RESPONSABILIDAD
+ *   - Construir la lista (playlist) de MediaItem a reproducir según el modo:
+ *       · Legado: un único `recordingId`.
+ *       · Día/timeline: `cameraId` + `date` + `mode` → todas las grabaciones
+ *         del día de ese tipo, ordenadas y reproducidas EN CADENA.
+ *   - Posicionar el índice inicial (por `startRecordingId` o por `targetTime`,
+ *     buscando el segmento más cercano al instante del evento de la push).
+ *   - Cámaras dual-lens: el RECORTE de lente lo hace el BACKEND server-side; el
+ *     fragment solo añade `?lens=l1|l2` a la URL firmada y re-pide al servidor
+ *     al alternar el lente (ver streamUrl / reloadWithCurrentLens).
+ *   - Controles de transporte (play/pause, anterior/siguiente, seek) y barra
+ *     de progreso sincronizada con la posición de ExoPlayer.
+ *
+ * DEPENDENCIAS
+ *   - androidx.media3 (ExoPlayer + PlayerView): decodificación/render del vídeo.
+ *   - RetrofitClient + ApiService: resuelve la URL base y consulta metadatos de
+ *     grabaciones (getRecordings / getRecording / getCamera). El vídeo en sí NO
+ *     pasa por Retrofit, se sirve por HTTP con URL firmada directa a ExoPlayer.
+ *   - model.RecordingResponse: DTO de cada grabación (incluye playbackUrl/fileUrl).
+ *
+ * COMPONENTES RELACIONADOS
+ *   - RecordingsHostFragment / RecordingsFragment / TimelineFragment: listan las
+ *     grabaciones y navegan aquí con los argumentos de reproducción.
+ *   - MainActivity.handleNotificationIntent: abre este fragment al tocar una
+ *     push de evento (argumentos cameraId/date/mode=event/targetTime).
+ *
+ * PUNTO DE ENTRADA
+ *   Destino de Navigation `playbackFragment`. Se instancia al navegar desde las
+ *   listas de grabaciones o desde el deep-link de notificación.
+ *
+ * PIPELINE(S)
+ *   #14 Reproducción histórica — etapa final (cliente reproduce los segmentos
+ *   grabados por el Pipeline #11 Grabación, servidos con URL firmada).
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
-import android.graphics.Matrix
-import android.graphics.RectF
 import android.os.Bundle
 import android.view.LayoutInflater
-import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -16,9 +59,9 @@ import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
-import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
 import com.google.android.material.button.MaterialButton
 import com.ipn.mx.onvif.R
 import com.ipn.mx.onvif.model.RecordingResponse
@@ -31,22 +74,29 @@ import java.util.Locale
 
 /**
  * Reproductor de grabaciones. Dos modos:
+ *   1. Legado: un único `recordingId`.
+ *   2. Timeline: `cameraId` + `date` + `mode` → reproduce EN CADENA todas las
+ *      grabaciones del día de ese tipo.
  *
- *  1. Legado: un único `recordingId` (String) → reproduce esa grabación.
- *  2. Timeline: `cameraId` + `date` + `mode` (continuous|event) → carga TODAS
- *     las grabaciones del día de ese tipo y las reproduce EN CADENA (timeline),
- *     empezando en `startRecordingId` o en la que cubre `targetTime` (link de
- *     una alerta). ExoPlayer encadena los MediaItems automáticamente.
+ * Recorte dual-lens: SERVER-SIDE. La grabación es el combinado (dos lentes
+ * apilados); el backend devuelve solo el lente pedido vía `?lens=l1|l2` en la
+ * URL firmada (recortado + cacheado). Antes se intentaba recortar en el cliente
+ * con una matriz sobre TextureView, pero sangraba el otro lente en el letterbox;
+ * el recorte en servidor es fiable y se ve con `PlayerView` (encaje automático).
  *
- * Dual-lens: el archivo es el combinado (dos lentes apilados). El recorte por
- * lente se hace en el CLIENTE con una matriz sobre el TextureView (sin re-pedir
- * ni transcodificar nada en el servidor); el toggle cambia de lente al instante.
- *   - l2 = mitad superior, l1 = mitad inferior (igual que go2rtc/desktop).
+ * Lo instancian RecordingsHostFragment / TimelineFragment / RecordingsFragment
+ * (vía NavController) y MainActivity al tocar una notificación push de evento.
+ *
+ * Ciclo de vida: los argumentos se leen en onCreate; ExoPlayer se crea de forma
+ * perezosa tras resolver la playlist en loadAndPlay (onViewCreated); se pausa en
+ * onPause y se LIBERA en onDestroyView (release) para no fugar el codec/surface.
+ *
+ * Pipeline #14 (reproducción histórica).
  */
 class PlaybackFragment : Fragment() {
 
     private var player: ExoPlayer? = null
-    private var textureView: TextureView? = null
+    private var playerView: PlayerView? = null
     private var btnLensToggle: MaterialButton? = null
     private var isSeekingByUser = false
 
@@ -58,11 +108,11 @@ class PlaybackFragment : Fragment() {
     private var argStartRecordingId = -1
     private var argTargetTime: String? = null
     private var isDualLens = false
-
-    // Estado de recorte por lente
     private var currentLens: String? = null     // null = sin recorte | "l1" | "l2"
-    private var videoW = 0
-    private var videoH = 0
+
+    // Estado de la lista (para reconstruir URLs al cambiar de lente sin re-pedir).
+    private var recordings: List<RecordingResponse> = emptyList()
+    private var baseUrlCached: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -94,24 +144,22 @@ class PlaybackFragment : Fragment() {
         val btnNext        = view.findViewById<ImageButton>(R.id.btnNext)
         btnLensToggle      = view.findViewById(R.id.btnLensToggle)
 
-        // TextureView (en vez de PlayerView) para poder recortar por lente con
-        // una matriz. Se inserta detrás del botón de lente (índice 0).
-        val tv = TextureView(requireContext()).apply {
+        // PlayerView de Media3 (encaje de aspecto automático). El recorte ya
+        // viene del servidor, así que no hace falta transformar la superficie.
+        val pv = PlayerView(requireContext()).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
-            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyLensTransform() }
+            useController = false
         }
-        videoContainer.addView(tv, 0)
-        textureView = tv
+        videoContainer.addView(pv, 0)
+        playerView = pv
 
-        // Toggle de lente (visibilidad real se decide en refreshLensUi, una vez
-        // sabemos si la cámara es dual — el link de alerta no lo informa).
         btnLensToggle?.setOnClickListener {
             currentLens = if (currentLens == "l2") "l1" else "l2"
             updateLensButtonText()
-            applyLensTransform()   // recorte instantáneo, sin recargar
+            reloadWithCurrentLens()   // re-pide el otro lente al servidor
         }
         refreshLensUi()
 
@@ -129,7 +177,6 @@ class PlaybackFragment : Fragment() {
                 }
             }
         }
-        // En modo timeline saltan a la grabación anterior/siguiente del día.
         btnPrevious.setOnClickListener {
             val p = player ?: return@setOnClickListener
             if (p.hasPreviousMediaItem() && p.currentPosition < 3000) p.seekToPreviousMediaItem()
@@ -168,7 +215,6 @@ class PlaybackFragment : Fragment() {
         btnLensToggle?.text = if (currentLens == "l2") "Lente 2" else "Lente 1"
     }
 
-    /** Muestra/oculta el toggle de lente según si la cámara es dual. */
     private fun refreshLensUi() {
         if (isDualLens) {
             if (currentLens == null) currentLens = "l1"
@@ -180,15 +226,60 @@ class PlaybackFragment : Fragment() {
         }
     }
 
+    /**
+     * URL absoluta de reproducción de una grabación, con recorte por lente
+     * server-side si la cámara es dual y hay lente activo (`&lens=`).
+     *
+     * Prefiere `playbackUrl` y cae a `fileUrl`; si la URL es relativa la
+     * antepone con la base cacheada. La URL ya viene FIRMADA (token HMAC) del
+     * backend, por lo que ExoPlayer la consume directamente.
+     *
+     * @param rec grabación de la que obtener la URL.
+     * @return URL absoluta lista para ExoPlayer, o null si no hay URL/base.
+     * Llamado por: buildMediaItems.
+     */
+    private fun streamUrl(rec: RecordingResponse): String? {
+        val base = baseUrlCached ?: return null
+        val raw = rec.playbackUrl?.let { if (it.startsWith("http")) it else base + it }
+            ?: rec.fileUrl?.let { if (it.startsWith("http")) it else base + it }
+            ?: return null
+        if (!isDualLens || currentLens == null) return raw
+        val sep = if (raw.contains("?")) "&" else "?"
+        return "$raw${sep}lens=$currentLens"
+    }
+
+    /**
+     * Convierte la lista actual de grabaciones en MediaItem para la playlist de
+     * ExoPlayer (uno por segmento, con su URL firmada y el lente activo).
+     *
+     * @return lista de MediaItem en el mismo orden que `recordings`.
+     * Llamado por: loadAndPlay, reloadWithCurrentLens. Llama a: streamUrl.
+     */
+    private fun buildMediaItems(): List<MediaItem> =
+        recordings.mapNotNull { streamUrl(it)?.let { u -> MediaItem.fromUri(u) } }
+
+    /**
+     * Resuelve la playlist, crea el ExoPlayer y arranca la reproducción.
+     *
+     * Flujo: resuelve la URL base → (si vino por cámara) consulta getCamera para
+     * saber si es dual-lens y activar el toggle → construye la lista del día
+     * (buildDayPlaylist) o la grabación única (getRecording) → arma los MediaItem
+     * y reproduce desde el índice inicial calculado.
+     *
+     * @param btnPlayPause botón cuyo icono se sincroniza con onIsPlayingChanged.
+     * Llamado por: onViewCreated. Llama a: buildDayPlaylist, buildMediaItems,
+     * ApiService.getCamera/getRecordings/getRecording.
+     */
     @OptIn(UnstableApi::class)
     private fun loadAndPlay(btnPlayPause: ImageButton) {
         val baseUrl = RetrofitClient.buildBaseUrl(requireContext()) ?: return
+        baseUrlCached = baseUrl
         val api = RetrofitClient.create(baseUrl, requireContext())
 
         viewLifecycleOwner.lifecycleScope.launch {
             try {
-                // Si venimos por cámara (timeline/alerta) y no sabíamos si es dual,
-                // consultarlo para activar el recorte por lente automáticamente.
+                // Si venimos por cámara y no sabíamos si es dual, consultarlo para
+                // activar el recorte por lente automáticamente.
                 if (argCameraId > 0 && !isDualLens) {
                     try {
                         isDualLens = api.getCamera(argCameraId).isDualLens
@@ -196,24 +287,26 @@ class PlaybackFragment : Fragment() {
                     } catch (_: Exception) {}
                 }
 
-                // Construir la lista de reproducción (URL absolutas firmadas) +
-                // el índice donde empezar.
-                val (urls, startIndex) = if (argCameraId > 0 && !argDate.isNullOrBlank()) {
-                    buildDayPlaylist(api, baseUrl)
+                val startIndex: Int
+                if (argCameraId > 0 && !argDate.isNullOrBlank()) {
+                    val (recs, idx) = buildDayPlaylist(api)
+                    recordings = recs
+                    startIndex = idx
                 } else {
                     val rec = argRecordingId?.let { api.getRecording(it).data }
-                    val u = rec?.let { absUrl(it, baseUrl) }
-                    (listOfNotNull(u)) to 0
+                    recordings = listOfNotNull(rec)
+                    startIndex = 0
                 }
 
-                if (urls.isEmpty()) {
+                val items = buildMediaItems()
+                if (items.isEmpty()) {
                     Toast.makeText(requireContext(), "No hay grabaciones para reproducir", Toast.LENGTH_LONG).show()
                     return@launch
                 }
 
                 player = ExoPlayer.Builder(requireContext()).build().also { exo ->
-                    textureView?.let { exo.setVideoTextureView(it) }
-                    exo.setMediaItems(urls.map { MediaItem.fromUri(it) }, startIndex, 0L)
+                    playerView?.player = exo
+                    exo.setMediaItems(items, startIndex.coerceIn(0, items.size - 1), 0L)
                     exo.prepare()
                     exo.playWhenReady = true
                     exo.addListener(object : Player.Listener {
@@ -221,11 +314,6 @@ class PlaybackFragment : Fragment() {
                             btnPlayPause.setImageResource(
                                 if (isPlaying) R.drawable.ic_record_stop else R.drawable.ic_play
                             )
-                        }
-                        override fun onVideoSizeChanged(size: VideoSize) {
-                            videoW = size.width
-                            videoH = size.height
-                            applyLensTransform()
                         }
                     })
                 }
@@ -235,19 +323,40 @@ class PlaybackFragment : Fragment() {
         }
     }
 
-    /** Pide las grabaciones del día, filtra por tipo de la pestaña, las ordena
-     *  cronológicamente y devuelve (urls, índiceInicial). */
+    /** Re-pide la lista con el lente actual conservando posición e índice. */
+    private fun reloadWithCurrentLens() {
+        val p = player ?: return
+        if (recordings.isEmpty()) return
+        val idx = p.currentMediaItemIndex
+        val pos = p.currentPosition
+        val items = buildMediaItems()
+        if (items.isEmpty()) return
+        p.setMediaItems(items, idx.coerceIn(0, items.size - 1), pos)
+        p.prepare()
+        p.play()
+    }
+
+    /**
+     * Grabaciones del día filtradas por tipo, ordenadas, + índice inicial.
+     *
+     * Pide `getRecordings(cameraId, date)`, filtra por `argMode` (o todas),
+     * ordena por hora de inicio y calcula el índice de arranque: por
+     * `argStartRecordingId` si llega, o por el segmento más cercano a
+     * `argTargetTime` (instante del evento de una push).
+     *
+     * @param api cliente Retrofit ya construido con la URL base.
+     * @return par (lista de grabaciones del día, índice inicial en esa lista).
+     * Llamado por: loadAndPlay. Usa endpoint GET /recordings.
+     */
     private suspend fun buildDayPlaylist(
-        api: com.ipn.mx.onvif.network.ApiService, baseUrl: String
-    ): Pair<List<String>, Int> {
+        api: com.ipn.mx.onvif.network.ApiService
+    ): Pair<List<RecordingResponse>, Int> {
         val all = api.getRecordings(cameraId = argCameraId, date = argDate).data ?: emptyList()
         val filtered = all
             .filter { argMode == "all" || it.type == argMode }
-            .sortedBy { it.startedAt }   // ascendente = orden timeline
-        if (filtered.isEmpty()) return emptyList<String>() to 0
+            .sortedBy { it.startedAt }
+        if (filtered.isEmpty()) return emptyList<RecordingResponse>() to 0
 
-        // Índice de inicio: por id explícito, o por la grabación que cubre/precede
-        // a targetTime (link de alerta), o 0.
         var startIndex = 0
         if (argStartRecordingId > 0) {
             val idx = filtered.indexOfFirst { (it.id.toIntOrNull() ?: -1) == argStartRecordingId }
@@ -255,7 +364,6 @@ class PlaybackFragment : Fragment() {
         } else if (!argTargetTime.isNullOrBlank()) {
             val target = parseIso(argTargetTime)
             if (target > 0) {
-                // Grabación con inicio MÁS CERCANO al instante de la alerta.
                 val idx = filtered.indices.minByOrNull {
                     val t = parseIso(filtered[it].startedAt)
                     if (t > 0) kotlin.math.abs(t - target) else Long.MAX_VALUE
@@ -263,48 +371,7 @@ class PlaybackFragment : Fragment() {
                 startIndex = idx ?: 0
             }
         }
-        val urls = filtered.mapNotNull { absUrl(it, baseUrl) }
-        // Si alguna URL faltó, recalcular el índice por seguridad (mapNotNull
-        // podría descolocarlo); como las firmadas siempre vienen, es defensivo.
-        return urls to startIndex.coerceIn(0, (urls.size - 1).coerceAtLeast(0))
-    }
-
-    private fun absUrl(rec: RecordingResponse, baseUrl: String): String? {
-        val u = rec.playbackUrl?.let { if (it.startsWith("http")) it else baseUrl + it } ?: rec.fileUrl
-        return u?.takeIf { it.isNotBlank() }
-    }
-
-    /** Aplica el recorte por lente sobre el TextureView. Cada lente del combinado
-     *  es 16:9; lo encajamos (fit) centrado en el contenedor. Sin lente = vídeo
-     *  completo encajado. */
-    private fun applyLensTransform() {
-        val tv = textureView ?: return
-        val cw = tv.width.toFloat()
-        val ch = tv.height.toFloat()
-        if (cw <= 0f || ch <= 0f || videoW <= 0 || videoH <= 0) return
-
-        val lens = currentLens
-        // Región de origen (en coordenadas de la vista, donde por defecto el buffer
-        // completo ocupa [0,0,cw,ch]).
-        val src = when (lens) {
-            "l2" -> RectF(0f, 0f, cw, ch / 2f)   // mitad superior
-            "l1" -> RectF(0f, ch / 2f, cw, ch)   // mitad inferior
-            else -> RectF(0f, 0f, cw, ch)
-        }
-        // Tamaño del contenido a mostrar (px de origen) y su encaje centrado.
-        val contentW = videoW.toFloat()
-        val contentH = if (lens == null) videoH.toFloat() else videoH / 2f
-        val scale = minOf(cw / contentW, ch / contentH)
-        val dW = contentW * scale
-        val dH = contentH * scale
-        val ox = (cw - dW) / 2f
-        val oy = (ch - dH) / 2f
-        val dst = RectF(ox, oy, ox + dW, oy + dH)
-
-        val m = Matrix()
-        m.setRectToRect(src, dst, Matrix.ScaleToFit.FILL)
-        tv.setTransform(m)
-        tv.invalidate()
+        return filtered to startIndex
     }
 
     private fun parseIso(iso: String?): Long {
@@ -324,7 +391,7 @@ class PlaybackFragment : Fragment() {
         super.onDestroyView()
         player?.release()
         player = null
-        textureView = null
+        playerView = null
         btnLensToggle = null
     }
 }

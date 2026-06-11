@@ -1,3 +1,42 @@
+/*
+ * ============================================================================
+ * MÓDULO: NotificationsPanelFragment — pantalla del historial de notificaciones
+ *         (Pipeline #13 Notificaciones, lado móvil)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Mostrar al usuario el historial de eventos/alertas: una lista (RecyclerView)
+ *   alimentada por REST y refrescada en vivo con los eventos que llegan por el
+ *   WebSocket. Cada alerta es accionable: al tocarla se abre el playback del
+ *   instante del evento.
+ *
+ * RESPONSABILIDAD
+ *   - Cargar el historial (GET /mobile/notifications/history) al abrir y en
+ *     pull-to-refresh.
+ *   - Escuchar el broadcast in-app ACTION_EVENT_RECEIVED de
+ *     NotificationWebSocketService e insertar los eventos en vivo en la lista.
+ *   - Calcular y mostrar el badge de no-leídas (contra notif_last_seen_ms en
+ *     SharedPreferences) y marcar todo como leído al salir.
+ *   - Navegar al PlaybackFragment (modo "event") al pulsar una alerta y al
+ *     EventConfigFragment desde el botón de configuración.
+ *
+ * DEPENDENCIAS
+ *   - ui/NotificationAdapter (RecyclerView), model/NotificationItem (DTO).
+ *   - network/RetrofitClient + ApiService (historial REST).
+ *   - service/NotificationWebSocketService (broadcast de eventos en vivo).
+ *   - ui/BaseMenuFragment (toolbar de 3 puntos).
+ *
+ * COMPONENTES RELACIONADOS
+ *   - PlaybackFragment (destino al tocar una alerta, Pipeline #14).
+ *   - EventConfigFragment (preferencias, abierto desde el botón de config).
+ *
+ * PUNTO DE ENTRADA
+ *   Destino de primer nivel de la barra inferior (R.id.notificationsPanelFragment).
+ *
+ * PIPELINE(S)
+ *   #13 Notificaciones — presentación/historial en el dispositivo.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.content.BroadcastReceiver
@@ -37,6 +76,12 @@ import kotlinx.coroutines.launch
  *     volver atrás).
  *
  * Extiende BaseMenuFragment para conservar el toolbar de 3 puntos.
+ *
+ * Ciclo de vida: registra el receiver de eventos en vivo en onStart y lo libera
+ * en onStop (y ahí marca todo como leído). Quién lo instancia: el Navigation
+ * Component al seleccionar la pestaña Notificaciones en la barra inferior.
+ *
+ * Pipeline: #13 Notificaciones.
  */
 class NotificationsPanelFragment : BaseMenuFragment() {
 
@@ -162,6 +207,12 @@ class NotificationsPanelFragment : BaseMenuFragment() {
 
     // ── Red ───────────────────────────────────────────────────────────────────
 
+    /**
+     * Carga el historial de notificaciones y lo vuelca en el adapter.
+     * Endpoint: GET /api/v1/mobile/notifications/history?limit=50. Filtra los tipos
+     * retirados (camera_reconnected, tampering) y actualiza el badge.
+     * Llamado por: onViewCreated y el listener de pull-to-refresh.
+     */
     private fun loadHistory() {
         val baseUrl = RetrofitClient.buildBaseUrl(requireContext())
         if (baseUrl == null) {
@@ -200,6 +251,10 @@ class NotificationsPanelFragment : BaseMenuFragment() {
 
     // ── Badge / last_seen ─────────────────────────────────────────────────────
 
+    /**
+     * Recalcula y pinta el badge de no-leídas (oculto si 0, "99+" si >99).
+     * Llamado por: loadHistory, el receiver de eventos en vivo y markLatestAsSeen.
+     */
     private fun updateUnreadBadge() {
         val count = adapter.unreadCount()
         if (count <= 0) {
@@ -210,6 +265,11 @@ class NotificationsPanelFragment : BaseMenuFragment() {
         }
     }
 
+    /**
+     * Persiste el timestamp del item más reciente como "última vez visto" en
+     * SharedPreferences, deja el badge a cero y refresca la UI.
+     * Llamado por: onStop y el click de una alerta (antes de navegar).
+     */
     private fun markLatestAsSeen() {
         val latest = adapter.newestTimestampMs()
         if (latest <= 0) return
@@ -219,6 +279,13 @@ class NotificationsPanelFragment : BaseMenuFragment() {
         updateUnreadBadge()
     }
 
+    /**
+     * Convierte un epoch en segundos (el timestamp del WS) a ISO UTC
+     * "yyyy-MM-dd'T'HH:mm:ss", el mismo formato que usa el historial REST, para
+     * que el item en vivo sea homogéneo con los de BD.
+     * @param epochSec segundos desde epoch (0 → cadena vacía).
+     * @return cadena ISO o "". Llamado por: el receiver de eventos en vivo.
+     */
     private fun isoFromEpochSec(epochSec: Double): String {
         if (epochSec <= 0) return ""
         val sdf = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss",

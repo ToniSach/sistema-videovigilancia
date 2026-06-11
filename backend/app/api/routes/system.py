@@ -1,3 +1,46 @@
+"""
+================================================================================
+MÓDULO: api.routes.system — Blueprint REST de salud, métricas y configuración
+================================================================================
+
+PROPÓSITO
+    Endpoints transversales del sistema: estado de salud (CPU/RAM/disco + estado
+    por cámara), estadísticas en vivo (FPS, conteos), lectura/escritura de la
+    configuración global (SystemConfig), info de hardware (GPU/aceleración) y un
+    disparador de evento de prueba para validar la integración con Telegram.
+
+RESPONSABILIDAD
+    Exponer telemetría y configuración a la app de escritorio. La salud real la
+    calcula MetricsCollector + CameraManager; este blueprint los combina y da
+    forma al contrato que espera el SystemHealthView del desktop.
+
+DEPENDENCIAS
+    infrastructure.metrics.collector.metrics_collector → salud y métricas de FPS.
+    cameras.camera_manager.CameraManager → estado real de cámaras (handles go2rtc).
+    database.models.SystemConfig (+ db_manager) → clave-valor de configuración.
+    core.hardware_detector → GPU/aceleración disponible.
+    core.security.admin_required → protege escritura de configuración.
+    (test event) recording_manager + telegram_notifier + GlobalExecutor.
+
+PUNTO DE ENTRADA
+    Registrado en main.register_blueprints() como "system_bp". url_prefix=
+    /api/v1/system. health/stats/hardware están EXENTOS del rate limiter (polling).
+
+PIPELINE(S)
+    Transversal (soporte/observabilidad). El test-telegram cruza #11 Grabación
+    (clip pre+post) y #13 Notificaciones (envío a Telegram) para validar extremo
+    a extremo sin esperar una detección real.
+
+ENDPOINTS DEL BLUEPRINT
+    GET  /health                      → salud + cámaras para el desktop   [JWT]
+    GET  /stats                       → estadísticas de FPS/cámaras        [JWT]
+    GET  /config                      → toda la configuración (k-v)        [JWT]
+    PUT  /config                      → actualiza configuración      [JWT+admin]
+    GET  /hardware                    → info de hardware/GPU               [JWT]
+    PUT  /config/hardware             → ajusta backend IA (GPU/CPU)   [JWT+admin]
+    POST /test-telegram/<camera_id>   → dispara evento de prueba     [JWT+admin]
+================================================================================
+"""
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required
 from ...cameras.camera_manager import CameraManager
@@ -85,6 +128,17 @@ def health_check():
 @system_bp.route("/stats", methods=["GET"])
 @jwt_required()
 def get_stats():
+    """
+    Propósito: estadísticas en vivo de cámaras (total/activas/error + FPS por
+        cámara). La poletea el dashboard (exenta del rate limiter).
+    Método+Ruta: GET /api/v1/system/stats
+    Inputs: ninguno. Permiso: @jwt_required().
+    Outputs:
+        200 → {"success": true, "data": {"cameras": {"total", "active_streaming",
+              "error", "fps_metrics", "details"}, "system": {...}}}.
+        500 → error interno.
+    Llama a: CameraManager.get_all_status(), metrics_collector.get_all_camera_metrics().
+    """
     try:
         camera_manager = CameraManager()
         all_status = camera_manager.get_all_status()
@@ -113,6 +167,18 @@ def get_stats():
 @system_bp.route("/config", methods=["GET"])
 @jwt_required()
 def get_config():
+    """
+    Propósito: vuelca TODA la configuración global (tabla SystemConfig) como un
+        dict clave→valor. La usa la pantalla de Ajustes del desktop.
+    Método+Ruta: GET /api/v1/system/config
+    Inputs: ninguno. Permiso: @jwt_required() (lectura abierta a cualquier sesión).
+    Outputs:
+        200 → {"success": true, "data": {<key>: <value>, ...}}.
+        500 → error interno.
+    Llama a: SystemConfig (query directa con db_manager.get_session()).
+    Nota: incluye TODAS las claves (también credenciales Telegram); la UI decide
+        qué mostrar.
+    """
     try:
         from ...database.connection import db_manager
         from ...database.models import SystemConfig
@@ -132,6 +198,22 @@ def get_config():
 @jwt_required()
 @admin_required
 def update_config():
+    """
+    Propósito: actualiza (upsert) claves de configuración global y aplica EN
+        CALIENTE las operacionales (almacenamiento/IA/telemetría) sin reiniciar.
+    Método+Ruta: PUT /api/v1/system/config
+    Inputs:
+        Body JSON: { <key>: <value>, ... } (valores se guardan como str).
+        Permiso: @jwt_required() + @admin_required.
+    Outputs:
+        200 → {"success": true, "message": "Configuración actualizada"}.
+        400 → body vacío, o max_storage_gb inválido / mayor que el espacio REAL
+              disponible en disco (validación contra shutil.disk_usage).
+        403 → no admin (lo emite @admin_required).
+        500 → error interno.
+    Llama a: SystemConfig (upsert), settings.reload_runtime_config_from_db() si
+        alguna clave está en settings._DB_OVERRIDE_KEYS.
+    """
     try:
         data = request.get_json()
         if not data:
@@ -186,11 +268,11 @@ def update_config():
                     session.add(SystemConfig(key=key, value=str(value)))
             session.commit()
 
-        # Aplicar EN CALIENTE los overrides de almacenamiento (cuota/ruta) para
-        # que el cambio tenga efecto sin reiniciar el backend.
-        if any(k in data for k in ("max_storage_gb", "recordings_path")):
-            from ...config import settings as _settings
-            _settings.reload_storage_from_db()
+        # Aplicar EN CALIENTE los overrides OPERACIONALES (almacenamiento, IA,
+        # telemetría) para que el cambio tenga efecto sin reiniciar el backend.
+        from ...config import settings as _settings
+        if any(k in data for k in _settings._DB_OVERRIDE_KEYS):
+            _settings.reload_runtime_config_from_db()
 
         return jsonify({"success": True, "message": "Configuración actualizada"})
     except Exception as e:
@@ -201,6 +283,16 @@ def update_config():
 @system_bp.route("/hardware", methods=["GET"])
 @jwt_required()
 def get_hardware_info():
+    """
+    Propósito: info de hardware detectada (CPU, GPU NVIDIA/Intel, aceleración
+        disponible) para que la UI ofrezca opciones de backend de IA coherentes.
+    Método+Ruta: GET /api/v1/system/hardware
+    Inputs: ninguno. Permiso: @jwt_required() (exenta del rate limiter).
+    Outputs:
+        200 → {"success": true, "data": <hardware_detector.detect()>}.
+        500 → error interno.
+    Llama a: core.hardware_detector.detect().
+    """
     try:
         from backend.app.core.hardware_detector import hardware_detector
         return jsonify({"success": True, "data": hardware_detector.detect()}), 200
@@ -212,6 +304,21 @@ def get_hardware_info():
 @system_bp.route("/config/hardware", methods=["PUT"])
 @jwt_required()
 def update_hardware_config():
+    """
+    Propósito: persiste la preferencia de backend de IA (usar GPU y cuda/cpu).
+        Surte efecto al reiniciar las cámaras (no en caliente).
+    Método+Ruta: PUT /api/v1/system/config/hardware
+    Inputs:
+        Body JSON: { "use_gpu_ai": "auto"|"true"|"false"?,
+                     "ai_backend": "auto"|"cuda"|"cpu"? }.
+        Permiso: @jwt_required() + check is_admin (403 si no).
+    Outputs:
+        200 → {"success": true, "message": "...Reinicie cámaras.", "changes": {...}}.
+        400 → body vacío o valores fuera de las listas permitidas.
+        403 → no admin.
+        500 → error interno.
+    Llama a: UserService.is_admin(), SystemConfig.merge() (use_gpu_ai/ai_backend).
+    """
     try:
         from flask_jwt_extended import get_jwt_identity
         from backend.app.services.user_service import UserService

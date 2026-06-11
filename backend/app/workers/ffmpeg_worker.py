@@ -1,3 +1,46 @@
+"""
+================================================================================
+MÓDULO: workers.ffmpeg_worker — Decode local RTSP (LEGACY / DESCOMISIONADO)
+================================================================================
+
+⚠️  ESTADO: LEGACY. Este worker FUE ELIMINADO del pipeline activo.
+    Hoy TODO el directo (preview WebRTC/RTSP/HLS) lo sirve go2rtc directamente al
+    cliente, sin pasar por este decode local. CameraManager ya NO construye la
+    cadena RTSP→FFmpegWorker→CircularFrameBuffer→FrameDistributor (ver comentarios
+    en cameras/camera_manager.py). Se CONSERVA el código como referencia histórica
+    y posible fallback de decode local (p.ej. alimentar IA/grabación desde frames
+    crudos si en el futuro se reactiva esa ruta). NO añadir features nuevas aquí.
+
+PROPÓSITO (cuando estaba activo)
+    Capturar el stream RTSP de UNA cámara lanzando `ffmpeg` como subproceso,
+    leer los frames crudos (rawvideo bgr24) por stdout, escalar/parsear, y
+    depositarlos en un `CircularFrameBuffer` para los consumidores (IA, grabación).
+
+RESPONSABILIDAD PRINCIPAL
+    Robustez de captura: detección de resolución real (ffprobe rápido), escalado
+    que preserva aspect ratio, reconexión con backoff exponencial (hasta
+    MAX_RECONNECT=10), watchdog que marca FROZEN si no llegan frames
+    (WATCHDOG_TIMEOUT=30s) y auto-desactivación tras agotar reintentos.
+
+DEPENDENCIAS
+    ffmpeg/ffprobe en PATH; numpy (frames); database.models.Camera (datos de
+    conexión); streaming.frame_buffer.CircularFrameBuffer (destino);
+    infrastructure.metrics.collector (reporta frescura al reconectar).
+
+COMPONENTES RELACIONADOS
+    cameras.camera_manager ........ antiguo dueño/instanciador (hoy lo evita).
+    streaming.go2rtc_manager ...... el reemplazo: capa de medios actual.
+
+PUNTO DE ENTRADA
+    `FFmpegWorker(camera, frame_buffer, ...).start()` — arranca dos hilos daemon:
+    el loop de captura/reconexión y el watchdog.
+
+PIPELINE(S) + ETAPA
+    - Pipeline #4 (RTSP) → #3 (Live) HISTÓRICO: era la fuente de frames del
+      antiguo preview MJPEG y de los consumidores. Ese rol pasó a go2rtc (#5/#6).
+    - Si se reactivara como fallback, alimentaría #9 (IA) y #11 (Grabación).
+================================================================================
+"""
 import subprocess
 import threading
 import select

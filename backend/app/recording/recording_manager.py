@@ -1,3 +1,90 @@
+"""
+================================================================================
+MÓDULO: recording_manager — Grabación continua y generación de clips de evento
+================================================================================
+
+PROPÓSITO
+    Núcleo del subsistema de grabación del NVR. Mantiene la grabación CONTINUA
+    por segmentos de cada cámara y, ante un evento de IA/movimiento, genera un
+    CLIP MP4 del evento (pre + evento + post) y lo registra en la tabla
+    `recordings`. Es el componente crítico de los pipelines #11 y #12.
+
+RESPONSABILIDAD PRINCIPAL
+    - Grabación continua: trocear el vídeo de cada cámara en segmentos de
+      CONTINUOUS_SEGMENT_DURATION (120 s) y persistirlos en
+      `recordings/<cam>/continuous/<cam>_<ts>.mp4`, registrando cada uno en BD.
+      Dos modos:
+        · modo `-c copy` (preferente): lee el restream RTSP de go2rtc y COPIA
+          el H.264/HEVC a disco SIN recodificar (CPU ≈ 0).
+        · modo clásico (fallback): recibe frames raw del pre-buffer y los
+          recodifica con libx264 ultrafast.
+    - Generación de clips de evento (#12): suscrito a EventManager; cuando llega
+      un evento (motion/person/vehicle) extrae [evento-10 s, evento+10 s] del/los
+      segmento(s) continuos con `ffmpeg -c copy` (SPLICE, sin re-encode), registra
+      el clip en BD y lo envía a Telegram.
+
+DEPENDENCIAS IMPORTANTES
+    EventManager ............. fuente de eventos a los que se suscribe (#10→#12)
+    RecordingRepository ...... persistencia de filas Recording en BD
+    EventRepository .......... (opcional) acceso a eventos
+    Go2RtcManager ............ provee la URL del restream RTSP para el modo copia
+    GlobalExecutor ........... ejecuta la grabación de cada clip de evento
+    telegram_notifier ........ envío del vídeo del clip (best-effort)
+    settings ................. RECORDINGS_PATH, RECORDING_COPY_MODE, GO2RTC_ENABLED
+    ffmpeg / ffprobe ......... subprocesos para splice, remux, thumbnail, probe
+
+COMPONENTES RELACIONADOS
+    - CameraManager._wire_recording_manager() registra el pre-buffer de cada
+      cámara y arranca la grabación continua (idempotente).
+    - DependencyContainer construye y cachea el singleton lógico
+      ("recording_manager") que consumen las rutas (recordings.py, system.py),
+      AIService y CameraManager.
+    - StorageManager rota/limpia los archivos que este módulo produce.
+    - ConsistencyChecker reconcilia los archivos vs las filas que este crea.
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    No es un singleton `__new__`; se instancia UNA vez en
+    DependencyContainer (container.py) y se comparte vía get_container().
+    No lo arranca main.py directamente: CameraManager lo cablea por cámara al
+    levantar el pipeline de cada una.
+
+PIPELINES Y ETAPA
+    #10 Eventos  → (entrada) EventManager.publish() despierta _on_event().
+    #11 Grabación → start_continuous_recording() / _continuous_loop[_copy]().
+    #12 Clips     → _on_event() → _record_event_splice() → SPLICE → BD → Telegram.
+    #13 Notificaciones → _send_clip_to_telegram() entrega el vídeo del clip.
+
+FLUJO DE GRABACIÓN Y CLIP (ASCII)
+
+    GRABACIÓN CONTINUA (#11)
+    ┌──────────────┐   modo copy    ┌─────────────────────────────────────┐
+    │ go2rtc RTSP  │───────────────▶│ ffmpeg -c copy -t 120  (sin encode) │
+    └──────────────┘                └──────────────┬──────────────────────┘
+                                                   ▼
+    ┌──────────────┐   modo clásico ┌─────────────────────────────────────┐
+    │ pre_buffer   │───────────────▶│ ffmpeg libx264 ultrafast (raw→h264) │
+    │ (frames raw) │                └──────────────┬──────────────────────┘
+    └──────────────┘                               ▼
+                              recordings/<cam>/continuous/<cam>_<ts>.mp4 (fMP4)
+                                                   │  remux -c copy +faststart
+                                                   ▼      + fila Recording(BD)
+                                            MP4 regular reproducible
+
+    CLIP DE EVENTO (#12)
+    EventManager ──evento──▶ _on_event() ──submit──▶ _record_event_splice()
+        │ (cooldown reentrante por cámara)                │
+        │                                       espera 10 s post-evento
+        │                                                 ▼
+        │                          _find_continuous_segments([ev-10, ev+10])
+        │                                                 ▼
+        │                       1 seg → _splice_single() │ N segs → _splice_concat()
+        │                                ffmpeg -ss -t -c copy (~200 ms)
+        │                                                 ▼
+        │                     recordings/<cam>/events/event_<tipo>_<ts>.mp4
+        │                                                 ▼
+        └──────────────── fila Recording(BD) ──▶ _send_clip_to_telegram() (#13)
+================================================================================
+"""
 import subprocess
 import threading
 import os
@@ -16,6 +103,42 @@ from backend.app.config import settings
 
 
 class RecordingManager:
+    """
+    Gestor de grabación continua y clips de evento (pipelines #11 y #12).
+
+    ROL
+        Mantiene un hilo de grabación continua por cámara y reacciona a los
+        eventos de detección generando clips MP4 mediante SPLICE del continuo.
+        Es el único punto del sistema que escribe en `recordings/` y crea filas
+        en la tabla `recordings`.
+
+    SINGLETON (lógico, NO `__new__`)
+        No usa el patrón `__new__` de otros componentes del sistema. La unicidad
+        la garantiza DependencyContainer: se construye UNA sola vez y se cachea
+        bajo la clave "recording_manager". Todos los consumidores obtienen la
+        misma instancia vía get_container().get("recording_manager").
+
+    QUIÉN LO INSTANCIA / CONSUME
+        - Instancia: DependencyContainer (backend/app/container.py).
+        - Cablea por cámara: CameraManager._wire_recording_manager()
+          (register_camera_buffer + start_continuous_recording).
+        - Consumen: rutas REST recordings.py y system.py, AIService (arranca
+          continua al activar IA), telemetry.py (lee estado).
+
+    ESTADO VIVO (en memoria de proceso)
+        _pre_buffers ......... deque circular de frames raw por cámara (fallback)
+        _event_recordings .... cámaras con clip de evento en curso (cooldown)
+        _continuous_threads .. hilo de grabación continua por cámara
+        _continuous_stop_events ... Event para detener cada hilo de forma segura
+        _frame_dimensions .... últimas dimensiones (h,w) conocidas por cámara
+        Cada estructura tiene su propio Lock; el módulo es thread-safe.
+
+    DEPENDENCIAS
+        RecordingRepository (BD), EventManager (suscripción), Go2RtcManager
+        (URL restream), GlobalExecutor (clips), telegram_notifier (envío),
+        ffmpeg/ffprobe (subprocesos).
+    """
+
     # PRE_BUFFER_SIZE: solo se usa cuando NO hay grabación continua activa
     # (fallback). Con continuous activo, los 10s pre se extraen del .mp4
     # de continuous con `ffmpeg -c copy` (sin RAM, sin re-encode).
@@ -36,6 +159,20 @@ class RecordingManager:
         return settings.RECORDINGS_PATH
 
     def __init__(self, recording_repo: RecordingRepository, event_repo: Optional[EventRepository] = None):
+        """
+        Construye el gestor y se SUSCRIBE a EventManager (puente #10→#12).
+
+        Propósito (etapa): inicializa el estado vivo (buffers, locks, dicts) y
+            engancha _on_event a los tipos de evento que disparan clips. La
+            suscripción aquí es lo que conecta el pipeline de Eventos (#10) con
+            el de Clips (#12).
+        Inputs:
+            recording_repo: repositorio para persistir filas Recording.
+            event_repo: repositorio de eventos (opcional, reservado).
+        Outputs: ninguno (efecto: crea RECORDINGS_PATH y suscribe callbacks).
+        Llamado por: DependencyContainer al construir el servicio.
+        Llama a: event_manager.subscribe() para motion/person/vehicle.
+        """
         self._recording_repo = recording_repo
         self._event_repo = event_repo
         os.makedirs(settings.RECORDINGS_PATH, exist_ok=True)
@@ -61,7 +198,21 @@ class RecordingManager:
         logging.info("RecordingManager inicializado")
 
     def register_camera_buffer(self, camera_id: int, frame_distributor) -> None:
-        """Registra buffer circular pre-evento para una cámara."""
+        """
+        Registra el pre-buffer circular de una cámara como consumidor del
+        FrameDistributor (etapa #11: alimentación del fallback de grabación).
+
+        Propósito: crear la deque circular pre-evento y suscribir el callback
+            _update_pre_buffer al distribuidor de frames de la cámara. Estos
+            frames son el FALLBACK cuando no hay continua en modo copy.
+        Inputs:
+            camera_id: id de la cámara.
+            frame_distributor: FrameDistributor de esa cámara (#4/#9 pipeline).
+        Outputs: ninguno (efecto: deque creada + consumidor registrado).
+        Llamado por: CameraManager._wire_recording_manager() al arrancar cámara.
+        Llama a: frame_distributor.register_consumer(needs_copy=False).
+        Siguiente etapa: los frames fluyen a _update_pre_buffer en cada frame.
+        """
         with self._pre_buffer_lock:
             self._pre_buffers[camera_id] = collections.deque(maxlen=self.PRE_BUFFER_SIZE)
 
@@ -91,7 +242,24 @@ class RecordingManager:
                     self._frame_dimensions[camera_id] = (h, w)
 
     def _on_event(self, event_data: EventData) -> None:
-        """Handler de eventos que inicia grabación de clip."""
+        """
+        Handler suscrito a EventManager: dispara la generación de un clip de
+        evento (PUNTO DE ENTRADA del pipeline #12 Clips).
+
+        Propósito (etapa #10→#12): ante un evento de detección, encolar la
+            extracción del clip en el GlobalExecutor. Aplica un COOLDOWN
+            reentrante por cámara (si ya hay un clip en curso, no arranca otro).
+            Exige grabación continua activa: si no la hay, omite el clip (el
+            SPLICE necesita el archivo continuo como fuente).
+        Inputs: event_data (EventData con camera_id, event_type, timestamp...).
+        Outputs: ninguno (efecto: encola _record_event_splice o descarta).
+        Excepciones: no propaga; en saturación del executor libera el slot.
+        Llamado por: EventManager (dispatch en su pool de hilos) al publicarse
+            un evento motion/person/vehicle.
+        Llama a: is_recording_continuous(), global_executor.submit(
+            _record_event_splice).
+        Siguiente etapa: _record_event_splice() en un hilo del executor.
+        """
         camera_id = event_data.camera_id
 
         # Cooldown reentrante: si ya hay grabación de evento en curso para
@@ -246,8 +414,22 @@ class RecordingManager:
 
     def _record_event_splice(self, camera_id: int, event_data: EventData) -> None:
         """
-        Extrae los 20s del evento (10 pre + 10 post) del archivo continuous
-        usando `ffmpeg -c copy` (sin re-encodear).
+        Genera el clip de evento por SPLICE del continuo (CORE del pipeline #12).
+
+        Propósito (etapa #12): extraer [evento-10 s, evento+10 s] de el/los
+            segmento(s) de grabación continua con `ffmpeg -c copy` (sin
+            re-encode, ~200 ms), registrar el clip en BD y enviarlo a Telegram.
+            Si no encuentra segmentos o el splice falla, cae al método clásico
+            por pre-buffer (_record_event_clip).
+        Inputs: camera_id, event_data (timestamp del evento = centro del clip).
+        Outputs: ninguno (efecto: MP4 en recordings/<cam>/events/ + fila BD +
+            envío Telegram). Libera el slot de cooldown en el finally.
+        Excepciones: capturadas y logueadas; nunca propagan al executor.
+        Llamado por: _on_event() vía global_executor.submit (hilo del executor).
+        Llama a: _find_continuous_segments(), _splice_single()/_splice_concat(),
+            recording_repo.create(), _send_clip_to_telegram(); fallback
+            _record_event_clip().
+        Siguiente etapa: #13 Notificaciones (_send_clip_to_telegram).
         """
         try:
             event_ts = event_data.timestamp
@@ -309,8 +491,12 @@ class RecordingManager:
             duration = post_end_ts - pre_start_ts
             recording = Recording(
                 camera_id=camera_id,
-                start_time=datetime.fromtimestamp(pre_start_ts),
-                end_time=datetime.fromtimestamp(post_end_ts),
+                # UTC, IGUAL que la grabación continua (datetime.utcnow()). Antes
+                # se usaba fromtimestamp() (hora LOCAL), así que los clips de
+                # evento quedaban archivados bajo OTRO día que las continuas y NO
+                # aparecían en la pestaña "Eventos" al pedir el día (en UTC).
+                start_time=datetime.utcfromtimestamp(pre_start_ts),
+                end_time=datetime.utcfromtimestamp(post_end_ts),
                 file_path=output_path,
                 file_size_bytes=file_size,
                 duration_seconds=duration,
@@ -321,6 +507,19 @@ class RecordingManager:
                 f"({file_size} bytes, {duration:.0f}s, "
                 f"{len(segments)} segmento(s))"
             )
+
+            # 4b. Enlazar el clip al EVENTO (Pipeline #12): rellena Event.clip_path
+            # para que el móvil/escritorio puedan abrir la grabación desde el
+            # evento. El id lo dejó EventService en la metadata al persistir.
+            try:
+                event_id = (event_data.metadata or {}).get("event_id")
+                if event_id:
+                    from ..container import get_container
+                    ev_svc = get_container().get("event_service")
+                    if ev_svc is not None:
+                        ev_svc.update_event_clip_path(int(event_id), output_path)
+            except Exception as e:
+                logging.debug(f"[SPLICE] no pude enlazar clip al evento: {e}")
 
             # 5. Enviar a Telegram
             self._send_clip_to_telegram(camera_id, output_path, event_data)
@@ -379,7 +578,21 @@ class RecordingManager:
 
     def _splice_single(self, segment: tuple, start_ts: float, end_ts: float,
                         output_path: str) -> bool:
-        """Extrae [start_ts, end_ts] de UN segmento con `ffmpeg -c copy`."""
+        """
+        Extrae [start_ts, end_ts] de UN solo segmento continuo con
+        `ffmpeg -c copy` (etapa #12, caso evento dentro de un segmento).
+
+        Propósito: calcular el offset/duración dentro del segmento y copiar ese
+            tramo a output_path sin recodificar (`-ss` antes de `-i` = seek
+            rápido por keyframes).
+        Inputs: segment (path, seg_start_ts, seg_end_ts); start_ts/end_ts del
+            clip; output_path destino.
+        Outputs: True si el MP4 se generó; False si la duración es <=0 o ffmpeg
+            falla.
+        Excepciones: capturadas → devuelve False.
+        Llamado por: _record_event_splice() cuando hay un único segmento.
+        Llama a: subprocess.run(ffmpeg).
+        """
         seg_path, seg_start, seg_end = segment
         # Offset dentro del segmento donde empezar
         offset = max(0.0, start_ts - seg_start)
@@ -394,6 +607,11 @@ class RecordingManager:
             "-i", seg_path,
             "-t", f"{duration:.3f}",
             "-c", "copy",                # sin re-encoding
+            # Normaliza los timestamps para que empiecen en 0. Sin esto, el
+            # seek de entrada (-ss) sobre HEVC con -c copy deja un PTS inicial
+            # no-cero/edit-list → el reproductor lee mal la DURACIÓN (la barra
+            # se llena en ~3s aunque el vídeo dure 20s).
+            "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart",
             output_path,
         ]
@@ -413,9 +631,19 @@ class RecordingManager:
     def _splice_concat(self, segments: list, start_ts: float, end_ts: float,
                         output_path: str) -> bool:
         """
-        El evento cruza un boundary de segmento. Extraemos la cola del
-        primer segmento + segmentos intermedios + cabeza del último,
-        luego concatenamos con el demuxer concat de ffmpeg.
+        Une varios segmentos cuando el evento CRUZA un boundary de segmento
+        (etapa #12, caso multi-segmento).
+
+        Propósito: extraer la cola del primer segmento + segmentos intermedios
+            completos + la cabeza del último a ficheros temporales, y unirlos
+            con el demuxer `concat` de ffmpeg (todo `-c copy`, sin re-encode).
+        Inputs: segments (lista ordenada de (path, seg_start, seg_end)),
+            start_ts/end_ts del clip, output_path destino.
+        Outputs: True si el MP4 unido se generó; False si alguna parte/el join
+            falla. Limpia siempre los temporales en el finally.
+        Excepciones: capturadas → devuelve False.
+        Llamado por: _record_event_splice() cuando hay >1 segmento.
+        Llama a: subprocess.run(ffmpeg) por parte + un ffmpeg final de concat.
         """
         import tempfile
         tmp_files = []
@@ -436,6 +664,7 @@ class RecordingManager:
                     "-i", seg_path,
                     "-t", f"{duration:.3f}",
                     "-c", "copy",
+                    "-avoid_negative_ts", "make_zero",
                     tmp.name,
                 ]
                 result = subprocess.run(cmd, capture_output=True, timeout=15)
@@ -462,6 +691,7 @@ class RecordingManager:
                     "-f", "concat", "-safe", "0",
                     "-i", list_file.name,
                     "-c", "copy",
+                    "-avoid_negative_ts", "make_zero",
                     "-movflags", "+faststart",
                     output_path,
                 ]
@@ -490,8 +720,22 @@ class RecordingManager:
 
     def _record_event_clip(self, camera_id: int, event_data: EventData) -> None:
         """
-        Grabación de evento con pre-buffer incluido.
-        Patrón: Streaming directo a FFmpeg sin acumular en RAM.
+        FALLBACK de clip de evento: graba pre-buffer + post-evento recodificando
+        con libx264 (etapa #12, sólo si el SPLICE no es posible/falla).
+
+        Propósito: cuando NO hay segmentos continuos que splice (o el splice
+            falló), reconstruye el clip escribiendo los frames del pre-buffer
+            en RAM + 10 s en tiempo real al stdin de un ffmpeg libx264 ultrafast.
+            Mide la duración real con ffprobe antes de registrar/enviar.
+        Inputs: camera_id, event_data (timestamp = inicio del post-evento).
+        Outputs: ninguno (efecto: MP4 en events/ + fila BD + envío Telegram).
+            Libera el slot de cooldown en el finally.
+        Excepciones: capturadas y logueadas; mata el subproceso ffmpeg si queda
+            vivo.
+        Llamado por: _record_event_splice() como fallback (no por _on_event
+            directamente — el SPLICE es siempre la vía preferente).
+        Llama a: subprocess.Popen(ffmpeg), _probe_duration(),
+            recording_repo.create(), _send_clip_to_telegram().
         """
         process = None
         try:
@@ -639,7 +883,8 @@ class RecordingManager:
 
                 recording = Recording(
                     camera_id=camera_id,
-                    start_time=datetime.fromtimestamp(event_data.timestamp - (self.PRE_BUFFER_SIZE / 15)),
+                    # UTC, consistente con la grabación continua (ver splice arriba).
+                    start_time=datetime.utcfromtimestamp(event_data.timestamp - (self.PRE_BUFFER_SIZE / 15)),
                     end_time=datetime.utcnow(),
                     file_path=output_path,
                     file_size_bytes=file_size,
@@ -683,23 +928,28 @@ class RecordingManager:
         las llamadas HTTP a api.telegram.org tienen sus propios timeouts.
 
         Decisiones:
-          - Por simplicidad, lo enviamos a TODOS los chats configurados en
-            SystemConfig (telegram_chat_ids). El ruteo per-user del
-            NotificationRouter envía la FOTO; aquí complementamos con el
-            VIDEO al chat global. Esto evita doble persistencia/lookup BD.
-          - Si Telegram no está configurado o el archivo no existe, no hace
-            nada (sin error).
-          - Caption corto con clase + cámara + duración (la foto ya tenía
-            el caption largo con confianza/hora).
+          - Destinos UNIFICADOS con la foto: usamos
+            NotificationRouter.telegram_chat_ids_for_event(), que resuelve los
+            chats per-usuario (UserTelegramChat) de quienes tienen el canal
+            'telegram' habilitado para este evento. Antes esto enviaba a la lista
+            GLOBAL SystemConfig.telegram_chat_ids (segundo origen de destinos que
+            contradecía al router). El VIDEO complementa a la FOTO del router.
+          - Si no hay destinos o el archivo no existe, no hace nada (sin error).
+          - Caption corto con clase + cámara (la foto ya llevaba confianza/hora).
         """
         try:
             from backend.app.notifications.telegram_notifier import telegram_notifier
-            if not telegram_notifier._enabled or not telegram_notifier._chat_ids:
-                return
+            from backend.app.services.notification_router import notification_router
+
             if not os.path.exists(clip_path):
                 return
 
-            duration = self.EVENT_RECORDING_DURATION + (self.PRE_BUFFER_SIZE / 15)
+            chat_ids = notification_router.telegram_chat_ids_for_event(
+                event_data.event_type, camera_id
+            )
+            if not chat_ids:
+                return
+
             event_type_es = {
                 "person": "persona",
                 "vehicle": "vehículo",
@@ -709,15 +959,13 @@ class RecordingManager:
                 "bus": "autobús",
                 "motorcycle": "moto",
             }.get(event_data.event_type, event_data.event_type)
+            # Sin leyenda de duración (a petición): solo tipo + cámara.
             caption = (
                 f"🎥 Video del evento: *{event_type_es}*\n"
-                f"📹 Cámara: `{event_data.camera_name or camera_id}`\n"
-                f"⏱ Duración: ~{int(duration)}s "
-                f"({int(self.PRE_BUFFER_SIZE / 15)}s antes + "
-                f"{int(self.EVENT_RECORDING_DURATION)}s después)"
+                f"📹 Cámara: `{event_data.camera_name or camera_id}`"
             )
 
-            for chat_id in list(telegram_notifier._chat_ids):
+            for chat_id in chat_ids:
                 try:
                     telegram_notifier.send_video(chat_id, clip_path, caption)
                 except Exception as e:
@@ -726,7 +974,19 @@ class RecordingManager:
             logging.error(f"Error en _send_clip_to_telegram: {e}", exc_info=True)
 
     def start_continuous_recording(self, camera_id: int) -> bool:
-        """Inicia grabación continua cíclica."""
+        """
+        Arranca el hilo de grabación continua de una cámara (entrada #11).
+
+        Propósito (etapa #11): lanzar un hilo daemon que graba segmentos en
+            bucle. Es IDEMPOTENTE: si ya hay un hilo vivo para la cámara, no
+            arranca otro. El hilo elige por sí mismo modo `-c copy` o clásico.
+        Inputs: camera_id.
+        Outputs: True si arrancó un hilo nuevo; False si ya existía uno vivo.
+        Llamado por: CameraManager._wire_recording_manager() (al levantar la
+            cámara), AIService (al activar IA) y la ruta REST de recordings.
+        Llama a: crea threading.Thread(target=_continuous_loop).
+        Siguiente etapa: _continuous_loop() → (modo copy) _continuous_loop_copy().
+        """
         with self._continuous_lock:
             if camera_id in self._continuous_threads and self._continuous_threads[camera_id].is_alive():
                 logging.warning(f"Ya existe grabación continua para cámara {camera_id}")
@@ -762,8 +1022,18 @@ class RecordingManager:
 
     def _continuous_loop(self, camera_id: int, stop_event: threading.Event) -> None:
         """
-        FIX CRÍTICO: Streaming directo sin acumular frames en RAM.
-        Cada frame se escribe inmediatamente al stdin de FFmpeg.
+        Bucle de grabación continua en modo CLÁSICO (libx264) — etapa #11.
+
+        Propósito: en bucle hasta stop_event, abrir un ffmpeg libx264 por
+            segmento de 120 s, escribirle el último frame del pre-buffer cada
+            66 ms (15 fps CFR con duplicación), cerrar, remuxear fMP4→MP4 y
+            registrar la fila Recording. Si RECORDING_COPY_MODE+go2rtc están
+            activos, DESVÍA a _continuous_loop_copy (CPU ≈ 0).
+        Inputs: camera_id, stop_event (señal de parada del hilo).
+        Outputs: ninguno (efecto: MP4s en continuous/ + filas BD).
+        Llamado por: el hilo creado en start_continuous_recording().
+        Llama a: subprocess.Popen(ffmpeg), _remux_fragmented_to_regular(),
+            recording_repo.create(); o _continuous_loop_copy() si aplica.
         """
         # Desvío al modo -c copy si está habilitado (CPU ≈ 0, sin recodificar).
         if self._use_recording_copy_mode():
@@ -1066,7 +1336,16 @@ class RecordingManager:
             return None
 
     def stop_continuous_recording(self, camera_id: int) -> bool:
-        """Detiene grabación continua de forma segura."""
+        """
+        Detiene de forma segura el hilo de grabación continua de una cámara.
+
+        Propósito (etapa #11): señalar el stop_event, esperar (join) al hilo y
+            limpiar las estructuras de estado de esa cámara.
+        Inputs: camera_id.
+        Outputs: True si había un hilo y se detuvo; False si no existía.
+        Llamado por: CameraManager (al apagar cámara), rutas REST de recordings.
+        Llama a: stop_event.set() + Thread.join().
+        """
         with self._continuous_lock:
             if camera_id not in self._continuous_threads:
                 return False
@@ -1086,7 +1365,15 @@ class RecordingManager:
             return True
 
     def is_recording_continuous(self, camera_id: int) -> bool:
-        """Verifica si hay grabación continua activa."""
+        """
+        Indica si hay grabación continua activa (hilo vivo) para la cámara.
+
+        Propósito: gate que usa _on_event() para decidir si el SPLICE es viable
+            (necesita el archivo continuo como fuente).
+        Inputs: camera_id.
+        Outputs: True si existe un hilo de continua vivo; False en otro caso.
+        Llamado por: _on_event() (#12) y consumidores que consultan estado.
+        """
         with self._continuous_lock:
             if camera_id not in self._continuous_threads:
                 return False

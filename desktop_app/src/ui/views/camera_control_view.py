@@ -1,13 +1,54 @@
 """
-Vista de control de cámara individual.
+================================================================================
+MÓDULO: ui.views.camera_control_view — Control de UNA cámara (Pipelines #3/#8)
+================================================================================
 
-Layout estándar NVR comercial:
-  [ video grande, full-screen ]  [ panel controles ]
-       (75% del ancho)              (25% del ancho)
+PROPÓSITO
+    Vista dedicada a una sola cámara, con el layout estándar de un NVR comercial:
 
-Se accede al hacer click en una cámara desde LiveView o desde
-CameraManagementView. Reemplaza el viejo diálogo modal que se quedaba
-chico y no permitía interacción cómoda.
+        [ vídeo grande en directo ]   [ panel de controles ]
+              (~75% del ancho)            (~25% del ancho)
+
+    El vídeo a la izquierda (directo go2rtc) y, a la derecha, el panel con PTZ,
+    LEDs/IR, audio bidireccional, IA, snapshot, etc. Reemplaza al antiguo
+    diálogo modal (que se quedaba chico). Se accede haciendo clic en una cámara
+    desde LiveView (⚙ o menú PTZ) o desde CameraManagementView.
+
+RESPONSABILIDAD
+    - Reproducir el directo de la cámara/lente seleccionada con baja latencia,
+      cambiando de fuente (cámara o lente) mediante swap ASÍNCRONO de VLC para
+      NO congelar la UI (llamar stop()+play() en el hilo de UI la dejaba "No
+      responde" esperando al decodificador RTSP).
+    - Cargar los datos completos de la cámara en el panel de controles.
+    - Cablear el audio CLIENT-SIDE: "Escuchar cámara" desmutea el player del
+      directo y el slider ajusta su volumen (el operador oye por sus auriculares).
+    - Liberar el stream al salir de la vista (ahorra red/CPU) y reengancharlo al
+      volver.
+
+DEPENDENCIAS
+    - ui/components/rtsp_video.RtspVideoWidget : reproductor del directo go2rtc
+      (encapsula VLC; expone play/set_url/stop + set_audio_enabled/set_volume).
+    - ui/components/camera_control_panel.CameraControlPanel : panel de la derecha
+      (PTZ, LEDs, audio, IA). Este es el componente que llama a los endpoints de
+      control (PTZ, etc.); la vista solo lo aloja y le inyecta los datos.
+    - services/api_client.py :
+        * GET /cameras/{id} → datos completos para poblar el panel.
+      (El control PTZ/LED/audio lo emite el panel, no esta vista.)
+
+COMPONENTES RELACIONADOS
+    RtspVideoWidget (vídeo), CameraControlPanel (+ su audio_widget). A diferencia
+    de LiveView, aquí NO se instancia VLC a mano: se delega en RtspVideoWidget.
+
+PUNTO DE ENTRADA
+    La instancia MainWindow._create_main_view (índice VIEW_CONTROL=1, fuera de la
+    sidebar). MainWindow._open_camera_control la rellena (`set_cameras`) y le pide
+    mostrar una cámara concreta (`show_camera`). Emite `back_requested` para
+    volver a LiveView.
+
+PIPELINE(S)
+    #3 Live (directo go2rtc de una cámara) y #8 PTZ (control del movimiento de la
+    cámara, ejecutado a través del CameraControlPanel embebido).
+================================================================================
 """
 import logging
 from typing import Optional
@@ -28,7 +69,33 @@ logger = logging.getLogger(__name__)
 
 
 class CameraControlView(QWidget):
-    """Vista grande de una sola cámara con panel de controles a la derecha."""
+    """
+    Vista dedicada de una cámara: directo grande + panel de control.
+
+    RESPONSABILIDAD / ROL
+        Mostrar el directo de la cámara/lente activa y alojar el
+        CameraControlPanel (PTZ/LEDs/audio/IA). Conmuta de fuente con swaps
+        asíncronos de VLC para no bloquear la UI.
+
+    QUIÉN LA INSTANCIA
+        MainWindow._create_main_view (índice VIEW_CONTROL=1). Se navega a ella
+        desde LiveView/CameraManagementView, no desde la sidebar.
+
+    SEÑALES QT
+        - EMITE `back_requested()`: volver a "En vivo". La escucha MainWindow
+          (conectada a `_switch_view(VIEW_LIVE)`).
+        - ESCUCHA del panel: `audio_widget.listen_changed` →
+          video_widget.set_audio_enabled, `audio_widget.volume_changed` →
+          video_widget.set_volume (audio del directo en local).
+
+    ESTADO
+        - `_current_camera_id` / `_current_stream_type` ("main"|"l1"|"l2").
+        - `_is_dual_lens` y `_cameras_cache` (lista de cámaras para el combo).
+
+    DEPENDENCIAS
+        RtspVideoWidget (directo), CameraControlPanel (control), api_client
+        (GET /cameras/{id}).
+    """
 
     # Señal para volver a la vista anterior (LiveView)
     back_requested = Signal()
@@ -139,7 +206,12 @@ class CameraControlView(QWidget):
     # API pública
     # ------------------------------------------------------------------
     def set_cameras(self, cameras: list):
-        """Actualiza la lista de cámaras disponibles en el combo."""
+        """Refresca el combo de cámaras conservando la selección actual.
+
+        Propósito: poblar el desplegable con las cámaras disponibles (marcando
+        las dual-lens) sin perder la cámara que ya se estaba viendo. Inputs:
+        `cameras` (lista de DTOs Camera). Llamado por:
+        MainWindow._open_camera_control antes de `show_camera`."""
         self._cameras_cache = list(cameras)
         prev_id = self._current_camera_id
 
@@ -161,7 +233,12 @@ class CameraControlView(QWidget):
                     return
 
     def show_camera(self, camera_id: int, lens: str = "main"):
-        """Muestra una cámara específica (llamado desde LiveView)."""
+        """Selecciona y muestra una cámara/lente concreta en la vista.
+
+        Propósito: posicionar el combo en `camera_id` (lo que dispara la carga
+        del directo y del panel) y, si es dual-lens, fijar la lente pedida.
+        Inputs: `camera_id`, `lens` ("main"|"l1"|"l2"). Llamado por:
+        MainWindow._open_camera_control (desde LiveView/gestión)."""
         # Asegurar que está en el combo
         for i in range(self.cmb_camera.count()):
             if self.cmb_camera.itemData(i) == camera_id:
@@ -179,6 +256,14 @@ class CameraControlView(QWidget):
     # Internos
     # ------------------------------------------------------------------
     def _on_camera_change(self, idx: int):
+        """Slot del combo de cámara: reconfigura lentes, panel y directo.
+
+        Propósito: al elegir otra cámara, rearmar el combo de lente (L1/L2 si es
+        dual, "Principal" si no), pedir sus datos completos para el panel y
+        cargar su directo con swap asíncrono. Inputs: índice del combo. Señales:
+        ninguna. Llamado por: `cmb_camera.currentIndexChanged`. Llama a:
+        GET /cameras/{id}, `_load_stream(swap=True)`,
+        control_panel.set_camera."""
         camera_id = self.cmb_camera.itemData(idx)
 
         if camera_id is None:

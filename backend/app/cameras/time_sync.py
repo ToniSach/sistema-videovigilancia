@@ -1,6 +1,24 @@
 """
+================================================================================
+MÓDULO: time_sync — Sincronización de la hora de la cámara vía ONVIF
+================================================================================
+
 Sincronización de la hora de la cámara con la del servidor vía ONVIF
 (SetSystemDateAndTime).
+
+RESPONSABILIDAD / DEPENDENCIAS
+    Función única `sync_camera_time(camera)`: conecta al device_service ONVIF
+    (onvif-zeep, reutilizando .onvif_common) y empuja la hora del servidor.
+    Best-effort: nunca lanza, devuelve True/False.
+
+QUIÉN LO CONSUME
+    camera_manager._maybe_sync_time() lo invoca en un hilo aparte al ARRANCAR
+    cada cámara, si CAMERA_SYNC_TIME_ON_START está activo (default True). No
+    bloquea el arranque.
+
+PIPELINE
+    #7 ONVIF (control: device_service) · enganchado en #1 Inicio (al arrancar
+    cada cámara).
 
 POR QUÉ
 -------
@@ -44,8 +62,19 @@ def _build_cam(camera: Camera, port: int) -> Optional[ONVIFCamera]:
 
 def sync_camera_time(camera: Camera) -> bool:
     """
-    Empuja la hora del servidor a la cámara. Devuelve True si la cámara aceptó
-    el cambio; False si no soporta ONVIF o lo rechazó (best-effort, no lanza).
+    Empuja la hora del servidor a la cámara vía ONVIF. (Pipeline #7 ONVIF.)
+
+    Solicitud SOAP: SetSystemDateAndTime con DateTimeType=Manual,
+        DaylightSavings=False, TimeZone={TZ:"GMT0"} y UTCDateTime = hora LOCAL
+        del servidor. El truco GMT0 hace que el OSD quede en hora local tanto en
+        cámaras que respetan la zona horaria como en las que la ignoran
+        (XiongMai pintan UTCDateTime tal cual).
+    Respuesta esperada: SetSystemDateAndTimeResponse vacío (HTTP 200 sin Fault).
+    Servicio ONVIF: device_service.
+    Inputs:  camera (IP/credenciales).
+    Outputs: True si la cámara aceptó; False si no hay ONVIF o lo rechazó.
+    Excepciones: ninguna se propaga (best-effort; Fault/errores → False).
+    Llamado por: camera_manager._maybe_sync_time() (hilo de arranque).
     """
     cam = None
     for port in _candidate_ports(camera):

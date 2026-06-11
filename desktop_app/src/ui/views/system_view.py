@@ -1,11 +1,38 @@
 """
-Vista de salud del sistema — dashboard de monitoreo.
+================================================================================
+MÓDULO: ui.views.system_view — Salud y métricas del sistema (dashboard de monitoreo)
+================================================================================
 
-Muestra en tiempo real:
-- CPU / RAM / disco del servidor
-- Estado de cada cámara (FPS, conexión, último frame)
-- Información de hardware
-- Estadísticas de eventos (últimas 24h por tipo)
+PROPÓSITO
+    Pantalla de monitoreo en tiempo real del SERVIDOR: tarjetas de CPU/RAM/disco,
+    score de salud general, info de hardware, tendencias (sparklines) y una tabla
+    con el estado de cada cámara (FPS, último frame, datos procesados). Hace
+    polling periódico mientras está visible.
+
+RESPONSABILIDAD
+    - Polling cada 5s (`_poll`) de `system/health` para refrescar tarjetas,
+      sparklines, score y tabla de cámaras; arranca/para el timer según
+      visibilidad (showEvent/hideEvent).
+    - Carga única de la info de hardware (`_load_hardware`, no cambia).
+    - Calcular un "score de salud" 0-100 con avisos accionables
+      (`_update_health_score`).
+
+DEPENDENCIAS (endpoints consumidos)
+    - GET system/hardware ... CPU/RAM/GPU/OS (una vez).
+    - GET system/health ..... métricas en vivo (sistema + lista de cámaras).
+
+COMPONENTES RELACIONADOS
+    main_window la instancia (índice VIEW_SYSTEM=6). Usa GlassCard, Sparkline y
+    reutiliza `_TABLE_STYLE` de users_view. `StatCard` es un widget local
+    (número grande + barra) definido en este módulo.
+
+PUNTO DE ENTRADA (en la app)
+    Sidebar «Sistema» → MainWindow._switch_view(VIEW_SYSTEM).
+
+PIPELINE(S)
+    Transversal de observabilidad: refleja MetricsCollector / estado de cámaras
+    del backend; no participa en un pipeline de datos concreto.
+================================================================================
 """
 import logging
 from typing import List
@@ -101,6 +128,21 @@ class StatCard(GlassCard):
 
 
 class SystemHealthView(QWidget):
+    """Vista de salud/métricas del sistema (dashboard de monitoreo).
+
+    RESPONSABILIDAD / ROL
+        Página del content_stack que muestra el estado del servidor y de las
+        cámaras en tiempo real, con polling mientras está visible.
+
+    QUIÉN LA INSTANCIA
+        main_window (índice VIEW_SYSTEM=6).
+
+    SEÑALES QT
+        No define señales propias. Usa un QTimer interno (`_timer`) cuyo
+        `timeout` dispara `_poll`; se arranca/para en showEvent/hideEvent para
+        no consumir red cuando la vista no se ve.
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._setup_ui()
@@ -244,7 +286,12 @@ class SystemHealthView(QWidget):
         api_client.get("system/hardware", on_hw)
 
     def _poll(self):
-        """Polling de salud + estadísticas (cada 3s)."""
+        """Refresco periódico (cada 5s): pide system/health y actualiza la UI.
+
+        Outputs: tarjetas, sparklines, score de salud y tabla de cámaras.
+        Llamado por: el QTimer (mientras la vista es visible) y la carga inicial.
+        Llama a: GET system/health; delega en `_update_stats` y `_update_cameras`.
+        """
         def on_health(response):
             if not response.success:
                 self.lbl_last_update.setText("Sin conexión")

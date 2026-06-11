@@ -1,3 +1,62 @@
+"""
+================================================================================
+MÓDULO: api.routes.cameras — Blueprint REST de cámaras (CRUD + control + directo)
+================================================================================
+
+PROPÓSITO
+    Capa HTTP de todo lo relativo a cámaras: alta/baja/edición, descubrimiento
+    ONVIF, enriquecimiento de URLs de directo (go2rtc), signaling WebRTC, control
+    PTZ/LEDs/audio y diagnóstico de latencia. Es uno de los blueprints más
+    grandes porque concentra la interacción del cliente con el hardware.
+
+RESPONSABILIDAD PRINCIPAL
+    Validar autenticación (@jwt_required) y permiso por cámara
+    (@require_camera_permission / @require_admin), parsear la petición y DELEGAR
+    en CameraService (lógica de negocio) o en servicios especializados
+    (PTZLockService, Go2RtcManager, webrtc_signaling). No contiene lógica de
+    dominio: traduce HTTP ↔ servicios.
+
+DEPENDENCIAS IMPORTANTES
+    container.get_container() → "camera_service" (CameraService)   [delegado principal]
+    services.permission_service .. require_camera_permission / PermissionService
+    services.ptz_lock_service .... lock de control PTZ exclusivo (#8)
+    streaming.go2rtc_manager ..... URLs de restream RTSP/HLS (_enrich_live_fields)
+    streaming.webrtc_signaling ... proxy del SDP offer→answer (#6)
+    cameras.camera_manager ....... estado del worker para diagnóstico
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    Se registra como `cameras_bp` (url_prefix=/api/v1/cameras) en
+    main.register_blueprints(). El cliente desktop/móvil lo consume para listar
+    cámaras y obtener las URLs de directo.
+
+PIPELINES EN QUE PARTICIPA
+    #3 Visualización en vivo .. _enrich_live_fields añade stream_url/hls_url
+    #6 WebRTC ................. POST /<id>/webrtc (signaling, medio va P2P)
+    #7 ONVIF ................. /discover, /test-connection, /url-suggestions
+    #8 PTZ ................... /<id>/ptz/* (con lock), /<id>/leds/*, /<id>/audio/*
+    #1 Inicio ................ no arranca nada; refleja estado de CameraManager
+
+CONTRATO HTTP COMÚN
+    Respuesta JSON uniforme: {"success": bool, "data"|"error": ...}. Códigos:
+    200/201 ok · 400 datos inválidos · 403 sin permiso · 404 no existe ·
+    423 cámara bloqueada por otro usuario (PTZ) · 502 cámara/ONVIF no responde ·
+    503 WebRTC/go2rtc desactivado · 500 error interno.
+
+ENDPOINTS (resumen)
+    GET    /                         lista cámaras visibles (filtra por permiso)
+    GET    /<id>                     detalle de una cámara
+    POST   /                         alta (solo admin)
+    PUT    /<id>                     edición · DELETE /<id> baja (solo admin)
+    PATCH  /<id>/toggle              activar/desactivar
+    POST   /<id>/webrtc              signaling WebRTC (#6)
+    POST   /discover · /test-connection · GET /url-suggestions   (ONVIF, #7)
+    POST   /<id>/sync-time           empuja hora del servidor a la cámara (ONVIF)
+    POST   /<id>/ptz/<dir>           movimiento PTZ con lock (#8)
+    GET    /<id>/ptz/status · presets · POST /ptz/goto/<tok> · /ptz/preset
+    POST   /<id>/leds/<state> · /<id>/audio/{talk,stop,listen/*}
+    GET    /<id>/diagnose · /<id>/latency   diagnóstico de worker/latencia
+================================================================================
+"""
 from flask import Blueprint, request, jsonify, Response
 from flask_jwt_extended import jwt_required, decode_token, get_jwt_identity
 import logging
@@ -32,24 +91,29 @@ def _enrich_live_fields(cam: dict) -> dict:
         if go2rtc.is_enabled() and cam.get("id") is not None:
             cam = dict(cam)
             cid = cam["id"]
-            qualities = ("high", "medium", "low")
+            # Solo se generan el ORIGINAL + "medium". Por lente (dual) la única
+            # calidad de visualización es "medium"; el "original" es el combinado.
             if cam.get("is_dual_lens"):
-                # Dual-lens: por lente y por calidad.
-                cam["stream_url"] = go2rtc.rtsp_restream_url(cid)  # combinado (fallback)
-                cam["stream_url_l1"] = go2rtc.rtsp_restream_url(cid, "l1")
-                cam["stream_url_l2"] = go2rtc.rtsp_restream_url(cid, "l2")
+                # Dual-lens: por lente solo "medium". stream_url = combinado original.
+                cam["stream_url"] = go2rtc.rtsp_restream_url(cid)  # combinado (original)
+                cam["stream_url_l1"] = go2rtc.rtsp_restream_url(cid, "l1", "medium")
+                cam["stream_url_l2"] = go2rtc.rtsp_restream_url(cid, "l2", "medium")
                 cam["stream_urls"] = {
-                    "l1": {q: go2rtc.rtsp_restream_url(cid, "l1", q) for q in qualities},
-                    "l2": {q: go2rtc.rtsp_restream_url(cid, "l2", q) for q in qualities},
+                    "l1": {"medium": go2rtc.rtsp_restream_url(cid, "l1", "medium")},
+                    "l2": {"medium": go2rtc.rtsp_restream_url(cid, "l2", "medium")},
                 }
                 # HLS por lente (la móvil lo prefiere; RTSP queda como fallback).
                 cam["hls_url"] = go2rtc.hls_url(cid)
-                cam["hls_url_l1"] = go2rtc.hls_url(cid, "l1")
-                cam["hls_url_l2"] = go2rtc.hls_url(cid, "l2")
+                cam["hls_url_l1"] = go2rtc.hls_url(cid, "l1", "medium")
+                cam["hls_url_l2"] = go2rtc.hls_url(cid, "l2", "medium")
             else:
+                # Mono: original (cam_X) + medium.
                 cam["stream_url"] = go2rtc.rtsp_restream_url(cid)
                 cam["stream_urls"] = {
-                    "main": {q: go2rtc.rtsp_restream_url(cid, None, q) for q in qualities}
+                    "main": {
+                        "high": go2rtc.rtsp_restream_url(cid, None, "high"),
+                        "medium": go2rtc.rtsp_restream_url(cid, None, "medium"),
+                    }
                 }
                 cam["hls_url"] = go2rtc.hls_url(cid)
             if settings.WEBRTC_ENABLED:
@@ -351,6 +415,18 @@ def discover_cameras():
 @jwt_required()
 @require_camera_permission("control_ptz")
 def ptz_control(camera_id, direction):
+    """
+    Mueve la cámara (Pipeline #8 PTZ, etapa HTTP→lock→ONVIF).
+
+    Inputs: camera_id; direction ∈ {up,down,left,right,zoom_in,zoom_out,stop};
+        requiere permiso 'control_ptz'.
+    Flujo: adquiere el lock exclusivo (ptz_lock_service) para evitar control
+        simultáneo de dos usuarios → si otro lo tiene, 423 Locked. Con el lock,
+        delega en CameraService.ptz_control (que habla ONVIF ContinuousMove),
+        extiende el lock 10s y SIEMPRE lo libera en finally.
+    Outputs: 200 {success, data} · 423 ocupado · 500 error.
+    Llama a: ptz_lock_service.acquire/extend/release_lock, CameraService.ptz_control.
+    """
     try:
         user_id = int(get_jwt_identity())
         user = UserService().get_user_by_id(user_id)

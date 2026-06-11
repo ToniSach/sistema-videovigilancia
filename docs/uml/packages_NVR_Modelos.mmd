@@ -1,0 +1,20 @@
+classDiagram
+  class database {
+  }
+  class connection {
+  }
+  class models {
+  }
+  class repositories {
+  }
+  class base_repository {
+  }
+  class camera_repository {
+  }
+  class event_repository {
+  }
+  class recording_repository {
+  }
+  camera_repository --> base_repository
+  event_repository --> base_repository
+  recording_repository --> base_repository

@@ -1,10 +1,62 @@
 """
-API Endpoints para gestión de dispositivos móviles.
+================================================================================
+MÓDULO: api.routes.devices — Registro y ciclo de vida de dispositivos móviles
+================================================================================
 
-Tras vincular vía QR el móvil recibe JWT REALES (no tokens custom): así
-puede usar todos los endpoints existentes que ya están protegidos por
-@jwt_required(), incluyendo cameras/ptz, leds, audio, recordings, etc.
-sin duplicar lógica de autenticación.
+PROPÓSITO
+    Blueprint REST del onboarding y sesión de la app móvil (CamLink): alta de
+    un MobileDevice tras escanear el QR de vinculación, emisión/renovación de
+    JWT propios del móvil, logout (revocación + baja) y listado/baja de
+    dispositivos del usuario.
+
+DECISIÓN CLAVE (no duplicar autenticación)
+    Tras vincular vía QR el móvil recibe JWT REALES (no tokens custom): así
+    puede usar TODOS los endpoints existentes ya protegidos por @jwt_required()
+    (cameras/ptz, leds, audio, recordings...) sin lógica de auth aparte. Los
+    tokens llevan claims extra: device_id (distingue móvil de desktop y permite
+    revocar por dispositivo) y src="mobile". Vida más larga que desktop
+    (access 24h, refresh ≥30 días) para no relogear todo el día.
+
+RESPONSABILIDAD
+    Contrato HTTP + validación/saneo de entrada (UUID y nombre de dispositivo)
+    + emisión de tokens. La persistencia del dispositivo vive en DeviceService;
+    el consumo del link_token de un solo uso vive en QRService; la revocación
+    en jwt_blocklist.
+
+DEPENDENCIAS
+    services.device_service.DeviceService  alta/baja/listado de MobileDevice
+    services.qr_service.QRService .......... consume el link_token (5 min)
+    database.connection.db_manager ......... lee User/MobileDevice frescos de BD
+    core.jwt_blocklist.jwt_blocklist ....... revoca el JWT en logout
+    flask_jwt_extended ..................... emisión de access/refresh tokens
+    api.helpers.api_error_response ......... error JSON sin filtrar stack trace
+
+COMPONENTES RELACIONADOS
+    routes/qr.py + routes/auth.py(/qr)  generan el QR/link_token que aquí se consume
+    routes/mobile.py ................... endpoints de datos del cliente móvil
+    routes/telegram_link.py ............ otro canal de notificación del usuario
+    database.models.MobileDevice ....... modelo ORM (.to_dict() en /my-devices)
+
+PUNTO DE ENTRADA
+    Registrado en main.create_app() vía safe_register(devices_bp).
+    Prefijo: /api/v1/devices. Best-effort.
+
+PIPELINE(S)
+    Pipeline #2 (Autenticación) — variante móvil: emisión/renovación/revocación
+    de sesión por dispositivo. Habilita además al móvil como destino del
+    Pipeline #13 (Notificaciones push/FCM).
+
+ENDPOINTS
+    POST   /register      → register_device()       [público, link_token] alta + JWT
+    POST   /refresh       → refresh_device_token()   [refresh JWT] renueva access
+    POST   /logout        → logout_device()          [auth] revoca + desactiva
+    GET    /my-devices    → get_my_devices()         [auth] lista dispositivos activos
+    DELETE /<device_id>   → unregister_device()      [auth+ownership] baja dispositivo
+
+HELPERS INTERNOS
+    _validate_device_uuid / _validate_device_name  saneo de entrada del QR.
+    _issue_mobile_tokens  emite el par access/refresh con claims de móvil.
+================================================================================
 """
 import logging
 import re
@@ -81,16 +133,24 @@ def _issue_mobile_tokens(user_id: int, role: str, device_id: int) -> tuple[str, 
 @devices_bp.route("/register", methods=["POST"])
 def register_device():
     """
-    Registro de dispositivo desde QR scan.
-    No requiere JWT, usa link_token de un solo uso (5 min de validez).
+    Alta de dispositivo móvil tras escanear el QR de vinculación.
 
-    Body:
-      {
-        "link_token": "<uuid generado por desktop>",
-        "device_uuid": "<uuid único del móvil>",
-        "device_name": "Mi iPhone",
-        "platform": "android" | "ios"
-      }
+    Método+Ruta: POST /api/v1/devices/register
+    Permiso: PÚBLICO (sin JWT). La autorización es el link_token de un solo uso
+        (5 min de validez) generado por el desktop/QR.
+    Inputs (body JSON):
+        link_token (str, REQUERIDO; uuid generado por desktop, se consume),
+        device_uuid (str, REQUERIDO; UUID único del móvil, validado a canónico),
+        device_name (str, opcional; saneado, default "Dispositivo móvil"),
+        platform ("android"|"ios"|"unknown"; cualquier otro → "unknown").
+    Outputs:
+        201 {success:true, data:{device_id, access_token, refresh_token,
+             server_url, user:{id, username, role}}} (JWT reales para el móvil).
+        400 si falta link_token o device_uuid inválido.
+        401 si link_token inválido/expirado o usuario asociado no válido.
+        5xx vía api_error_response ante fallo interno.
+    Llama a: QRService.consume_link_token() + DeviceService.register_device()
+        + _issue_mobile_tokens().
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -172,7 +232,16 @@ def register_device():
 def refresh_device_token():
     """
     Renueva el access_token del móvil usando el refresh_token JWT.
-    El refresh_token DEBE venir en header Authorization como Bearer.
+
+    Método+Ruta: POST /api/v1/devices/refresh
+    Permiso: @jwt_required(refresh=True) — el refresh_token DEBE venir en header
+        Authorization: Bearer ... y llevar claim device_id (es de móvil).
+    Inputs: ninguno en body; identidad y device_id salen del token.
+    Outputs:
+        200 {success:true, data:{access_token}} (nuevo access, vida 24h).
+        400 si el token no es de dispositivo móvil (sin device_id).
+        401 si el usuario está inactivo o el dispositivo fue desactivado.
+    Llama a: db_manager (revalida User/MobileDevice) + create_access_token.
     """
     try:
         identity = get_jwt_identity()
@@ -216,9 +285,18 @@ def refresh_device_token():
 @jwt_required()
 def logout_device():
     """
-    Cierra sesión del dispositivo móvil:
-    - Revoca el JWT actual (blocklist)
-    - Marca el MobileDevice como is_active=False
+    Cierra sesión del dispositivo móvil.
+
+    Método+Ruta: POST /api/v1/devices/logout
+    Permiso: JWT válido (access del móvil).
+    Efectos: revoca el JWT actual en jwt_blocklist (hasta su exp natural) y, si
+        el token lleva device_id, marca el MobileDevice como is_active=False
+        (futuros refresh fallarán con 401).
+    Inputs: ninguno (jti/exp/device_id salen de los claims).
+    Outputs:
+        200 {success:true, message}
+        5xx vía api_error_response ante fallo interno.
+    Llama a: jwt_blocklist.revoke() + DeviceService.deactivate_device().
     """
     try:
         claims = get_jwt() or {}
@@ -242,7 +320,17 @@ def logout_device():
 @devices_bp.route("/my-devices", methods=["GET"])
 @jwt_required()
 def get_my_devices():
-    """Obtiene dispositivos activos del usuario actual."""
+    """
+    Lista los dispositivos móviles activos del usuario autenticado.
+
+    Método+Ruta: GET /api/v1/devices/my-devices
+    Permiso: JWT válido (cualquier rol).
+    Inputs: ninguno.
+    Outputs:
+        200 {success:true, data:[MobileDevice.to_dict(), ...]}
+        5xx vía api_error_response ante fallo interno.
+    Llama a: DeviceService.get_user_devices(user_id).
+    """
     try:
         user_id = int(get_jwt_identity())
         devices = device_service.get_user_devices(user_id)
@@ -258,9 +346,20 @@ def get_my_devices():
 @jwt_required()
 def unregister_device(device_id):
     """
-    Desactiva un dispositivo específico. Solo el dueño puede desactivar
-    sus propios dispositivos. Cualquier JWT del dispositivo desactivado
-    seguirá siendo válido hasta su exp; el cliente debe descartarlo.
+    Desactiva un dispositivo concreto del usuario (baja remota).
+
+    Método+Ruta: DELETE /api/v1/devices/<device_id>
+    Permiso: JWT válido + OWNERSHIP (solo el dueño puede dar de baja sus
+        dispositivos; si no le pertenece → 403).
+    Inputs: Path device_id (int).
+    Outputs:
+        200 {success:true}
+        403 {success:false, error:"No autorizado"} si no es del usuario.
+        404 {success:false, error:"No encontrado"} si no existe.
+        5xx vía api_error_response ante fallo interno.
+    Nota: cualquier JWT ya emitido para ese dispositivo sigue válido hasta su
+        exp; el cliente debe descartarlo (no se revoca por jti aquí).
+    Llama a: DeviceService.get_user_devices() (ownership) + deactivate_device().
     """
     try:
         user_id = int(get_jwt_identity())

@@ -1,22 +1,56 @@
 """
-Telegram Bot Poller — lee mensajes que llegan al bot vía long-polling
-(getUpdates) y procesa comandos de vinculación.
+================================================================================
+MÓDULO: notifications.telegram_bot_poller — Long-poll del bot (vinculación)
+================================================================================
 
-¿Por qué un poller y no webhook?
-- LAN-only: el servidor no es accesible desde internet, así que webhook no
-  funciona. getUpdates long-poll funciona desde cualquier red con salida.
+PROPÓSITO
+    Escucha los mensajes ENTRANTES del bot de Telegram (getUpdates long-poll) y
+    procesa comandos de vinculación de chats con cuentas de usuario. Es el flujo
+    INVERSO al de telegram_notifier (que sólo envía): aquí Telegram → backend.
 
-Comandos soportados:
-  /start                → mensaje de bienvenida con instrucciones
-  /vincular CÓDIGO      → vincula este chat con el usuario dueño del código
-  CÓDIGO                → atajo: si el mensaje es sólo el código, igual vincula
-  /desvincular          → desactiva todos los chats con este chat_id
-  /estado               → consulta si el chat está vinculado y a quién
-  cualquier otra cosa   → muestra los comandos disponibles
+RESPONSABILIDAD PRINCIPAL
+    Detectar el comando /vincular CÓDIGO (y sus variantes) para asociar un
+    chat_id de Telegram a un usuario (tabla UserTelegramChat), de modo que el
+    NotificationRouter pueda luego enrutar notificaciones a ese chat. También
+    gestiona /desvincular, /estado, /start (con deep-link) y /ayuda.
 
-Persistencia del offset: la API devuelve un update_id incremental. Si el
-backend se reinicia, se debe recordar el último procesado para no repetir
-notificaciones. Se guarda en SystemConfig key='telegram_last_update_id'.
+¿POR QUÉ POLLING Y NO WEBHOOK?
+    El backend es LAN-only (no accesible desde internet), así que un webhook de
+    Telegram no funcionaría. getUpdates long-poll sale desde cualquier red con
+    conexión saliente.
+
+COMANDOS SOPORTADOS
+    /start [CÓDIGO]    → bienvenida; con código (deep-link t.me/<bot>?start=) vincula
+    /vincular CÓDIGO   → vincula este chat con el usuario dueño del código
+    CÓDIGO (suelto)    → atajo: si el mensaje es sólo el código, vincula igual
+    /desvincular       → desactiva todos los UserTelegramChat de este chat_id
+    /estado            → indica si el chat está vinculado y a qué cuentas
+    /ayuda /help       → lista de comandos
+
+DEPENDENCIAS
+    requests ........................ HTTP a la Bot API (getMe/getUpdates/sendMessage)
+    database.connection.db_manager .. lee token/offset, escribe vinculaciones
+    database.models ................. SystemConfig (config/offset), UserTelegramChat
+    services.telegram_link_service .. verifica el código y crea la vinculación
+
+COMPONENTES RELACIONADOS
+    telegram_link_service ... valida códigos generados por la app/escritorio
+    telegram_notifier ....... canal de SALIDA (este módulo es el de ENTRADA)
+    NotificationRouter ...... consume las vinculaciones que crea este poller
+
+PUNTO DE ENTRADA
+    Singleton global `telegram_bot_poller`. main.create_app() llama start() en
+    el arranque; el finally del proceso llama stop().
+
+PIPELINE(S)
+    Soporte del pipeline #13 (Notificaciones): construye el destino (chat
+    vinculado) que el router usa después. No emite eventos al bus #10.
+
+PERSISTENCIA DEL OFFSET
+    getUpdates devuelve un update_id incremental; tras un reinicio hay que
+    recordar el último procesado para no reprocesar mensajes. Se guarda en
+    SystemConfig key='telegram_last_update_id'.
+================================================================================
 """
 from __future__ import annotations
 
@@ -42,7 +76,24 @@ _CODE_RE = re.compile(r"^([A-Z0-9]{4,10})$")
 
 
 class TelegramBotPoller:
-    """Singleton thread-safe que escucha el bot."""
+    """
+    Poller del bot de Telegram, SINGLETON thread-safe (soporte pipeline #13).
+
+    Rol: corre un hilo daemon que hace long-poll de getUpdates, parsea comandos
+    y crea/elimina vinculaciones chat↔usuario. Resiliente: si no hay red en el
+    arranque, el loop igual arranca y reintenta identidad+updates al volver la
+    conexión (self-healing con backoff agresivo).
+
+    SINGLETON (__new__ + lock): un único hilo de polling por proceso (dos
+    consumirían los mismos updates y duplicarían respuestas).
+
+    Quién lo instancia/consume: instancia global `telegram_bot_poller`. main lo
+    arranca (start) y lo detiene en el shutdown. Usa TelegramLinkService para
+    verificar códigos.
+
+    Dependencias: SystemConfig (token, offset, username del bot), UserTelegramChat
+    (vinculaciones), requests (HTTP).
+    """
 
     _instance = None
     _instance_lock = threading.Lock()
@@ -114,26 +165,35 @@ class TelegramBotPoller:
         return True
 
     def stop(self) -> None:
+        """
+        Señala el fin del loop y espera al hilo (hasta 5s). Llamado en shutdown.
+        """
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         logger.info("[TelegramPoller] Detenido")
 
     def reload(self) -> None:
-        """Reinicia el poller con la config nueva (cambio de token, etc.)."""
+        """
+        Reinicia el poller con la config nueva (p.ej. tras cambiar el bot_token).
+        Equivale a stop() + start(). Llamado por las rutas de Telegram al editar
+        las credenciales.
+        """
         self.stop()
         self.start()
 
     def get_bot_username(self) -> str:
+        """Devuelve el @username del bot (vacío si aún no se resolvió getMe)."""
         with self._lock:
             return self._bot_username
 
     def is_configured(self) -> bool:
-        """True si hay bot_token (haya o no arrancado el poller)."""
+        """True si hay bot_token en SystemConfig (haya o no arrancado el poller)."""
         self._load_config()
         return bool(self._bot_token)
 
     def is_running(self) -> bool:
+        """True si el hilo de polling está vivo."""
         return bool(self._thread and self._thread.is_alive())
 
     # ------------------------------------------------------------------
@@ -213,6 +273,15 @@ class TelegramBotPoller:
     # Loop principal
     # ------------------------------------------------------------------
     def _poll_loop(self) -> None:
+        """
+        Bucle principal del hilo: long-poll de updates con backoff adaptativo.
+
+        Mientras no se pida parar: resuelve identidad pendiente, pide updates y
+        procesa cada uno. Ante fallos de red sostenidos sube el backoff hasta 5
+        min (no spamear logs) y lo resetea a 1s en cuanto la red vuelve. Aísla
+        cualquier excepción para que el hilo no muera. Llama a _get_updates y
+        _process_update.
+        """
         backoff = 1
         offline_streak = 0  # contador consecutivo de errores de red
         while not self._stop_event.is_set():
@@ -308,6 +377,13 @@ class TelegramBotPoller:
     # Procesado de mensajes
     # ------------------------------------------------------------------
     def _process_update(self, update: dict) -> None:
+        """
+        Procesa UN update: extrae chat/texto, despacha el comando y avanza offset.
+
+        Inputs:  update (dict de la Bot API). Outputs: None.
+        El offset se persiste DESPUÉS de procesar (en _advance_offset) para no
+        perder mensajes si crashea a mitad de batch. Llama a _dispatch_command.
+        """
         update_id = int(update.get("update_id", 0))
         message = update.get("message") or {}
         chat = message.get("chat") or {}
@@ -339,10 +415,17 @@ class TelegramBotPoller:
         self._save_offset(update_id)
 
     def _dispatch_command(self, chat_id: str, username: str, text: str) -> None:
+        """
+        Enruta el texto del mensaje al comando correspondiente (/start, /vincular,
+        /desvincular, /estado, /ayuda) o al atajo de CÓDIGO suelto.
+
+        Inputs:  chat_id, username (para personalizar), text del mensaje.
+        Outputs: None (efecto: responde por Telegram vía los _cmd_*).
+        Por defecto (texto no reconocido) muestra la ayuda.
+        """
         if not text:
             return
 
-        # Normalizar
         if text.startswith("/start"):
             # Deep link de Telegram: t.me/<bot>?start=CODIGO llega como
             # "/start CODIGO" → vincula directamente (un toque desde la app).
@@ -416,6 +499,17 @@ class TelegramBotPoller:
         )
 
     def _cmd_verify(self, chat_id: str, username: str, code: str) -> None:
+        """
+        Verifica un código y vincula el chat con la cuenta (núcleo de /vincular).
+
+        Propósito (etapa clave del soporte #13): delega en TelegramLinkService la
+        validación del código (caduca a los 5 min) y la creación de la fila
+        UserTelegramChat. Responde éxito o error al usuario.
+
+        Inputs:  chat_id, username, code (4-10 alfanum. en mayúscula).
+        Outputs: None (responde por Telegram).
+        Llama a: TelegramLinkService.verify_code, self._reply.
+        """
         link = self._get_link_service()
         try:
             ok = link.verify_code(
@@ -496,6 +590,10 @@ class TelegramBotPoller:
         return self._link_service
 
     def _reply(self, chat_id: str, text: str) -> bool:
+        """
+        Responde un texto al chat (sendMessage). Si Markdown falla por caracteres
+        especiales, reintenta sin parse_mode. Usado por todos los _cmd_*.
+        """
         try:
             url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
             r = requests.post(url, json={
@@ -513,5 +611,5 @@ class TelegramBotPoller:
             return False
 
 
-# Instancia global
+# Instancia global (singleton): único poller del bot por proceso.
 telegram_bot_poller = TelegramBotPoller()

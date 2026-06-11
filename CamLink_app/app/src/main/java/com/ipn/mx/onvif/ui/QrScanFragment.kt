@@ -1,3 +1,39 @@
+/*
+ * ============================================================================
+ * MÓDULO: QrScanFragment — Pantalla de login/vinculación (CamLink Android)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Punto de entrada de sesión de la app: vincula el dispositivo a un servidor
+ *   NVR/VMS de la LAN escaneando el QR que genera el backend (o, en su defecto,
+ *   por conexión manual), obtiene los tokens JWT y navega al directo.
+ *
+ * RESPONSABILIDAD
+ *   - Auto-login: si ya hay servidor + access token en prefs, salta al LiveView.
+ *   - Escaneo QR con CameraX + ML Kit: el QR trae { server, link_token, version };
+ *     se hace POST /devices/register, que devuelve los tokens reales.
+ *   - Conexión manual (fallback): diálogo IP/puerto/usuario/contraseña → /auth/login.
+ *   - Persistir serverIp/serverPort y tokens; arrancar el WS de notificaciones.
+ *
+ * DEPENDENCIAS
+ *   - CameraX (preview + análisis de frames) + ML Kit Barcode (solo QR).
+ *   - RetrofitClient + ApiService — POST /devices/register y POST /auth/login.
+ *   - DeviceIdentity — UUID estable y nombre legible del dispositivo.
+ *   - NotificationWebSocketService — se inicia al completar la sesión.
+ *
+ * COMPONENTES RELACIONADOS
+ *   - MainActivity — oculta toolbar/barra inferior en esta pantalla y navega
+ *     aquí al recibir SESSION_EXPIRED (re-login).
+ *   - LiveViewFragment — destino tras vincular con éxito.
+ *
+ * PUNTO DE ENTRADA
+ *   Destino de Navigation R.id.qrScanFragment (pantalla "fuera de sesión").
+ *
+ * PIPELINE(S)
+ *   #2 Auth (lado móvil): QR/manual → tokens JWT → RetrofitClient.saveToken.
+ *   #13 Notificaciones — arranca el foreground service de push al entrar.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.Manifest
@@ -43,19 +79,34 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Pantalla de vinculación inicial.
+ * Fragment de vinculación/login inicial (pantalla "fuera de sesión").
  *
- * Modos:
+ * ROL Y RESPONSABILIDAD
+ *   Resuelve la autenticación del cliente móvil (Pipeline #2) por tres vías y,
+ *   tras obtener los tokens JWT, arranca el WS de notificaciones y navega al
+ *   directo.
+ *
+ * MODOS
  *   1) Auto-login: si ya hay `serverIp` + `jwt_access_token` en prefs,
- *      navega directamente al LiveView.
+ *      navega directamente al LiveView (no se monta la cámara).
  *   2) Escaneo QR: CameraX + ML Kit. El QR contiene
  *      `{ "server": "http://ip:port", "link_token": "uuid", "version": "1.0" }`.
  *      Al detectarlo, POST /api/v1/devices/register devuelve tokens reales
  *      → se guardan en prefs → navega a LiveView.
- *   3) Conexión manual: diálogo con IP/puerto/usuario/contraseña.
+ *   3) Conexión manual: diálogo con IP/puerto/usuario/contraseña → /auth/login.
  *
- * Manejo de permiso CAMERA en runtime. Si el usuario lo rechaza, queda
- * disponible el botón de conexión manual.
+ * QUIÉN LA INSTANCIA / CONSUME
+ *   La instancia el Navigation Component como destino R.id.qrScanFragment.
+ *   MainActivity navega aquí cuando JwtAuthenticator emite SESSION_EXPIRED.
+ *
+ * CICLO DE VIDA ANDROID RELEVANTE
+ *   - onViewCreated: comprueba auto-login y pide/usa el permiso CAMERA.
+ *   - onDestroyView: cierra el executor de CameraX y el BarcodeScanner (evita
+ *     leaks de hilo/recursos nativos de ML Kit).
+ *   Manejo de permiso CAMERA en runtime; si se rechaza, queda el botón manual.
+ *
+ * PIPELINE
+ *   #2 Auth · #13 Notificaciones (arranque del WS service).
  */
 class QrScanFragment : Fragment() {
 
@@ -186,6 +237,16 @@ class QrScanFragment : Fragment() {
         }, ContextCompat.getMainExecutor(ctx))
     }
 
+    /**
+     * Analizador de frames de CameraX: pasa cada imagen a ML Kit buscando un QR.
+     * Descarta el frame sin coste si ya se está procesando un QR (isHandlingQr),
+     * y usa compareAndSet para garantizar que solo el PRIMER frame válido dispara
+     * el registro (ML Kit puede leer el mismo QR muchas veces en milisegundos).
+     * Cierra siempre el ImageProxy en onComplete (si no, CameraX deja de entregar).
+     *
+     * @param imageProxy frame entregado por ImageAnalysis (en cameraExecutor).
+     * Llamado por: el analyzer registrado en startCamera. Llama a: onQrDetected.
+     */
     // ExperimentalGetImage es una anotación de CameraX en Java (no Kotlin),
     // así que NO usamos kotlin.OptIn (no tendría efecto) sino la versión
     // de AndroidX que sí entiende anotaciones Java marcadas con @RequiresOptIn.
@@ -221,6 +282,14 @@ class QrScanFragment : Fragment() {
 
     // ── Procesado del QR ─────────────────────────────────────────────────────
 
+    /**
+     * Procesa el texto crudo de un QR detectado: lo parsea y, si es válido,
+     * lanza el registro del dispositivo. Si no, muestra "inválido" y rearma el
+     * escaneo a los 1.5s (libera isHandlingQr) para reintentar.
+     *
+     * @param raw contenido textual del QR leído por ML Kit.
+     * Llamado por: analyzeFrame. Llama a: parseQrPayload, registerDevice.
+     */
     private fun onQrDetected(raw: String) {
         Log.i(TAG, "QR detectado (len=${raw.length})")
         // Parsear JSON esperado: { server, link_token, version }
@@ -238,6 +307,14 @@ class QrScanFragment : Fragment() {
 
     private data class QrPayload(val serverUrl: String, val linkToken: String)
 
+    /**
+     * Parsea el QR al [QrPayload] (server + link_token). Acepta el JSON que
+     * genera el backend y, como fallback legacy, el formato "host:port:token".
+     *
+     * @param raw contenido del QR.
+     * @return [QrPayload] válido o null si faltan campos / formato desconocido.
+     * Llamado por: onQrDetected.
+     */
     private fun parseQrPayload(raw: String): QrPayload? {
         // El servidor genera JSON; aceptamos también un fallback "ip:port:token"
         // (legacy) por si llegara desde otra fuente.
@@ -260,6 +337,17 @@ class QrScanFragment : Fragment() {
         }
     }
 
+    /**
+     * Vincula el dispositivo: persiste IP/puerto (los lee buildBaseUrl), hace
+     * POST /devices/register con el link_token del QR + identidad del dispositivo,
+     * guarda los tokens reales (RetrofitClient.saveToken) e info de usuario y
+     * navega al LiveView. Mapea 401/400/red a mensajes y rearma el escaneo.
+     *
+     * @param serverUrl URL base del backend extraída del QR (http://ip:port).
+     * @param linkToken token de vinculación de un solo uso del QR.
+     * Endpoint: POST /api/v1/devices/register (ApiService.registerDevice).
+     * Llamado por: onQrDetected. Llama a: extractHostPort, navigateToLiveView.
+     */
     private fun registerDevice(serverUrl: String, linkToken: String) {
         // Persistir IP/puerto extraídos del QR ANTES de crear el Retrofit,
         // porque buildBaseUrl(context) los lee desde prefs.
@@ -364,6 +452,18 @@ class QrScanFragment : Fragment() {
             .show()
     }
 
+    /**
+     * Login manual (fallback al QR): persiste servidor/credenciales, hace
+     * POST /auth/login, guarda los tokens y navega al LiveView. Distingue
+     * 401 (credenciales), 404 (servidor) y fallo de conexión.
+     *
+     * @param ip IP del backend en la LAN.
+     * @param port puerto (por defecto 5000 si vacío).
+     * @param user usuario.
+     * @param password contraseña.
+     * Endpoint: POST /api/v1/auth/login (ApiService.login).
+     * Llamado por: showManualConnectDialog. Llama a: navigateToLiveView.
+     */
     private fun connectAndLogin(ip: String, port: String, user: String, password: String) {
         val prefs = requireContext().getSharedPreferences("auth_prefs", Context.MODE_PRIVATE)
         prefs.edit()
@@ -401,6 +501,11 @@ class QrScanFragment : Fragment() {
 
     // ── Navegación ────────────────────────────────────────────────────────────
 
+    /**
+     * Arranca el foreground service de notificaciones (WS en LAN, Pipeline #13)
+     * y navega al directo. Único camino de salida exitoso de esta pantalla.
+     * Llamado por: auto-login, registerDevice y connectAndLogin.
+     */
     private fun navigateToLiveView() {
         try {
             NotificationWebSocketService.start(requireContext().applicationContext)

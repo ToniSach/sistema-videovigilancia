@@ -1,3 +1,37 @@
+/*
+ * ============================================================================
+ * MÓDULO: TelegramLinkFragment — vinculación de Telegram del usuario
+ *         (Pipeline #13 Notificaciones, canal Telegram, lado móvil)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Permitir al usuario enlazar su cuenta de Telegram con el sistema para recibir
+ *   alertas por ese canal: genera un código en el backend, ofrece abrir el bot
+ *   (deep link) con el comando copiado al portapapeles, y hace polling hasta
+ *   confirmar la vinculación.
+ *
+ * RESPONSABILIDAD
+ *   - Solicitar un código de vinculación (POST /telegram/generate-code).
+ *   - Mostrar instrucciones y abrir el bot (deep link t.me) copiando "/vincular CODE".
+ *   - Hacer polling del estado (GET /telegram/link-status) cada 2.5s hasta que
+ *     linked=true o expired=true.
+ *   - Gestionar casos: bot no configurado, sesión expirada, código caducado.
+ *
+ * DEPENDENCIAS
+ *   - network/RetrofitClient + ApiService (generateTelegramCode, telegramLinkStatus).
+ *   - Coroutines (lifecycleScope) para el polling cancelable.
+ *
+ * COMPONENTES RELACIONADOS
+ *   - Backend de Telegram (bot + endpoints de vinculación).
+ *   - EventConfigFragment (donde el usuario activa el canal "telegram" por evento).
+ *
+ * PUNTO DE ENTRADA
+ *   Destino de navegación abierto desde el menú/toolbar; sin argumentos.
+ *
+ * PIPELINE(S)
+ *   #13 Notificaciones — configuración del canal Telegram.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.content.ClipData
@@ -29,6 +63,12 @@ import kotlinx.coroutines.launch
  *   2. El usuario toca "Abrir Telegram" (deep link t.me/bot?start=CODE) o envía
  *      manualmente "/vincular CODE" al bot.
  *   3. Polling GET /telegram/link-status?code=CODE cada 2.5s hasta linked=true.
+ *
+ * Ciclo de vida: arranca generando código en onViewCreated; cancela el job de
+ * polling en onDestroyView para no fugar la coroutine. Quién lo instancia: el
+ * Navigation Component al abrir la pantalla desde el menú.
+ *
+ * Pipeline: #13 Notificaciones (canal Telegram).
  */
 class TelegramLinkFragment : Fragment() {
 
@@ -65,6 +105,14 @@ class TelegramLinkFragment : Fragment() {
         generateCode()
     }
 
+    /**
+     * Pide un código nuevo al backend, lo pinta junto con las instrucciones y
+     * arranca el polling de estado. Maneja sesión expirada (401) y bot no
+     * configurado en el servidor.
+     * Endpoint: POST /telegram/generate-code.
+     * Llamado por: onViewCreated y el botón "Generar código nuevo".
+     * Llama a: startPolling.
+     */
     private fun generateCode() {
         pollJob?.cancel()
         tvCode.text = "..."
@@ -120,6 +168,14 @@ class TelegramLinkFragment : Fragment() {
         }
     }
 
+    /**
+     * Sondea el estado de vinculación cada 2.5s hasta linked=true (éxito) o
+     * expired=true (caducado), o hasta que se cancele la coroutine. Errores de red
+     * se reintentan en silencio en el siguiente ciclo.
+     * @param code código de vinculación a consultar.
+     * Endpoint: GET /telegram/link-status?code=CODE.
+     * Llamado por: generateCode.
+     */
     private fun startPolling(code: String) {
         pollJob?.cancel()
         val baseUrl = RetrofitClient.buildBaseUrl(requireContext()) ?: return
@@ -149,6 +205,12 @@ class TelegramLinkFragment : Fragment() {
         }
     }
 
+    /**
+     * Abre el bot de Telegram (deep link o https://t.me/usuario) y copia
+     * "/vincular CODE" al portapapeles para que el usuario sólo lo pegue y envíe
+     * (cubre el caso en que el bot ya fue iniciado y el deep link no auto-envía).
+     * Llamado por: el botón "Abrir Telegram".
+     */
     private fun openTelegram() {
         val link = deepLink
             ?: botUsername?.let { "https://t.me/$it" }

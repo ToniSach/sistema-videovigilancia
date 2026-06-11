@@ -1,5 +1,56 @@
 """
-API Endpoints para grabaciones con timeline, playback streaming y descarga.
+================================================================================
+MÓDULO: api.routes.recordings — Reproducción histórica y gestión de grabaciones
+================================================================================
+
+PROPÓSITO
+    Capa HTTP del Pipeline #14 (Reproducción histórica): listar grabaciones,
+    construir el timeline de un día, servir el vídeo MP4 con seek (Range) y
+    thumbnails, descargar, borrar y controlar la grabación continua manual.
+
+RESPONSABILIDAD
+    Autorizar (JWT + permiso por cámara o token firmado), resolver el archivo en
+    disco de forma segura y servirlo con soporte de Range. Delega la lógica de
+    negocio en RecordingRepository (consultas), SignedUrlService (tokens HMAC) y
+    RecordingManager (grabación manual). No genera clips: eso lo hace
+    recording/recording_manager.py (Pipelines #11/#12).
+
+DOS VÍAS DE AUTORIZACIÓN DE MEDIOS
+    a) JWT en cabecera → /play/<id>, /download/<id> (clientes que sí lo envían).
+    b) URL FIRMADA (token HMAC en query) → /<id>/media, /<id>/thumbnail. Pensada
+       para reproductores nativos (ExoPlayer/AVPlayer/VLC) que NO mandan
+       cabecera Authorization. Ver el "PIPELINE de reproducción segura" detallado
+       más abajo (pasos 1-4) y SignedUrlService.
+
+DEPENDENCIAS IMPORTANTES
+    repositories.recording_repository .. consultas de grabaciones (lectura BD)
+    services.signed_url_service ........ firma/valida tokens de medios (HMAC+TTL)
+    services.permission_service ........ permiso 'view'/'download' por cámara
+    container → "recording_manager" .... start/stop de grabación continua manual
+    streaming.hls_service .............. HLS de VOD (legacy/secundario)
+    ffmpeg (subproceso) ................ recorte por lente dual (_lens_cropped_path)
+
+PUNTO DE ENTRADA / PIPELINES
+    Blueprint `recordings_bp` (url_prefix=/api/v1/recordings), registrado en main.
+    Participa en #14 (reproducción) y ofrece el control manual de #11 (grabación).
+
+ENDPOINTS (resumen)
+    GET    /                         lista con filtros (camera_id/date/limit)
+    GET    /<id>                     detalle con URLs firmadas
+    GET    /<id>/playback-url        paso 1: emite URL firmada
+    GET    /<id>/media?token=        pasos 3-4: sirve MP4 con Range (sin JWT)
+    GET    /<id>/thumbnail?token=    thumbnail JPEG (token o JWT)
+    GET    /timeline                 segmentos de un día para la UI
+    GET    /play/<id>                streaming con Range (JWT) + ?lens=l1|l2
+    GET    /download/<id>            descarga (permiso 'download')
+    DELETE /<id>                     borra archivo + fila (solo admin)
+    GET    /<id>/hls/index.m3u8 · /<id>/hls/<seg>   HLS de VOD (legacy)
+    POST   /manual/start|stop/<cam> · GET /manual/status/<cam>  grabación continua
+
+NOTA DUAL-LENS: `?lens=l1|l2` recorta server-side el lente pedido del vídeo
+    combinado (apilado), lo transcodifica a 720p y lo CACHEA por (id, lens) con
+    escritura atómica (tmp→rename) para no servir archivos a medio escribir.
+================================================================================
 """
 import os
 import logging
@@ -243,6 +294,17 @@ def get_signed_media(recording_id):
         if not file_path or not os.path.exists(file_path) or os.path.getsize(file_path) < 1024:
             return jsonify({"success": False, "error": "Archivo no disponible"}), 404
 
+        # Recorte por lente SERVER-SIDE (dual-lens): `?lens=l1|l2` sirve solo ese
+        # lente recortado del combinado (transcodificado y cacheado). El token
+        # firmado autoriza la grabación completa, así que la variante por lente
+        # queda igualmente autorizada. Es más fiable que recortar en el cliente
+        # (VLC crop / matriz de TextureView fallaban según el reproductor).
+        lens = request.args.get("lens")
+        if lens in ("l1", "l2"):
+            cropped = _lens_cropped_path(file_path, recording_id, lens)
+            if cropped:
+                file_path = cropped
+
         mime_type, _ = mimetypes.guess_type(file_path)
         return _serve_file_with_range(file_path, mime_type or "video/mp4")
     except Exception:
@@ -355,6 +417,27 @@ def get_timeline():
         return jsonify({"success": False, "error": "Error interno del servidor"}), 500
 
 
+# Control de concurrencia del recorte por lente (ffmpeg libx264 pesado):
+#  - Semáforo GLOBAL: como mucho N recortes simultáneos en toda la app (evita
+#    que decenas de ffmpeg de ~500 MB saturen RAM/CPU cuando varios clientes —o
+#    los reintentos de ExoPlayer— piden reproducir a la vez).
+#  - Candado POR (grabación, lente): la MISMA grabación no se recorta dos veces
+#    en paralelo; las peticiones concurrentes esperan y luego usan el caché.
+import threading as _threading
+_LENS_CROP_SEM = _threading.Semaphore(2)
+_LENS_CROP_LOCKS: dict = {}
+_LENS_CROP_LOCKS_GUARD = _threading.Lock()
+
+
+def _lens_crop_lock(key) -> "_threading.Lock":
+    with _LENS_CROP_LOCKS_GUARD:
+        lk = _LENS_CROP_LOCKS.get(key)
+        if lk is None:
+            lk = _threading.Lock()
+            _LENS_CROP_LOCKS[key] = lk
+        return lk
+
+
 def _lens_cropped_path(src_path: str, recording_id: int, lens: str) -> "str | None":
     """
     Devuelve la ruta de un MP4 que contiene SOLO el lente pedido, recortado del
@@ -385,25 +468,89 @@ def _lens_cropped_path(src_path: str, recording_id: int, lens: str) -> "str | No
         pass
     crop = "crop=iw:ih/2:0:ih/2" if lens == "l1" else "crop=iw:ih/2:0:0"
     vf = f"{crop},scale=-2:720"  # recorte + escala a 720p para encode veloz
-    cmd = [
+    # CLAVE: ffmpeg escribe a un TEMPORAL y solo al terminar se renombra (atómico)
+    # al nombre de caché final. Así una petición concurrente (ExoPlayer abre Range
+    # mientras aún se transcodifica) NUNCA ve un archivo a medio escribir → antes
+    # se servía parcial y el vídeo "duraba 3 segundos".
+    tmp = os.path.join(cache_dir, f"rec{recording_id}_{lens}.{os.getpid()}.tmp.mp4")
+    # Comando SOFTWARE (libx264) — fallback universal.
+    cmd_sw = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", src_path,
         "-vf", vf,
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
         "-an", "-movflags", "+faststart",
-        out,
+        tmp,
     ]
+    # Preferir QSV (iGPU): decode hevc_qsv + encode h264_qsv (mismo patrón que
+    # go2rtc). Recortar un continuo de 2 min HEVC con libx264 SOFTWARE tardaba
+    # >180s → timeout (el vídeo "no cargaba" y los ffmpeg se apilaban). Con QSV
+    # son segundos. Si QSV falla (p.ej. la fuente no es HEVC), cae a libx264.
+    cmds = []
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=180)
-        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024:
+        from backend.app.config import settings as _cfg
+        if (getattr(_cfg, "GO2RTC_HWACCEL", "") or "").lower() == "qsv":
+            cmds.append([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-c:v", "hevc_qsv", "-i", src_path,
+                "-vf", vf,
+                "-c:v", "h264_qsv", "-g", "30",
+                "-an", "-movflags", "+faststart",
+                tmp,
+            ])
+    except Exception:
+        pass
+    cmds.append(cmd_sw)
+
+    # Serializar por (grabación, lente) + semáforo global: la MISMA grabación no
+    # se recorta dos veces a la vez, y como mucho 2 recortes ffmpeg simultáneos en
+    # toda la app. Así los reintentos/clientes concurrentes esperan y reusan el
+    # caché en vez de apilar decenas de ffmpeg pesados.
+    lock = _lens_crop_lock((recording_id, lens))
+    try:
+        r = None
+        with _LENS_CROP_SEM, lock:
+            # Re-comprobar el caché dentro del candado: otra petición pudo
+            # terminarlo mientras esperábamos → reusarlo sin lanzar ffmpeg.
+            try:
+                if (os.path.exists(out) and os.path.getsize(out) > 1024
+                        and os.path.getmtime(out) >= os.path.getmtime(src_path)):
+                    return out
+            except OSError:
+                pass
+            # Intentar QSV primero y caer a software si falla.
+            for _c in cmds:
+                try:
+                    r = subprocess.run(_c, capture_output=True, timeout=150)
+                    if (r.returncode == 0 and os.path.exists(tmp)
+                            and os.path.getsize(tmp) > 1024):
+                        break
+                except Exception as _e:
+                    logger.debug(f"[PLAY] recorte intento falló: {_e}")
+                    r = None
+        if (r is not None and r.returncode == 0 and os.path.exists(tmp)
+                and os.path.getsize(tmp) > 1024):
+            try:
+                os.replace(tmp, out)  # atómico: el lector ve 'out' completo o nada
+            except OSError:
+                # Si el rename falla, al menos sirve el temporal completo.
+                _prune_lens_cache(cache_dir, max_files=40)
+                return tmp
             _prune_lens_cache(cache_dir, max_files=40)
             return out
         logger.warning(
-            f"[PLAY] recorte lente {lens} rec={recording_id} falló: "
-            f"{(r.stderr or b'')[:200]!r}"
+            f"[PLAY] recorte lente {lens} rec={recording_id} falló "
+            f"(rc={getattr(r, 'returncode', None)})"
         )
     except Exception as e:
         logger.warning(f"[PLAY] recorte lente {lens} rec={recording_id} error: {e}")
+    finally:
+        # Limpiar el temporal si quedó (fallo/timeout) y no se renombró.
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
     return None
 
 

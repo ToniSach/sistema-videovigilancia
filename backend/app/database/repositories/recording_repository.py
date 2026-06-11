@@ -1,6 +1,30 @@
 """
-Repositorio especializado para operaciones con grabaciones.
-Incluye gestión de almacenamiento y rotación de archivos.
+================================================================================
+MÓDULO: recording_repository — Acceso a datos de grabaciones de video
+================================================================================
+
+PROPÓSITO
+    Repositorio concreto del modelo `Recording`: hereda el CRUD de
+    `BaseRepository[Recording]` y añade consultas por cámara, por rango de fechas,
+    las más antiguas (para rotación) y el tamaño total ocupado.
+
+RESPONSABILIDAD PRINCIPAL
+    Servir el índice en BD de los segmentos grabados para reproducción histórica
+    y para la gestión de cuota/rotación de almacenamiento.
+
+DEPENDENCIAS IMPORTANTES
+    database.models.Recording, base_repository.BaseRepository,
+    connection.db_manager, sqlalchemy.func (suma de tamaños).
+
+COMPONENTES RELACIONADOS (quién lo consume)
+    recording_manager (pipeline #11 Grabación: alta/cierre de segmentos),
+    StorageManager (rotación: get_oldest + get_total_size_bytes), y las rutas de
+    reproducción/timeline (pipeline #14).
+
+PIPELINES
+    #11 Grabación (escritura del índice), #14 Reproducción histórica (lectura),
+    rotación/limpieza de almacenamiento (get_oldest / get_total_size_bytes).
+================================================================================
 """
 import logging
 from datetime import datetime
@@ -14,8 +38,12 @@ logger = logging.getLogger(__name__)
 
 class RecordingRepository(BaseRepository[Recording]):
     """
-    Repositorio para gestión de grabaciones de video.
-    Soporta consultas por fecha y gestión de cuota de almacenamiento.
+    Repositorio del modelo `Recording`.
+
+    ROL
+        CRUD heredado + consultas por cámara/fecha y soporte de rotación
+        (get_oldest, get_total_size_bytes). Lo consumen recording_manager
+        (#11), StorageManager (rotación) y las rutas de reproducción (#14).
     """
     
     def __init__(self) -> None:

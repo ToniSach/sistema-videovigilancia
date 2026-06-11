@@ -1,6 +1,52 @@
 """
-Contenedor de dependencias (Dependency Injection Container).
-Implementa patrón Singleton para gestión centralizada de servicios.
+================================================================================
+MÓDULO: container — Contenedor de Inyección de Dependencias (DI) del backend
+================================================================================
+
+PROPÓSITO
+    Construir UNA sola vez, en el orden correcto, todos los repositorios y
+    servicios de larga vida del sistema y mantenerlos accesibles por nombre.
+    Es el "cableado" central: quien necesita un servicio lo pide al contenedor
+    en vez de instanciarlo (evita duplicar singletons y dependencias cruzadas).
+
+RESPONSABILIDAD PRINCIPAL
+    - Instanciar los repositorios (Camera/Event/Recording) y servicios
+      (Auth, Camera, Event, AI, Recording) con sus dependencias inyectadas.
+    - Resolver el grafo de dependencias en orden: repos → servicios que los
+      usan → servicios que se autosuscriben al EventManager.
+    - Tolerar fallos de subsistemas opcionales: cada bloque de servicio va en su
+      propio try/except (best-effort), salvo el núcleo de repos/AuthService que,
+      si falla, aborta el arranque (RuntimeError).
+
+RESPONSABILIDAD (lo que NO hace)
+    No arranca cámaras ni hilos de fondo (eso lo hace main.py tras pedir el
+    contenedor). Aquí solo se CONSTRUYEN las instancias; algunos servicios, al
+    construirse, se suscriben solos al EventManager (p. ej. EventService).
+
+DEPENDENCIAS
+    database.repositories.* ... CameraRepository / EventRepository /
+                                RecordingRepository (acceso a BD).
+    services.* ................ AuthService, CameraService, EventService,
+                                AIService, RecordingManager.
+    cameras.* ................. CameraManager (singleton), ONVIFDiscovery.
+    (todos los imports son DIFERIDOS dentro de __init__ para evitar ciclos.)
+
+COMPONENTES RELACIONADOS
+    main.create_app() ......... llama a get_container() (paso 7 del pipeline #1).
+    Las rutas de la API ....... obtienen servicios vía get_container().get(...).
+    CameraManager / EventManager / DatabaseManager ... singletons de proceso que
+                                el contenedor enlaza pero no posee.
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    `from backend.app.container import get_container`; get_container() devuelve
+    el singleton (lo crea la primera vez). Encaja con la restricción de PROCESO
+    ÚNICO: una sola instancia con todo el estado vivo en memoria.
+
+PIPELINE(S)
+    Pipeline #1 (Inicio), etapa 7. Indirectamente sostiene casi todos los demás,
+    porque los servicios que construye atienden: Auth (#2), Cámaras/Live (#3),
+    IA (#9), Eventos (#10), Grabación (#11).
+================================================================================
 """
 import logging
 from typing import Any, Optional
@@ -10,20 +56,58 @@ logger = logging.getLogger(__name__)
 
 class DependencyContainer:
     """
-    Contenedor de inyección de dependencias.
-    Mantiene instancias singleton de repositorios y servicios.
+    Contenedor DI: registro central de repositorios y servicios singleton.
+
+    ROL / RESPONSABILIDAD
+        Construir e inyectar el grafo de dependencias del backend y exponerlo
+        por nombre (atributo directo o diccionario `_services`).
+
+    SINGLETON (por qué)
+        Usa __new__ + flag `_initialized` para garantizar UNA sola instancia por
+        proceso. Es imprescindible porque los servicios que crea (CameraManager,
+        AIService, RecordingManager...) mantienen hilos, subprocesos FFmpeg,
+        buffers y pools VIVOS en memoria; dos contenedores = dos copias de ese
+        estado compitiendo por las mismas cámaras/archivos. Encaja con la
+        restricción de PROCESO ÚNICO del sistema.
+
+    QUIÉN LO INSTANCIA / CONSUME
+        Lo crea get_container() (paso 7 del arranque en main.py). Lo consumen las
+        rutas de la API y otros servicios vía get_container().get("nombre").
+
+    DEPENDENCIAS
+        Importa de forma diferida repos y servicios (ver docstring del módulo)
+        para romper ciclos de import.
+
+    PIPELINE
+        #1 (Inicio), etapa 7.
     """
-    
+
     _instance: Optional['DependencyContainer'] = None
     _initialized: bool = False
-    
+
     def __new__(cls) -> 'DependencyContainer':
+        """Devuelve SIEMPRE la misma instancia (singleton de proceso)."""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             logger.debug("Nueva instancia de DependencyContainer creada")
         return cls._instance
-    
+
     def __init__(self):
+        """
+        Construye e inyecta todo el grafo de dependencias (idempotente).
+
+        Inputs: ninguno (toma los singletons/repos por import diferido).
+        Outputs: self con repos y servicios registrados como atributos y en
+            `_services`. El núcleo (repos + AuthService) se construye primero;
+            luego, en bloques try/except independientes, los servicios de cámara,
+            EventService, AIService y RecordingManager (best-effort: un fallo
+            opcional se loguea pero no aborta el resto).
+        Excepciones:
+            RuntimeError — si falla la construcción del núcleo (repos/AuthService):
+            sin eso el sistema no puede operar, así que se propaga al arranque.
+        Llamado por: get_container() (la primera vez). Protegido por
+            `_initialized` para no reconstruir si se vuelve a invocar.
+        """
         if DependencyContainer._initialized:
             return
         
@@ -132,7 +216,15 @@ class DependencyContainer:
             raise RuntimeError(f"Fallo en inicialización de dependencias: {error}") from error
     
     def register(self, name: str, instance: object) -> None:
-        """Registra un servicio adicional en el contenedor."""
+        """
+        Registra un servicio extra en el diccionario `_services` en runtime.
+
+        Inputs: name (str no vacío), instance (objeto no None/falsy).
+        Excepciones: ValueError si el nombre no es string válido o instance es
+            None/falsy.
+        Llamado por: código que añade servicios fuera del cableado fijo de
+            __init__ (extensiones/tests).
+        """
         if not name or not isinstance(name, str):
             raise ValueError("Nombre de servicio debe ser string no vacío")
         
@@ -144,7 +236,15 @@ class DependencyContainer:
     
     def get(self, name: str) -> Any:
         """
-        Obtiene un servicio registrado por su nombre.
+        Resuelve un servicio por nombre.
+
+        Busca primero como atributo directo del contenedor (repos y servicios
+        del núcleo) y luego en el diccionario `_services` (cámara, eventos, IA,
+        grabación y registros dinámicos).
+
+        Inputs: name (str).
+        Outputs: la instancia registrada, o None si no existe.
+        Llamado por: rutas de la API y servicios que necesitan colaboradores.
         """
         # Primero buscar como atributo directo
         if hasattr(self, name):
@@ -154,11 +254,17 @@ class DependencyContainer:
         return self._services.get(name)
     
     def has(self, name: str) -> bool:
-        """Verifica si un servicio está registrado."""
+        """True si `name` está registrado (como atributo o en `_services`)."""
         return hasattr(self, name) or name in self._services
-    
+
     def unregister(self, name: str) -> bool:
-        """Elimina un servicio del contenedor."""
+        """
+        Elimina un servicio dinámico del contenedor.
+
+        Outputs: True si existía en `_services` y se eliminó; False si no estaba.
+        Nota: solo opera sobre servicios registrados en `_services` (los del
+        núcleo cableado en __init__ no se desregistran por diseño).
+        """
         if name in self._services:
             del self._services[name]
             if hasattr(self, name):
@@ -173,7 +279,17 @@ _container_instance: Optional[DependencyContainer] = None
 
 
 def get_container() -> DependencyContainer:
-    """Obtiene la instancia global del contenedor de dependencias."""
+    """
+    Punto de entrada al contenedor DI (paso 7 del pipeline #1).
+
+    Devuelve el singleton global, construyéndolo la primera vez (lo que dispara
+    todo el cableado de repos/servicios). Las siguientes llamadas devuelven la
+    misma instancia ya inicializada.
+
+    Outputs: DependencyContainer (singleton).
+    Llamado por: main.create_app() y cualquier ruta/servicio que necesite
+        resolver dependencias.
+    """
     global _container_instance
     
     if _container_instance is None:

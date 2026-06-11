@@ -1,5 +1,46 @@
 """
-Punto de entrada de la aplicación desktop - FIX Qt6.
+================================================================================
+MÓDULO: desktop_app.main — Punto de entrada del cliente de escritorio (PySide6)
+================================================================================
+
+PROPÓSITO
+    Arrancar la aplicación Qt: crear el QApplication, fijar fuente/estilo/tema
+    global y mostrar la MainWindow. Es el equivalente desktop de backend/main.py,
+    pero del lado del CLIENTE (proceso separado que habla con el backend por
+    REST/JWT y consume el directo por RTSP/go2rtc con VLC).
+
+ARQUITECTURA DEL CLIENTE DESKTOP
+    Proceso PySide6 independiente. Capas:
+      main.py ............ arranque Qt (este archivo)
+      ui/main_window.py .. shell: navegación lateral + stack de vistas + login
+      ui/views/ .......... pantallas (login, dashboard, live, playback, eventos,
+                           gestión de cámaras, usuarios, permisos, ajustes…)
+      ui/components/ ..... widgets reutilizables (rtsp_video VLC, ptz_joystick,
+                           timeline, toast, glass_card, sparkline…)
+      ui/dialogs/ ........ diálogos (onboarding, vinculación QR/Telegram, info)
+      ui/theme.py · icons.py · help_texts.py .. estilo QSS, iconos y textos ayuda
+      services/api_client.py .. CLIENTE HTTP singleton (JWT + refresh + async)
+      services/playback_service.py .. reproducción de grabaciones
+      models/ ............ DTOs locales (User, Camera, Recording) — NO son las
+                           clases SQLAlchemy del backend; espejan los JSON de la API
+      config.py .......... API_BASE_URL, timeouts, constantes del cliente
+
+FLUJO DE DATOS (cómo se comunica con el backend)
+    Vista → api_client.get/post/... (async en QThreadPool) → backend REST
+          ← APIResponse marshalleada al hilo main (Qt.QueuedConnection) → callback
+    Directo en vivo: rtsp_video.py reproduce con VLC el restream RTSP de go2rtc
+    (NO pasa por api_client). Notificaciones push: WebSocket /ws/notifications.
+
+PUNTO DE ENTRADA
+    `python desktop_app/src/main.py` → main() → QApplication → MainWindow.show()
+    → app.exec() (loop de eventos Qt).
+
+DEPENDENCIAS CLAVE
+    PySide6 (Qt6), python-vlc/libVLC (directo), requests (vía api_client).
+    El singleton `api_client` se crea al importar services/api_client.py; su
+    dispatcher Qt se inicializa de forma perezosa para no crear QObjects antes
+    de que exista el QApplication.
+================================================================================
 """
 import sys
 import logging
@@ -31,9 +72,16 @@ def main():
     
     # Crear aplicación
     app = QApplication(sys.argv)
-    app.setApplicationName("NVR VMS")
+    app.setApplicationName("Sistema de videovigilancia")
     app.setOrganizationName("NVRSystems")
     app.setStyle('Fusion')
+
+    # Red de seguridad: que un error imprevisto no cierre la app de golpe.
+    try:
+        from desktop_app.src.ui.error_guard import install_error_guard
+        install_error_guard(app)
+    except Exception:
+        logging.getLogger(__name__).debug("No se pudo instalar error_guard", exc_info=True)
     
     # Cargar fuentes si están disponibles
     font_paths = [

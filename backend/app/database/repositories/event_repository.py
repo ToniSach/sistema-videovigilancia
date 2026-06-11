@@ -1,6 +1,28 @@
 """
-Repositorio especializado para operaciones con eventos de seguridad.
-Soporta consultas por tiempo, cámara y estado de reconocimiento.
+================================================================================
+MÓDULO: event_repository — Acceso a datos de eventos de seguridad
+================================================================================
+
+PROPÓSITO
+    Repositorio concreto del modelo `Event`: hereda el CRUD de
+    `BaseRepository[Event]` y añade consultas por cámara, por tipo, por tiempo y
+    por estado de reconocimiento, más la acción de "reconocer" (acknowledge).
+
+RESPONSABILIDAD PRINCIPAL
+    Resolver listados/timeline de eventos y la marcación de eventos como
+    revisados, devolviendo entidades desvinculadas de la sesión.
+
+DEPENDENCIAS IMPORTANTES
+    database.models.Event, base_repository.BaseRepository, connection.db_manager.
+
+COMPONENTES RELACIONADOS (quién lo consume)
+    EventService (persiste/consulta eventos del pipeline #10), las rutas de
+    eventos del API y la UI (listados, pendientes, timeline).
+
+PIPELINES
+    #10 Eventos (escritura vía create heredado + lectura aquí) y, de forma
+    indirecta, #9 IA (origen de los eventos) y #13 Notificaciones (consumidor).
+================================================================================
 """
 import logging
 from datetime import datetime, timedelta
@@ -14,8 +36,11 @@ logger = logging.getLogger(__name__)
 
 class EventRepository(BaseRepository[Event]):
     """
-    Repositorio para gestión de eventos de videovigilancia.
-    Incluye métodos para alertas y reconocimiento de eventos.
+    Repositorio del modelo `Event`.
+
+    ROL
+        CRUD heredado + consultas por cámara/tipo/tiempo y `acknowledge()`.
+        Lo consume EventService y las rutas de eventos del API (pipeline #10).
     """
     
     def __init__(self) -> None:
@@ -129,15 +154,57 @@ class EventRepository(BaseRepository[Event]):
             self.logger.error(f"Error al obtener eventos recientes: {error}")
             raise
     
+    def get_history_page(self, camera_ids, before=None, limit: int = 50,
+                         hours: int = 168) -> List[Event]:
+        """
+        Página de historial para el móvil con paginación por cursor a NIVEL BD.
+
+        Filtra por cámaras accesibles y created_at < `before` (cursor, datetime),
+        ordenado descendente, LIMIT en la consulta. Así TODOS los eventos de la
+        ventana son alcanzables al hacer scroll — antes el endpoint cacheaba solo
+        los 200 más recientes globales y los antiguos nunca aparecían.
+
+        Args:
+            camera_ids: ids de cámaras accesibles por el usuario.
+            before: datetime tope (exclusivo); None = desde ahora.
+            limit: máximo de resultados de esta página.
+            hours: ventana máxima de historial (default 7 días).
+        """
+        try:
+            from ..connection import db_manager
+            if not camera_ids:
+                return []
+            cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+            with db_manager.get_session() as session:
+                query = session.query(Event).filter(
+                    Event.camera_id.in_(list(camera_ids)),
+                    Event.created_at >= cutoff_time,
+                )
+                if before is not None:
+                    query = query.filter(Event.created_at < before)
+                results = query.order_by(
+                    Event.created_at.desc()
+                ).limit(limit).all()
+                for result in results:
+                    session.expunge(result)
+                return results
+        except Exception as error:
+            self.logger.error(f"Error al obtener página de historial: {error}")
+            raise
+
     def acknowledge(self, event_id: int) -> bool:
         """
-        Marca un evento como reconocido/revisado.
-        
+        Marca un evento como reconocido/revisado (acknowledged=True).
+
+        Modifica el objeto dentro de la sesión; el COMMIT lo hace el context
+        manager al cerrar sin error (no se necesita save explícito).
+
         Args:
             event_id: ID del evento a reconocer
-            
         Returns:
-            True si se actualizó, False si no existía
+            True si se actualizó, False si el evento no existía.
+        Llamado por:
+            La acción de "reconocer alerta" desde el cliente (vía EventService/ruta).
         """
         try:
             from ..connection import db_manager

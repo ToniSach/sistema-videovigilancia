@@ -1,6 +1,54 @@
 """
-Metrics Collector - Sistema de métricas desacoplado.
-Elimina la dependencia circular entre FrameDistributor y API routes.
+================================================================================
+MÓDULO: infrastructure.metrics.collector — Métricas de salud + auto-restart
+================================================================================
+
+PROPÓSITO
+    Recolector central de métricas del NVR/VMS, thread-safe y DESACOPLADO:
+    los PRODUCTORES (workers de cámara, FrameDistributor) reportan frames sin
+    conocer a los CONSUMIDORES (endpoint /health, telemetría, UI). Elimina la
+    dependencia circular que existía entre FrameDistributor y las rutas de la API.
+
+RESPONSABILIDAD PRINCIPAL
+    1. Mantener métricas por cámara (último frame, FPS real, bytes, errores).
+    2. Muestrear métricas globales del sistema (CPU/RAM/disco) en un hilo de fondo.
+    3. Servir el estado de salud agregado a `GET /api/v1/health`.
+    4. Detectar cámaras CONGELADAS (sin frames > umbral) y reiniciarlas
+       automáticamente vía el `stalled monitor` (auto-restart / self-healing).
+
+DEPENDENCIAS
+    psutil ........................ CPU/RAM/disco del proceso y el host.
+    config.settings ............... RECORDINGS_PATH (disco a medir).
+    cameras.camera_manager ........ se le pasa a `check_stalled_cameras` para
+                                    consultar/reiniciar workers (no se importa
+                                    directamente: inversión de control).
+    events.event_manager .......... emite `camera_offline` al reiniciar una cámara.
+
+COMPONENTES RELACIONADOS
+    main.py ....................... lo arranca (paso 11/13): el singleton se
+                                    autoinicia al importarse y main lanza el
+                                    monitor con `start_stalled_monitor()`.
+    telemetry.py .................. consumidor: muestrea estas métricas a disco.
+    infrastructure/metrics/__init__ exporta el singleton.
+
+PUNTO DE ENTRADA
+    `from ...infrastructure.metrics.collector import metrics_collector`
+    (instancia singleton global creada al final del módulo).
+
+PIPELINE(S) + ETAPA
+    - Pipeline #1 (Inicio): el singleton se autoinicia y main arranca el monitor.
+    - Pipeline #3 (Live) / #11 (Grabación): recibe `update_camera_frame()` de los
+      consumidores del FrameDistributor → mide FPS y frescura por cámara.
+    - Pipeline #10 (Eventos): al detectar congelación emite `camera_offline`.
+    - Transversal: alimenta /health y la telemetría (observabilidad).
+
+NOTA DE AUTO-CURACIÓN (defensa en capas contra cámaras colgadas)
+    1ª línea: el watchdog INTERNO de cada worker (WATCHDOG_TIMEOUT=30s).
+    2ª línea: este `stalled monitor` (umbral 25s en main) como red de seguridad.
+    El monitor evita interferir con reconexiones en curso (ver
+    `check_stalled_cameras`): respeta workers reconnecting/starting/error,
+    auto-desactivados y recién arrancados (grace period).
+================================================================================
 """
 import threading
 import time
@@ -15,7 +63,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CameraMetrics:
-    """Métricas individuales por cámara."""
+    """
+    Métricas individuales acumuladas por cámara (estado mutable thread-safe).
+
+    ROL: contenedor de datos vivos de UNA cámara. Lo crea/posee `MetricsCollector`
+    (un dict camera_id → CameraMetrics). `update_frame` se llama desde el hilo
+    consumidor del FrameDistributor por cada frame; la lectura ocurre desde el
+    hilo de /health y desde el stalled monitor. Tiene su propio `_lock` para que
+    la escritura por-frame no bloquee el RLock global del collector.
+
+    FPS REAL: en vez de promediar, cuenta cuántos timestamps caen en la última
+    ventana de 1s (deslizante) → FPS instantáneo robusto a ráfagas/GOP.
+    """
     last_frame_time: float = 0.0
     frame_count: int = 0
     fps: float = 0.0
@@ -41,7 +100,11 @@ class CameraMetrics:
 
 @dataclass
 class SystemMetrics:
-    """Métricas globales del sistema."""
+    """
+    Snapshot de métricas globales del host (no por cámara). Lo rellena el hilo
+    `_update_system_metrics` del collector cada 2s y lo leen /health y telemetría.
+    Cacheado: la lectura nunca bloquea esperando a psutil.
+    """
     cpu_percent: float = 0.0
     memory_percent: float = 0.0
     disk_percent: float = 0.0
@@ -50,8 +113,28 @@ class SystemMetrics:
 
 class MetricsCollector:
     """
-    Singleton de recolección de métricas thread-safe.
-    Desacopla productores (FrameDistributor) de consumidores (API Health).
+    SINGLETON de recolección de métricas thread-safe (clave en main, paso 11/13).
+
+    SINGLETON (patrón `__new__` con doble-check lock): UNA sola instancia por
+    proceso, porque las métricas viven en memoria de proceso (coherente con la
+    restricción de proceso único del backend). Se crea al importar el módulo
+    (`metrics_collector` al final) y se AUTOINICIA: arranca de inmediato el hilo
+    de fondo que muestrea CPU/RAM/disco. El monitor de cámaras congeladas NO
+    arranca solo: lo lanza main vía `start_stalled_monitor()`.
+
+    QUIÉN LO INSTANCIA/CONSUME
+        - Instancia: nadie con `new`; se usa el singleton global `metrics_collector`.
+        - Productores: consumidores del FrameDistributor llaman `update_camera_frame`;
+          CameraManager llama `register_camera` / `unregister_camera`.
+        - Consumidores: `health_check` en main (`get_health_status`), telemetry.py,
+          y el propio stalled monitor.
+
+    DEPENDENCIAS: psutil (sistema), config.settings (ruta de disco), y por
+    inversión de control un `camera_manager` que recibe como parámetro para
+    consultar/reiniciar workers (no lo importa para evitar acoplamiento).
+
+    PIPELINE: transversal de observabilidad + auto-curación de cámaras
+    (Pipelines #1, #3/#11 y #10).
     """
     _instance = None
     _lock = threading.Lock()
@@ -87,9 +170,18 @@ class MetricsCollector:
         
         logger.info("MetricsCollector inicializado")
     
-    def update_camera_frame(self, camera_id: int, timestamp: Optional[float] = None, 
+    def update_camera_frame(self, camera_id: int, timestamp: Optional[float] = None,
                            frame_size: int = 0) -> None:
-        """Registra un nuevo frame recibido de una cámara."""
+        """
+        Propósito: registrar que llegó un frame de una cámara (alimenta FPS real,
+            frescura y bytes). Etapa: Pipeline #3/#11, lado consumidor.
+        Inputs: camera_id; timestamp (default now); frame_size en bytes (opcional).
+        Outputs: None (muta CameraMetrics in-place bajo su propio lock).
+        Excepciones: ninguna esperada.
+        Llamado por: consumidores del FrameDistributor y `_start_ffmpeg_session`
+            del worker legacy; también al reconectar para resetear la frescura.
+        Llama a: CameraMetrics.update_frame.
+        """
         if timestamp is None:
             timestamp = time.time()
             
@@ -99,7 +191,14 @@ class MetricsCollector:
         metrics.update_frame(timestamp, frame_size)
     
     def register_camera(self, camera_id: int) -> None:
-        """Registra una nueva cámara para monitoreo."""
+        """
+        Propósito: dar de alta una cámara en el monitoreo, inicializando
+            `last_frame_time = now` para que el stalled monitor no la dé por
+            congelada antes de que llegue su primer frame. Etapa: Pipeline #1/#3.
+        Inputs: camera_id. Outputs: None. Excepciones: ninguna.
+        Llamado por: CameraManager al arrancar una cámara.
+        Llama a: nada (solo muta el dict bajo el RLock global).
+        """
         with self._lock:
             if camera_id not in self._camera_metrics:
                 # IMPORTANTE: inicializar last_frame_time = ahora.
@@ -112,7 +211,12 @@ class MetricsCollector:
                             f"(last_frame_time inicializado a now)")
     
     def unregister_camera(self, camera_id: int) -> None:
-        """Elimina una cámara del monitoreo."""
+        """
+        Propósito: baja de una cámara del monitoreo (no más alertas/FPS).
+        Inputs: camera_id. Outputs: None. Excepciones: ninguna (no-op si no existe).
+        Llamado por: CameraManager al parar/borrar una cámara, y por
+            `check_stalled_cameras` cuando detecta métricas huérfanas (sin worker).
+        """
         with self._lock:
             if camera_id in self._camera_metrics:
                 del self._camera_metrics[camera_id]
@@ -174,7 +278,17 @@ class MetricsCollector:
             time.sleep(2.0)
     
     def get_health_status(self) -> dict:
-        """Genera el estado de salud completo para la API."""
+        """
+        Propósito: construir el payload de salud agregado del sistema. Etapa:
+            transversal (sirve a `GET /api/v1/health`).
+        Inputs: ninguno (lee estado interno).
+        Outputs: dict {cameras: [{id, status healthy/stalled, last_frame_seconds_ago,
+            fps, total_frames, data_mb}], system: {cpu/mem/disk %, uptime_seconds,
+            last_updated}}. Marca 'stalled' si pasaron >5s desde el último frame.
+        Excepciones: ninguna esperada.
+        Llamado por: el endpoint `health_check` de main.py.
+        Llama a: get_system_metrics.
+        """
         now = time.time()
         cameras = []
         
@@ -209,9 +323,26 @@ class MetricsCollector:
     # ================== NUEVOS MÉTODOS PARA AUTO-RESTART ==================
     def check_stalled_cameras(self, camera_manager, stalled_threshold: int = 30):
         """
-        Verifica cámaras que no han recibido frames por más de `stalled_threshold` segundos.
-        Si se detecta una cámara congelada, intenta reiniciar su worker.
-        Retorna lista de cámaras reiniciadas.
+        Propósito: detectar cámaras CONGELADAS (sin frames > umbral) y reiniciar
+            su worker — núcleo de la auto-curación. Etapa: Pipeline #3/#10 (al
+            reiniciar emite `camera_offline`).
+        Inputs: camera_manager (inversión de control: se le consultan/reinician
+            workers); stalled_threshold en segundos.
+        Outputs: list[int] con los IDs de cámaras efectivamente reiniciadas.
+        Excepciones: capturadas internamente por cámara (un fallo no aborta el barrido).
+
+        GUARDAS que evitan reinicios duplicados o en mal momento (en este orden):
+            - last_frame_time inválido (<1990) → la cámara aún no entregó frames.
+            - cámara auto-desactivada por fallo permanente → NO reanimar (evita el
+              bucle infinito reintentos→reanimación cada 15s).
+            - worker inexistente → desregistra métricas huérfanas y sigue.
+            - worker en reconnecting/starting → ya se está recuperando solo.
+            - worker en error → en plena auto-desactivación; esperar.
+            - worker RUNNING recién arrancado (<30s) → grace period para el 1er
+              keyframe (GOP largo).
+        Llamado por: el hilo `monitor` de `start_stalled_monitor`.
+        Llama a: camera_manager.{is_auto_disabled,get_worker,restart_camera},
+            unregister_camera, event_manager.emit.
         """
         now = time.time()
         restarted = []
@@ -311,7 +442,15 @@ class MetricsCollector:
 
     def start_stalled_monitor(self, camera_manager, interval: int = 15, stalled_threshold: int = 30):
         """
-        Inicia un thread que monitorea cámaras congeladas y las reinicia.
+        Propósito: lanzar el hilo daemon que ejecuta `check_stalled_cameras` en
+            bucle — la 2ª línea de defensa del self-healing. Etapa: Pipeline #1
+            (lo arranca main, paso 13).
+        Inputs: camera_manager; interval (cada cuántos s barre, main usa 10);
+            stalled_threshold (main usa 25s, margen sobre el watchdog interno de 30s).
+        Outputs: None (deja un hilo daemon corriendo mientras `_running`).
+        Excepciones: cada iteración captura errores para no matar el hilo.
+        Llamado por: main.py en el arranque.
+        Llama a: check_stalled_cameras (en loop).
         """
         def monitor():
             while self._running:
@@ -326,7 +465,12 @@ class MetricsCollector:
     # ====================================================================
     
     def shutdown(self):
-        """Detiene el thread de métricas de sistema y el monitor de cámaras congeladas."""
+        """
+        Propósito: apagado ordenado — baja `_running` (lo que detiene tanto el hilo
+            de métricas de sistema como el del stalled monitor) y hace join del de
+            sistema. Etapa: Pipeline #1 (bloque `finally` de main).
+        Inputs/Outputs: ninguno. Excepciones: ninguna. Llamado por: main.py al cerrar.
+        """
         self._running = False
         if self._system_thread.is_alive():
             self._system_thread.join(timeout=2.0)

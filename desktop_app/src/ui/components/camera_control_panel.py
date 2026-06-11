@@ -1,6 +1,53 @@
 # desktop_app/src/ui/components/camera_control_panel.py
 """
-Panel de control para PTZ, LEDs y Audio de cámara.
+================================================================================
+MÓDULO: ui.components.camera_control_panel — Panel de control de cámara
+================================================================================
+
+PROPÓSITO
+    Panel lateral con TODOS los controles de una cámara seleccionada,
+    organizados en pestañas: Movimiento (PTZ + presets), IA/REC (detección +
+    grabación manual) y Audio/Luz (audio bidireccional + LEDs/IR). Cada sub-card
+    encapsula su propio dominio y habla con el backend por REST (api_client).
+
+RESPONSABILIDAD
+    - Componer las sub-cards de control y enrutar la cámara seleccionada a cada
+      una vía set_camera().
+    - Para PTZ, recibir las señales del PTZJoystick y traducirlas en POST REST
+      (este panel es el "pegamento" entre el joystick mudo y el backend).
+    - Cada sub-card gestiona su propio estado/feedback y emite señales (started,
+      activated, listen_changed…) que la vista puede observar.
+
+PIPELINES
+    #8 PTZ (PTZJoystick + presets → /cameras/<id>/ptz/...),
+    IA (/ai/<id>/activate|deactivate|status), grabación manual
+    (/recordings/manual/...), audio (talk/listen server-side + escucha cliente),
+    LEDs (/cameras/<id>/leds/<mode>).
+
+CLASES DE ESTE MÓDULO
+    - LEDControlWidget ......... iluminación/IR (auto/on/off).
+    - AudioControlWidget ....... audio bidireccional: PTT (talk) + escucha;
+                                 emite listen_changed/volume_changed que la vista
+                                 cablea al RtspVideoWidget.
+    - AIControlWidget .......... activar/desactivar YOLOv8 por lente + estado
+                                 global (solo 1 cámara con IA a la vez).
+    - RecordingControlWidget ... grabación continua manual (start/stop/status).
+    - CameraControlPanel ....... contenedor con pestañas que agrupa lo anterior
+                                 + presets PTZ; es la clase pública del módulo.
+
+DEPENDENCIAS
+    PySide6 (QTabWidget, QScrollArea, etc.), api_client (REST + JWT, asíncrono),
+    config (estilos), GlassCard (base visual de las sub-cards), PTZJoystick.
+
+COMPONENTES RELACIONADOS
+    ptz_joystick.py (emite move/stop que aquí se convierten en REST),
+    rtsp_video.py (recibe las señales de escucha/volumen del AudioControlWidget),
+    glass_card.py (base de las sub-cards).
+
+DÓNDE SE USA
+    En la vista de control de cámara / Directo; se muestra al seleccionar una
+    cámara y se oculta con clear().
+================================================================================
 """
 import logging
 from PySide6.QtWidgets import QMessageBox
@@ -22,7 +69,15 @@ logger = logging.getLogger(__name__)
 
 
 class LEDControlWidget(GlassCard):
-    """Control de LEDs/IR."""
+    """Control de iluminación/IR de la cámara (modos auto / on / off).
+
+    Rol: sub-card de la pestaña "Audio/Luz". Llama a
+    POST /cameras/<id>/leds/<mode> al cambiar de modo.
+
+    Quién la instancia/consume: CameraControlPanel (pestaña Audio/Luz).
+    Señales Qt: no emite señales propias.
+    Dependencias: api_client (REST), config, GlassCard (base visual).
+    """
     
     def __init__(self, parent=None):
         super().__init__(parent, border_radius=8)
@@ -50,11 +105,11 @@ class LEDControlWidget(GlassCard):
         self.btn_auto.setChecked(True)
         self.btn_auto.clicked.connect(lambda: self._set_mode("auto"))
         
-        self.btn_on = QPushButton("ON")
+        self.btn_on = QPushButton("Encendido")
         self.btn_on.setCheckable(True)
         self.btn_on.clicked.connect(lambda: self._set_mode("on"))
-        
-        self.btn_off = QPushButton("OFF")
+
+        self.btn_off = QPushButton("Apagado")
         self.btn_off.setCheckable(True)
         self.btn_off.clicked.connect(lambda: self._set_mode("off"))
         
@@ -84,9 +139,18 @@ class LEDControlWidget(GlassCard):
         layout.addWidget(self.lbl_status)
     
     def set_camera(self, camera_id: int):
+        """Fija la cámara objetivo de los comandos LED. Llamado por
+        CameraControlPanel.set_camera()."""
         self.camera_id = camera_id
-    
+
     def _set_mode(self, mode: str):
+        """Cambia el modo de iluminación y lo envía al backend.
+
+        Inputs: mode ('auto' | 'on' | 'off').
+        Outputs: ninguno (actualiza estado visual y hace POST).
+        Llamado por: el clicked de los botones Auto/ON/OFF.
+        Llama a: POST /cameras/<id>/leds/<mode>.
+        """
         # Desmarcar otros botones
         for btn in self.mode_buttons:
             btn.setChecked(False)
@@ -112,7 +176,28 @@ class LEDControlWidget(GlassCard):
 
 
 class AudioControlWidget(GlassCard):
-    """Control de audio bidireccional (talk + listen) con selector de micrófono."""
+    """Control de audio bidireccional (talk + listen) con selector de micrófono.
+
+    Rol: sub-card de la pestaña "Audio/Luz".
+      - Talk (PTT): captura el micrófono del operador y lo manda a la cámara
+        (server-side, /cameras/<id>/audio/talk|stop).
+      - Listen: reproduce el audio de la cámara. Por defecto server-side (ffplay,
+        /cameras/<id>/audio/listen/start|stop) porque el directo de go2rtc se
+        reexpone solo-vídeo; aun así emite listen_changed/volume_changed para que
+        la vista pueda dirigir la escucha al RtspVideoWidget cuando aplique.
+
+    Quién la instancia/consume: CameraControlPanel (pestaña Audio/Luz); la vista
+        conecta listen_changed → RtspVideoWidget.set_audio_enabled y
+        volume_changed → set_volume.
+
+    SEÑALES Qt que EMITE:
+      - talk_started() / talk_ended(): inicio/fin de transmisión PTT.
+      - listen_changed(bool): petición de escuchar/silenciar (consumo cliente).
+      - volume_changed(int): volumen de escucha cliente (0-100).
+    SEÑALES que RECIBE: ninguna.
+
+    Dependencias: api_client (REST), config, GlassCard.
+    """
 
     talk_started = Signal()
     talk_ended = Signal()
@@ -226,6 +311,13 @@ class AudioControlWidget(GlassCard):
         layout.addWidget(self.lbl_status)
 
     def set_camera(self, camera_id: int):
+        """Apunta el panel de audio a una cámara y refresca micrófonos.
+
+        Inputs: camera_id. Outputs: ninguno.
+        Efectos: apaga la escucha (silencio) para no soltar audio de golpe y
+            recarga la lista de micrófonos (asíncrono).
+        Llamado por: CameraControlPanel.set_camera().
+        """
         self.camera_id = camera_id
         # Al cambiar de cámara, dejar la escucha en OFF (silencio) para no
         # reproducir audio de golpe de la nueva cámara.
@@ -249,6 +341,12 @@ class AudioControlWidget(GlassCard):
         api_client.get("cameras/audio/devices", on_response)
     
     def _start_talk(self):
+        """Inicia la transmisión PTT (micrófono del operador → cámara).
+
+        Outputs: ninguno. Señales: talk_started() si el backend acepta.
+        Llamado por: pressed del botón "MANTENER PRESIONADO PARA HABLAR".
+        Llama a: POST /cameras/<id>/audio/talk (incluye mic_device si no es default).
+        """
         if not self.camera_id or self._talking:
             return
 
@@ -274,6 +372,12 @@ class AudioControlWidget(GlassCard):
         api_client.post(f"cameras/{self.camera_id}/audio/talk", on_response, data=body)
 
     def _stop_talk(self):
+        """Detiene la transmisión PTT.
+
+        Outputs: ninguno. Señales: talk_ended().
+        Llamado por: released del botón PTT.
+        Llama a: POST /cameras/<id>/audio/stop.
+        """
         if not self._talking:
             return
 
@@ -337,11 +441,21 @@ class AudioControlWidget(GlassCard):
 
 class AIControlWidget(GlassCard):
     """
-    Control de IA (YOLOv8) por cámara y por lente.
+    Control de IA (YOLOv8) por cámara y por lente (main, o l1/l2 si dual-lens).
+
+    Rol: sub-card de la pestaña "IA/REC". Activa/desactiva la detección y
+    refleja el estado, incluyendo el aviso de que SOLO UNA cámara puede tener IA
+    a la vez (si está en otra, activarla aquí la moverá).
+
     Llama a los endpoints REST:
         POST /api/v1/ai/<id>/activate    body: {lens, mode}
         POST /api/v1/ai/<id>/deactivate  body: {lens}
         GET  /api/v1/ai/<id>             → estado por lente
+        GET  /api/v1/ai/status           → cámaras con IA activa (aviso global)
+
+    Quién la instancia/consume: CameraControlPanel (pestaña IA/REC).
+    SEÑALES Qt que EMITE: activated() / deactivated() al cambiar el estado.
+    Dependencias: api_client (REST), config, GlassCard.
     """
 
     activated = Signal()
@@ -439,6 +553,12 @@ class AIControlWidget(GlassCard):
         """
 
     def set_camera(self, camera_id: int, is_dual_lens: bool = False):
+        """Apunta el control de IA a una cámara y rellena el selector de lente.
+
+        Inputs: camera_id; is_dual_lens (True → lentes l1/l2; False → 'main').
+        Outputs: ninguno. Llamado por: CameraControlPanel.set_camera().
+        Llama a: _refresh_status (consulta estado por lente y aviso global).
+        """
         self.camera_id = camera_id
         self._is_dual_lens = is_dual_lens
         self.cmb_lens.clear()
@@ -449,6 +569,12 @@ class AIControlWidget(GlassCard):
         self._refresh_status()
 
     def _activate(self):
+        """Activa la detección YOLOv8 en la lente y modo seleccionados.
+
+        Outputs: ninguno. Señales: activated() si el backend acepta.
+        Llamado por: clicked de "▶ Activar IA".
+        Llama a: POST /ai/<id>/activate {lens, mode}.
+        """
         if not self.camera_id:
             return
         lens = self.cmb_lens.currentText()
@@ -474,6 +600,12 @@ class AIControlWidget(GlassCard):
         )
 
     def _deactivate(self):
+        """Desactiva la detección en la lente seleccionada.
+
+        Outputs: ninguno. Señales: deactivated() si el backend acepta.
+        Llamado por: clicked de "Desactivar".
+        Llama a: POST /ai/<id>/deactivate {lens}.
+        """
         if not self.camera_id:
             return
         lens = self.cmb_lens.currentText()
@@ -544,11 +676,19 @@ class AIControlWidget(GlassCard):
 
 class RecordingControlWidget(GlassCard):
     """
-    Control de grabación continua manual.
+    Control de grabación continua MANUAL (independiente de la programada/evento).
+
+    Rol: sub-card de la pestaña "IA/REC". Inicia/detiene una grabación continua
+    a demanda y refleja el estado actual.
+
     Llama a los endpoints REST:
         POST /api/v1/recordings/manual/start/<id>
         POST /api/v1/recordings/manual/stop/<id>
         GET  /api/v1/recordings/manual/status/<id>
+
+    Quién la instancia/consume: CameraControlPanel (pestaña IA/REC).
+    SEÑALES Qt que EMITE: started() / stopped() al cambiar el estado.
+    Dependencias: api_client (REST), config, GlassCard.
     """
 
     started = Signal()
@@ -600,10 +740,18 @@ class RecordingControlWidget(GlassCard):
         layout.addWidget(self.lbl_status)
 
     def set_camera(self, camera_id: int):
+        """Apunta el control a una cámara y consulta si ya está grabando.
+        Llamado por: CameraControlPanel.set_camera()."""
         self.camera_id = camera_id
         self._refresh_status()
 
     def _start(self):
+        """Inicia la grabación continua manual.
+
+        Outputs: ninguno. Señales: started() si el backend acepta.
+        Llamado por: clicked de "Iniciar". Llama a:
+        POST /recordings/manual/start/<id>.
+        """
         if not self.camera_id:
             return
 
@@ -622,6 +770,12 @@ class RecordingControlWidget(GlassCard):
         api_client.post(f"recordings/manual/start/{self.camera_id}", on_response)
 
     def _stop(self):
+        """Detiene la grabación continua manual.
+
+        Outputs: ninguno. Señales: stopped().
+        Llamado por: clicked de "Detener". Llama a:
+        POST /recordings/manual/stop/<id>.
+        """
         if not self.camera_id:
             return
 
@@ -655,7 +809,23 @@ class RecordingControlWidget(GlassCard):
 
 
 class CameraControlPanel(QWidget):
-    """Panel completo de control para cámara seleccionada."""
+    """Panel completo de control para la cámara seleccionada (clase pública).
+
+    Rol: contenedor con pestañas (Movimiento / IA-REC / Audio-Luz) que agrupa
+    las sub-cards de este módulo + los presets PTZ. Es el "pegamento" entre el
+    PTZJoystick (mudo) y las llamadas REST de PTZ.
+
+    Quién la instancia/consume: la vista de control de cámara / Directo; le pasa
+        la cámara con set_camera(camera_id, camera_data) y la oculta con clear().
+
+    SEÑALES Qt: no emite señales propias; reexpone las sub-cards (ai_widget,
+        rec_widget, audio_widget…) para que la vista observe SUS señales.
+        RECIBE las señales move/stop del PTZJoystick interno y las convierte en
+        POST /cameras/<id>/ptz/...
+
+    Dependencias: PTZJoystick, las sub-cards (LED/Audio/AI/Recording), api_client,
+        GlassCard, config.
+    """
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -885,9 +1055,17 @@ class CameraControlPanel(QWidget):
         self.hide()
     
     def _on_ptz_move(self, direction: str, speed: float):
+        """Traduce la señal move del joystick en un comando PTZ al backend.
+
+        Inputs: direction (clave de dirección/zoom), speed (ignorada aquí; el
+            backend usa su propia velocidad por defecto).
+        Señales: slot conectado a PTZJoystick.move.
+        Llamado por: el PTZJoystick interno al presionar un botón.
+        Llama a: POST /cameras/<id>/ptz/<direction>.
+        """
         if not self.current_camera_id:
             return
-        
+
         def on_response(response):
             if not response.success:
                 logger.warning(f"Error PTZ: {response.error}")
@@ -895,12 +1073,17 @@ class CameraControlPanel(QWidget):
         api_client.post(f"cameras/{self.current_camera_id}/ptz/{direction}", on_response)
     
     def _on_ptz_stop(self):
+        """Traduce la señal stop del joystick en POST /cameras/<id>/ptz/stop.
+
+        Señales: slot conectado a PTZJoystick.stop.
+        Llamado por: el PTZJoystick interno al soltar un botón.
+        """
         if not self.current_camera_id:
             return
-        
+
         def on_response(response):
             pass
-        
+
         api_client.post(f"cameras/{self.current_camera_id}/ptz/stop", on_response)
     
     def _load_presets(self):

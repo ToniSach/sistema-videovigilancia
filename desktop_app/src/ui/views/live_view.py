@@ -1,13 +1,74 @@
 """
-Vista de cámaras en vivo con paginación tipo NVR comercial.
+================================================================================
+MÓDULO: ui.views.live_view — Rejilla de directo en vivo (CRÍTICO · Pipeline #3)
+================================================================================
 
-Diseño:
-  - Layout selector 1×1 / 2×2 / 3×3 (slots_per_page = cols²).
-  - Paginación ◀ Pág X/Y ▶ navega entre grupos de slots.
-  - Cache persistente de widgets: cambiar de página NO destruye streams,
-    sólo hide/show. Volver a una página atrás es instantáneo.
-  - Atajos: PageUp / PageDown / Ctrl+← / Ctrl+→.
-  - Dual-lens: cada cámara dual cuenta como 2 slots (L1, L2).
+PROPÓSITO
+    Pantalla de monitoreo en vivo tipo NVR comercial: una rejilla paginada de
+    cámaras donde cada celda reproduce el directo de baja latencia. Es la pieza
+    más sensible de rendimiento del cliente: gestiona N reproductores VLC vivos
+    a la vez sin congelar la UI ni fugar memoria de GPU.
+
+    Diseño de la rejilla:
+      - Selector de layout 1×1 / 2×2 / 3×3 (slots por página = columnas²).
+      - Paginación ◀ Pág X/Y ▶ entre grupos de slots; atajos PageUp/PageDown y
+        Ctrl+←/→.
+      - "Modo TV": rota automáticamente entre páginas cada 10s (vigilancia
+        desatendida).
+      - Doble clic = maximizar una cámara a todo el grid (y restaurar).
+      - Dual-lens: cada cámara dual ocupa 2 slots independientes (L1, L2).
+
+ARQUITECTURA DEL DIRECTO (cómo se pinta el vídeo)
+    El directo NO pasa por api_client. Cada `CameraWidget` reproduce con VLC
+    (libVLC) el restream RTSP que publica go2rtc en el backend; VLC pinta
+    directamente sobre el HWND/xwindow nativo del QLabel de vídeo. go2rtc abre
+    UNA sola conexión a la cámara y la multiplexa, así que tener el mismo stream
+    en varias páginas/vistas no penaliza a la cámara.
+
+    Latencia mínima (no VOD): VLC se arranca con --network-caching=150,
+    --rtsp-tcp y --drop-late-frames (resync por descarte → la latencia queda
+    ACOTADA; desactivar el resync con --clock-jitter=0 hacía CRECER el retardo
+    sin parar). El cuello de botella real suele ser el GOP de la cámara.
+
+    Cambio de calidad sin pantalla negra: `set_live_url` carga la nueva calidad
+    en un reproductor + superficie SECUNDARIOS por detrás y hace el relevo solo
+    cuando la nueva entrega su primer frame (con watchdog de 12s para descartarla
+    si nunca llega).
+
+CACHE Y CICLO DE VIDA (clave para no fugar VRAM)
+    Los widgets viven en `_widget_cache` indexados por (camera_id, stream_type);
+    cambiar de página/layout solo hace hide/show, no destruye streams (volver
+    atrás es instantáneo). Solo se destruyen al cargar una lista totalmente
+    distinta (`set_cameras`) o al hacer logout (`_destroy_all_widgets`, invocado
+    por MainWindow._logout). `release_resources` para VLC y libera el QPixmap
+    ANTES de deleteLater para que VLC no pinte sobre una ventana liberada.
+
+DEPENDENCIAS
+    - services/playback_service.VLCPlayer : reproductor libVLC (import diferido).
+    - services/api_client.py : NO para el vídeo; solo para badges de estado:
+        * GET /cameras/ (cada 15s) → indicador ●REC de las cámaras que graban.
+    - models/camera.Camera , ui/icons.icon , ui/components/toast (snapshot),
+      ui/dialogs/info_dialog + ui/help_texts (ayuda contextual).
+
+COMPONENTES RELACIONADOS
+    `CameraWidget` (definido aquí) es la celda de la rejilla. La vista de control
+    individual (camera_control_view) y el preview de gestión usan el componente
+    RtspVideoWidget en su lugar; aquí se usa VLC directo por densidad/rendimiento.
+
+PUNTO DE ENTRADA
+    La instancia MainWindow._create_main_view (índice VIEW_LIVE=0). MainWindow
+    le pasa cámaras + token con `set_cameras`, la reinicia con `restart_streams`
+    al entrar a la vista, y llama a `_destroy_all_widgets` en el logout.
+
+SEÑALES emitidas hacia MainWindow:
+    - ptz_requested(Camera)        → abrir control PTZ de esa cámara.
+    - camera_config_requested(int) → abrir la vista de control de la cámara.
+    - camera_selected(Camera)      → selección simple (informativa).
+
+PIPELINE(S)
+    #3 Live (reproducción del restream go2rtc con VLC, sin tocar el backend de
+    captura/IA).
+================================================================================
 """
 import logging
 import math
@@ -35,8 +96,31 @@ SlotTuple = Tuple[int, str, str, Camera]
 
 class CameraWidget(QFrame):
     """
-    Widget individual de cámara o lente (para dual-lens).
-    Identifica el frame que le toca por (camera_id, stream_type).
+    Celda de la rejilla: una cámara (o una lente de una cámara dual-lens).
+
+    RESPONSABILIDAD / ROL
+        Encapsula un reproductor VLC que muestra el restream go2rtc de su
+        (camera_id, stream_type), más la barra inferior (nombre, reloj, ●REC,
+        estado, snapshot, ⚙). Se identifica por la pareja (camera_id,
+        stream_type) — "main" | "l1" | "l2".
+
+    QUIÉN LA INSTANCIA
+        LiveView._load_page, una por slot visible; quedan cacheadas en
+        LiveView._widget_cache.
+
+    SEÑALES QT (las conecta LiveView)
+        - clicked(int) / double_clicked(int): selección / maximizar.
+        - ptz_requested(int): menú contextual → PTZ.
+        - snapshot_requested(int): captura del fotograma actual.
+        - config_requested(int): botón ⚙ → vista de control.
+
+    DETALLES DE RENDIMIENTO
+        - `start_live` arranca VLC una sola vez (idempotente).
+        - `set_live_url` cambia de calidad SIN corte (reproductor de relevo).
+        - El reloj se pausa en `hideEvent` (no malgastar ticks en widgets
+          ocultos del cache de páginas).
+        - `release_resources`/`stop_video` desligan el HWND antes de destruir
+          para evitar crashes nativos de VLC y fugas de QPixmap en GPU.
     """
 
     clicked = Signal(int)
@@ -63,6 +147,12 @@ class CameraWidget(QFrame):
         self._pending_player = None
         self._pending_surface = None
         self._pending_watchdog = None
+        # Watchdog de "primer frame": si VLC no recibe vídeo (transcoder go2rtc
+        # frío/saturado), reintenta sin congelar la UI hasta que llegue imagen.
+        self._got_frame = False
+        self._live_gen = 0
+        self._live_retries = 0
+        self._live_max_retries = 6
 
         self.setMinimumSize(280, 200)
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
@@ -211,11 +301,18 @@ class CameraWidget(QFrame):
             self._vlc.error.connect(
                 lambda m: logger.error(f"VLC live cam {self.camera_id}: {m}")
             )
+            try:
+                self._vlc.first_frame.connect(self._on_live_frame)
+            except Exception:
+                pass
             self._vlc.play_url(self.stream_url)
             # Rellenar el panel completo (sin barras negras). Se aplica tras un
             # instante (cuando el vídeo ya tiene tamaño) y en cada resize.
             QTimer.singleShot(300, self._apply_fill)
             self.lbl_status.setStyleSheet("color: #22c55e;")
+            # Armar el watchdog de primer frame (reintenta si el transcoder de
+            # go2rtc tarda en entregar; cancela en cuanto llega imagen).
+            self._arm_live_watchdog()
         except RuntimeError:
             # QLabel/objeto C++ borrado a mitad → abortar silenciosamente.
             return
@@ -225,6 +322,55 @@ class CameraWidget(QFrame):
                 self.lbl_video.setText("Error RTSP")
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # Watchdog de primer frame (reintento sin congelar la UI)
+    # ------------------------------------------------------------------
+    def _on_live_frame(self):
+        """Llega el primer frame → el directo va; cancelar reintentos."""
+        self._got_frame = True
+
+    def _arm_live_watchdog(self, reset: bool = True):
+        """Programa una comprobación del directo. Con reset=True (arranque nuevo)
+        reinicia contador y bandera de primer frame."""
+        if reset:
+            self._got_frame = False
+            self._live_retries = 0
+            self._live_gen += 1
+        gen = self._live_gen
+        # Primer chequeo GENEROSO: un transcoder dual-lens de go2rtc puede tardar
+        # varios segundos en entregar el primer frame en frío.
+        QTimer.singleShot(9000, lambda: self._check_live_stream(gen))
+
+    def _check_live_stream(self, gen: int):
+        """Si tras el intervalo no llegó imagen, reintenta la reproducción en
+        hilo de fondo (stop+play NO bloquea la UI)."""
+        if gen != self._live_gen:
+            return  # superado por otro arranque (cambio de calidad/página)
+        if self._got_frame or self._vlc is None or not self.stream_url:
+            return
+        if not self.isVisible():
+            return  # oculto en cache de páginas → no insistir
+        if self._live_retries >= self._live_max_retries:
+            try:
+                import shiboken6
+                if shiboken6.isValid(self.lbl_video):
+                    self.lbl_video.setText("Sin señal de vídeo")
+            except Exception:
+                pass
+            return
+        self._live_retries += 1
+        logger.info(
+            f"Live cam {self.camera_id} ({self.stream_type}): sin primer frame, "
+            f"reintentando ({self._live_retries}/{self._live_max_retries})"
+        )
+        try:
+            # Reconecta al MISMO path de go2rtc (su transcoder sigue caliente);
+            # en hilo de fondo para no bloquear la UI con el stop() de libVLC.
+            self._vlc.play_url_async(self.stream_url)
+        except Exception as e:
+            logger.debug(f"_check_live_stream retry cam {self.camera_id}: {e}")
+        QTimer.singleShot(7000, lambda: self._check_live_stream(gen))
 
     def _apply_fill(self):
         """
@@ -414,15 +560,16 @@ class CameraWidget(QFrame):
             self._cleanup_pending()
         except Exception:
             pass
+        # Cancelar cualquier reintento de watchdog pendiente.
+        self._live_gen += 1
+        self._got_frame = False
         try:
             if self._vlc is None:
                 return
             import os as _os
             p = self._vlc.player
-            try:
-                p.stop()
-            except Exception:
-                pass
+            # Desligar la ventana PRIMERO (operación rápida) para que el stop()
+            # en segundo plano no pinte sobre un HWND ya liberado.
             try:
                 if _os.name == "nt":
                     p.set_hwnd(0)
@@ -430,6 +577,20 @@ class CameraWidget(QFrame):
                     p.set_xwindow(0)
             except Exception:
                 pass
+            # player.stop() es BLOQUEANTE en libVLC 3 (espera a que el decoder
+            # RTSP/TCP termine, puede tardar segundos). Llamarlo en el hilo de UI
+            # era la CAUSA de los congelamientos al cerrar/cambiar de vista o al
+            # cerrar sesión con varias cámaras. Lo hacemos en un hilo de fondo.
+            import threading as _th
+
+            def _stop_async(pl):
+                try:
+                    pl.stop()
+                except Exception:
+                    pass
+
+            _th.Thread(target=_stop_async, args=(p,),
+                       name="VLCLiveStop", daemon=True).start()
         except Exception:
             pass
 
@@ -495,7 +656,43 @@ class CameraWidget(QFrame):
 
 
 class LiveView(QWidget):
-    """Vista principal de cámaras en vivo con paginación."""
+    """
+    Vista de directo en vivo: rejilla paginada de CameraWidget.
+
+    RESPONSABILIDAD / ROL
+        Orquestar el conjunto de celdas: expandir cámaras (dual-lens → 2 slots),
+        paginarlas según el layout 1×1/2×2/3×3, mantener el cache de widgets
+        vivo entre páginas, refrescar estado/grabación y gestionar la limpieza
+        de recursos. Núcleo de rendimiento del cliente (Pipeline #3).
+
+    QUIÉN LA INSTANCIA
+        MainWindow._create_main_view (índice VIEW_LIVE=0).
+
+    SEÑALES QT
+        EMITE (las escucha MainWindow):
+          - camera_selected(Camera): selección simple (informativa).
+          - ptz_requested(Camera): abrir control PTZ.
+          - camera_config_requested(int): abrir la vista de control de la cámara.
+        No escucha señales externas; recibe órdenes por métodos públicos
+        (`set_cameras`, `restart_streams`, `_destroy_all_widgets`).
+
+    ESTADO CLAVE
+        - `_widget_cache`: {(camera_id, stream_type): CameraWidget} — todos los
+          widgets vivos (no solo los visibles).
+        - `cameras`: subconjunto actualmente colocado en el grid.
+        - `_all_slots`: lista expandida de slots (con dual-lens desdoblado).
+        - `_grid_cols` / `_current_page`: layout y página activa.
+
+    TIMERS
+        - `_status_timer` (5s): marca en ámbar las celdas cuyo VLC dejó de
+          reproducir (RTSP caído).
+        - `_rec_timer` (15s): consulta GET /cameras/ para el badge ●REC.
+        - `_tv_timer` (10s): rotación automática del "Modo TV".
+
+    DEPENDENCIAS
+        CameraWidget (celdas + VLC/go2rtc), api_client (solo badges ●REC),
+        toast/info_dialog (UI auxiliar).
+    """
 
     camera_selected = Signal(Camera)
     ptz_requested = Signal(Camera)
@@ -686,13 +883,14 @@ class LiveView(QWidget):
     # API pública
     # ------------------------------------------------------------------
     def set_cameras(self, cameras: List[Camera], api_token: str):
-        """
-        Configura cámaras a mostrar.
+        """Define el conjunto de cámaras a mostrar y repuebla la página actual.
 
-        Si la lista es la misma que ya teníamos (mismos IDs), reutiliza
-        el cache; sólo reasigna a la página actual. Si la lista cambió,
-        destruye widgets de cámaras que ya no existen y crea los nuevos.
-        """
+        Propósito: expandir cámaras (dual-lens → slots L1/L2), descartar del
+        cache los widgets de cámaras que ya no existen (con release_resources) y
+        recolocar la página actual. Reutiliza el cache para las que siguen.
+        Inputs: `cameras` (DTOs Camera) y `api_token` (token de stream go2rtc).
+        Llamado por: MainWindow._load_cameras y `restart_streams`. Llama a:
+        `_load_page`."""
         self._camera_list = cameras
         self._current_api_token = api_token
 
@@ -724,7 +922,13 @@ class LiveView(QWidget):
         self._load_page(self._current_page)
 
     def restart_streams(self, api_token: str):
-        """Reinicia los streams con un nuevo token (cambio de sesión)."""
+        """Reinicia TODOS los streams con un token fresco (al entrar a la vista).
+
+        Propósito: destruir el cache completo y recrearlo (diferido 500ms) con
+        el token nuevo de go2rtc, para que las URLs lleven credenciales válidas
+        tras un cambio de sesión. Inputs: `api_token`. Llamado por:
+        MainWindow._switch_view cuando se navega a VIEW_LIVE. Llama a:
+        `_destroy_all_widgets` y, tras el timer, `set_cameras`."""
         logger.debug("Reiniciando streams de video con token nuevo...")
 
         if self._restart_timer:
@@ -811,9 +1015,13 @@ class LiveView(QWidget):
                 widget.config_requested.connect(self._on_config_request)
                 self._widget_cache[key] = widget
 
-                # Arranque escalonado del directo (go2rtc + VLC). El escalonado
-                # evita que N conexiones RTSP golpeen las cámaras a la vez.
-                QTimer.singleShot(i * 200, widget.start_live)
+                # Arranque escalonado del directo (go2rtc + VLC). En dual-lens
+                # cada lente/calidad es un TRANSCODE H264 propio en go2rtc; si los
+                # 4 arrancan a la vez saturan el encoder (qsv/CPU) y varios se
+                # quedan en "Conectando…". Espaciar ~1s deja que cada transcoder
+                # caliente antes del siguiente (la watchdog de cada tile reintenta
+                # si aun así no llega frame).
+                QTimer.singleShot(i * 1000, widget.start_live)
             else:
                 # Reutilizado del cache: actualizar label por si cambió el name
                 widget.lbl_name.setText(label)
@@ -1020,7 +1228,12 @@ class LiveView(QWidget):
                 widget.set_online_pending()
 
     def _refresh_recording_badges(self):
-        """Consulta qué cámaras están grabando para mostrar el ●REC."""
+        """Actualiza el indicador ●REC de cada celda según quién está grabando.
+
+        Propósito: pintar el badge rojo solo en las cámaras con grabación activa.
+        Async (callback en hilo UI). Llamado por: `_rec_timer` (15s) y
+        `showEvent`. Llama a: GET /cameras/ (lee `worker_status.recording` o
+        `is_recording`)."""
         if not self.cameras:
             return
         # Import diferido (mismo patrón que `config` en este archivo): api_client

@@ -1,0 +1,156 @@
+classDiagram
+  class AudioController {
+    is_active() bool
+    is_listening() bool
+    is_supported() bool
+    is_talk_supported() bool
+    start_listen(rtsp_url: str) bool
+    start_talk(mic_device: Optional[str]) bool
+    stop_listen() bool
+    stop_talk() bool
+  }
+  class AudioManager {
+    drop(camera_id: int) None
+    get(camera: Camera) AudioController
+    stop_all() None
+  }
+  class CameraManager {
+    clear_auto_disabled(camera_id: int) None
+    get_all_status() dict
+    get_buffer(camera_id, stream_id: str)
+    get_camera_by_id(camera_id: int) Camera | None
+    get_distributor(camera_id, stream_id: str)
+    get_dual_lens_ids(parent_id: int) list
+    get_worker(camera_id: int)
+    is_auto_disabled(camera_id: int) bool
+    restart_camera(camera_id: int) bool
+    start_all_active() None
+    start_camera(camera: Camera) bool
+    start_dual_lens_camera(parent_camera: Camera) bool
+    stop_all() None
+    stop_camera(camera_id: int) bool
+  }
+  class Capabilities {
+    device_xaddr : str
+    has_audio : bool
+    has_imaging : bool
+    has_media : bool
+    has_ptz : bool
+    imaging_xaddr : str
+    media_xaddr : str
+    ptz_xaddr : str
+  }
+  class DeviceInformation {
+    firmware_version : str
+    hardware_id : str
+    manufacturer : str
+    model : str
+    serial_number : str
+  }
+  class LEDController {
+    is_supported() bool
+    set_auto() bool
+    set_ir_cut_filter(mode: str) bool
+    set_white_light(on: bool) bool
+    turn_off() bool
+    turn_on() bool
+  }
+  class LEDManager {
+    drop(camera_id: int) None
+    get(camera: Camera) LEDController
+  }
+  class ONVIFDiscovery {
+    discover(timeout: int, subnet_scan: bool) List[Dict]
+    probe_single_ip(ip: str, username: str, password: str) Optional[Dict]
+  }
+  class ONVIFError {
+    fault_code : Optional[str]
+    fault_reason : Optional[str]
+    http_status : Optional[int]
+    kind : str
+    message : str
+    raw_response : Optional[str]
+  }
+  class ONVIFProfile {
+    encoding : str
+    fps : int
+    height : int
+    name : str
+    quality : int
+    token : str
+    width : int
+  }
+  class ONVIFSoapClient {
+    ip : str
+    password
+    port : int
+    timeout : int
+    username
+    get_capabilities() tuple[Optional[Capabilities], Optional[ONVIFError]]
+    get_device_information() tuple[Optional[DeviceInformation], Optional[ONVIFError], str]
+    get_profiles() tuple[list[Profile], Optional[ONVIFError]]
+    get_stream_uri(profile_token: str) tuple[str, Optional[ONVIFError]]
+    probe() ProbeResult
+  }
+  class PTZController {
+    go_to_preset
+    get_presets() list[dict]
+    get_status() Optional[dict]
+    goto_preset(preset_token: str, speed: float) bool
+    is_supported() bool
+    move(direction: str, speed: float) bool
+    remove_preset(preset_token: str) bool
+    set_preset(name: str) Optional[str]
+    stop() bool
+  }
+  class PTZManager {
+    drop(camera_id: int) None
+    get(camera: Camera) PTZController
+  }
+  class ProbeResult {
+    auth_method : str
+    auth_ok : bool
+    capabilities : Optional[Capabilities]
+    device_info : Optional[DeviceInformation]
+    endpoint_path : str
+    errors : list[ONVIFError]
+    ip : str
+    log_lines : list[str]
+    onvif_ok : bool
+    port : int
+    profiles : list[Profile]
+    reachable : bool
+    stream_uri : str
+    short_summary() str
+  }
+  class Profile {
+    encoding : str
+    fps : int
+    has_audio : bool
+    has_ptz : bool
+    height : int
+    name : str
+    token : str
+    width : int
+  }
+  class RobustONVIFClient {
+    ip : str
+    port : int
+    pwd : str
+    user : str
+    connect() bool
+    get_device_info() Tuple[str, str]
+    get_profiles() List[ONVIFProfile]
+    get_stream_url(profile_token: str) Optional[str]
+    has_audio() bool
+    has_ptz() bool
+    select_optimal_profile(profiles: List[ONVIFProfile]) Optional[ONVIFProfile]
+    test_profile(profile: ONVIFProfile) bool
+  }
+  class _Go2RtcCameraHandle {
+    camera_id : int
+    name : str
+    get_status() dict
+    set_permanent_failure_callback(cb)* None
+    stop()* None
+  }

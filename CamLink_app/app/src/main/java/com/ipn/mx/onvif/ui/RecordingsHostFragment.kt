@@ -1,3 +1,37 @@
+/*
+ * ============================================================================
+ * MÓDULO: RecordingsHostFragment — Contenedor de grabaciones por cámara/día
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Pantalla principal de "Grabaciones" (pestaña de la barra inferior, destino
+ *   `timelineFragment`). Permite elegir cámara + fecha y muestra los segmentos
+ *   del día en dos pestañas ("Por lente" = continuas, "Eventos" = clips). Tocar
+ *   un segmento abre PlaybackFragment para reproducir EN CADENA desde el elegido.
+ *
+ * RESPONSABILIDAD
+ *   - Cargar cámaras (GET /cameras) y grabaciones del día (GET /recordings).
+ *   - Cachear las grabaciones del día y filtrarlas por pestaña sin re-pedir.
+ *   - Mostrar el selector de lente L1/L2 en cámaras dual y propagar el lente
+ *     elegido al reproductor.
+ *   - Mapear cada grabación a un TimelineSegment para el TimelineAdapter.
+ *
+ * DEPENDENCIAS
+ *   - RetrofitClient + ApiService (getCameras, getRecordings).
+ *   - TimelineAdapter (filas de segmentos) y PlaybackFragment (reproducción).
+ *   - BaseMenuFragment (menú de la toolbar).
+ *
+ * COMPONENTES RELACIONADOS
+ *   - TimelineFragment / RecordingsFragment: vistas hermanas de grabaciones.
+ *   - PlaybackFragment: destino al tocar un segmento (con cameraId/date/mode).
+ *
+ * PUNTO DE ENTRADA
+ *   Destino de Navigation de la pestaña "Grabaciones".
+ *
+ * PIPELINE(S)
+ *   #14 Reproducción histórica — etapa de listado/selección por día.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.app.DatePickerDialog
@@ -37,6 +71,15 @@ import java.util.Locale
  * tipo de la pestaña) para reproducir EN CADENA tipo timeline desde la elegida.
  *
  * Es la pestaña "Grabaciones" de la barra inferior (destino timelineFragment).
+ *
+ * Nota sobre el lente: este host solo PROPAGA el lente elegido (L1/L2) a
+ * PlaybackFragment vía argumentos; el recorte real es SERVER-SIDE (el backend
+ * devuelve el lente pedido con `?lens=`). El comentario "recorte CLIENTE" de
+ * arriba es histórico — hoy el recorte lo hace el servidor.
+ *
+ * La instancia el NavController. En onViewCreated cablea spinner/tabs/lente y
+ * carga cámaras; usa `viewLifecycleOwner.lifecycleScope` para las corrutinas de
+ * red. `dayRecordings` cachea el día para que cambiar de pestaña no re-pida.
  */
 class RecordingsHostFragment : BaseMenuFragment() {
 
@@ -101,6 +144,15 @@ class RecordingsHostFragment : BaseMenuFragment() {
         loadCameras()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Al volver a esta pantalla (p.ej. tras ver el directo o un evento),
+        // recargar para mostrar las grabaciones/clips de evento NUEVOS sin tener
+        // que tirar de "pull-to-refresh". En la primera creación 'cameras' aún
+        // está vacío (carga async en loadCameras) → no duplica la carga inicial.
+        if (cameras.isNotEmpty()) loadRecordings()
+    }
+
     private fun updateDateButton() { btnDate.text = dateFmt.format(cal.time) }
 
     private fun pickDate() {
@@ -115,6 +167,13 @@ class RecordingsHostFragment : BaseMenuFragment() {
         ).show()
     }
 
+    /**
+     * Carga las cámaras del usuario, puebla el spinner y arranca la primera
+     * carga de grabaciones. Reconfigura la visibilidad del selector de lente al
+     * cambiar de cámara.
+     *
+     * Llamado por: onViewCreated. Usa endpoint GET /cameras (ApiService.getCameras).
+     */
     private fun loadCameras() {
         val baseUrl = RetrofitClient.buildBaseUrl(requireContext()) ?: return
         val api = RetrofitClient.create(baseUrl, requireContext())
@@ -148,6 +207,13 @@ class RecordingsHostFragment : BaseMenuFragment() {
         if (isDual && lensGroup.checkedButtonId == View.NO_ID) lensGroup.check(R.id.btnLensL1)
     }
 
+    /**
+     * Pide las grabaciones de la cámara y fecha seleccionadas, las cachea en
+     * `dayRecordings` (más recientes primero) y aplica el filtro de la pestaña.
+     *
+     * Llamado por: loadCameras, cambio de cámara/fecha y pull-to-refresh.
+     * Usa endpoint GET /recordings (ApiService.getRecordings). Llama a: applyFilter.
+     */
     private fun loadRecordings() {
         val cam = selectedCamera ?: return
         val date = dateFmt.format(cal.time)
@@ -188,6 +254,14 @@ class RecordingsHostFragment : BaseMenuFragment() {
         } else hideState()
     }
 
+    /**
+     * Navega a PlaybackFragment para reproducir EN CADENA el día desde el
+     * segmento tocado. Empaqueta cameraId, fecha, modo (continuous|event), id de
+     * arranque y, si la cámara es dual, el lente activo.
+     *
+     * @param seg segmento de la lista que el usuario pulsó.
+     * Llamado por: el callback del TimelineAdapter. Navega a: playbackFragment.
+     */
     private fun openPlayback(seg: TimelineSegment) {
         val cam = selectedCamera ?: return
         val args = Bundle().apply {

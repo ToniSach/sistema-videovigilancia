@@ -1,5 +1,39 @@
 """
-Servicio de gestión de usuarios multiusuario.
+================================================================================
+MÓDULO: services.user_service — Gestión CRUD de usuarios (multiusuario)
+================================================================================
+
+PROPÓSITO
+    Capa de negocio para el ciclo de vida de las cuentas: crear, consultar,
+    actualizar y dar de baja usuarios; comprobar rol admin y contar usuarios
+    (para detectar el primer arranque y crear el admin inicial).
+
+RESPONSABILIDAD PRINCIPAL
+    CRUD de la entidad User con la política de credenciales (longitudes mínimas,
+    roles válidos, unicidad de username) y hashing de contraseñas. Devuelve
+    siempre objetos DESLIGADOS de la sesión (expunge) para uso seguro tras cerrar
+    la transacción.
+
+DEPENDENCIAS
+    database.models ........... User, UserRole
+    database.connection ....... db_manager.get_session()
+    core.security ............. hash_password / verify_password
+
+COMPONENTES RELACIONADOS
+    Lo INSTANCIA/CONSUME: blueprint `users_bp` (api/routes/users.py) para el
+        panel de administración de usuarios; también puede usarse en el bootstrap
+        del primer admin. No es singleton del contenedor (se instancia ad-hoc).
+    Relación con AuthService: AuthService cubre login/tokens y un alta con roles
+        admin/viewer; UserService es el CRUD general multiusuario (roles
+        admin/user). Tener presente esa divergencia de roles al elegir cuál usar.
+
+PUNTO DE ENTRADA
+    Cada método público corresponde a una operación del panel de usuarios.
+
+PIPELINE(S)
+    Soporte de #2 Autenticación — provee las cuentas que login() valida; no es
+    una etapa de captura/medios.
+================================================================================
 """
 import logging
 from typing import Optional, List
@@ -13,25 +47,27 @@ logger = logging.getLogger(__name__)
 
 
 class UserService:
-    """Servicio para operaciones CRUD de usuarios."""
-    
+    """
+    Servicio CRUD de usuarios (panel multiusuario).
+
+    Rol: gestor de cuentas sin estado (abre sesión por operación). Distinto de
+    AuthService, que se ocupa de login/tokens.
+    Lo instancia/consume: users_bp.
+    Dependencias: modelos User/UserRole, db_manager, core.security.
+    """
+
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-    
+
     def create_user(self, username: str, password: str, role: str = "user") -> User:
         """
-        Crea un nuevo usuario.
-        
-        Args:
-            username: Nombre de usuario único
-            password: Contraseña en texto plano
-            role: 'admin' o 'user'
-        
-        Returns:
-            Usuario creado
-            
-        Raises:
-            ValueError: Si el usuario existe o datos inválidos
+        Crea un usuario nuevo con la contraseña hasheada.
+
+        Inputs: username (único, >=3), password (texto plano, >=6), role
+            ('admin'|'user' — OJO: AuthService usa 'admin'|'viewer').
+        Outputs: User creado (desligado de la sesión).
+        Excepciones: ValueError si el username ya existe o los datos no validan.
+        Llamado por: POST /api/v1/users (users_bp).
         """
         if len(username) < 3:
             raise ValueError("Username debe tener al menos 3 caracteres")
@@ -109,11 +145,16 @@ class UserService:
     
     def update_user(self, user_id: int, **kwargs) -> Optional[User]:
         """
-        Actualiza datos de usuario.
-        
-        Args:
-            user_id: ID del usuario
-            **kwargs: Campos a actualizar (is_active, role, password)
+        Actualiza campos de un usuario de forma genérica.
+
+        Si llega "password" en kwargs se hashea y se aplica a password_hash (nunca
+        se guarda texto plano); el resto de claves se asignan si existen como
+        atributo de User.
+
+        Inputs: user_id; kwargs (is_active, role, password, ...).
+        Outputs: User actualizado (desligado) o None si no existe.
+        Llamado por: PUT/PATCH /api/v1/users/<id> (users_bp); también lo usa
+            delete_user para la baja lógica.
         """
         try:
             with db_manager.get_session() as session:
@@ -137,10 +178,12 @@ class UserService:
             raise
     
     def delete_user(self, user_id: int) -> bool:
-        """Elimina usuario (soft delete)."""
+        """Baja LÓGICA del usuario (is_active=False, no borra la fila), delegando
+        en update_user. Outputs: True si el usuario existía. Llamado por: DELETE
+        /api/v1/users/<id> (users_bp)."""
         return self.update_user(user_id, is_active=False) is not None
-    
+
     def is_admin(self, user_id: int) -> bool:
-        """Verifica si usuario es admin."""
+        """True si el usuario tiene rol 'admin' (guardia de rutas solo-admin)."""
         user = self.get_user_by_id(user_id)
         return user is not None and user.role == "admin"

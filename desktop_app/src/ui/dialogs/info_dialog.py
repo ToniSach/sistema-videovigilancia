@@ -1,9 +1,31 @@
 """
-InfoDialog — diálogo reutilizable para mostrar ayuda contextual de cada
-sección. Recibe una lista de secciones `(título, texto)` y las pinta en un
-formato consistente con el resto de la app.
+================================================================================
+MÓDULO: desktop_app.ui.dialogs.info_dialog — Diálogo de ayuda reutilizable
+================================================================================
 
-Uso:
+PROPÓSITO
+    QDialog modal genérico que muestra ayuda contextual de una sección como una
+    lista de bloques `(título, texto)` con estilo coherente con el resto de la
+    app. NO habla con el backend: todo el contenido es estático y se lo pasa
+    quien lo abre.
+
+RESPONSABILIDAD
+    Solo presentación: pintar la cabecera, las secciones dentro de un scroll y
+    un botón «Entendido» que cierra. No tiene lógica de red ni de estado.
+
+DEPENDENCIAS
+    PySide6 (QDialog, QScrollArea…). Sin api_client.
+
+COMPONENTES RELACIONADOS
+    - components/help_button.py — el botón «?» de cada vista que lo instancia.
+    - help_texts.py — diccionario de secciones por vista (la fuente del texto).
+    - views/live_view.py, views/notifications_view.py — lo abren directamente.
+
+QUIÉN LO ABRE
+    help_button.py (botón «?» de cada vista) y algunas vistas que arman sus
+    propias secciones; siempre vía `InfoDialog(...).exec()`.
+
+EJEMPLO DE USO
     InfoDialog(
         title="Ayuda — Cámaras",
         sections=[
@@ -12,6 +34,7 @@ Uso:
         ],
         parent=self,
     ).exec()
+================================================================================
 """
 from __future__ import annotations
 
@@ -25,9 +48,29 @@ from PySide6.QtWidgets import (
 
 
 class InfoDialog(QDialog):
-    """Diálogo modal con secciones de ayuda."""
+    """Diálogo modal de solo lectura con secciones de ayuda.
+
+    ROL
+        Ventana modal que renderiza `sections` y se cierra con «Entendido».
+        Es reutilizable: el mismo widget sirve para la ayuda de cualquier vista,
+        cambiando únicamente `title` y `sections`.
+
+    QUIÉN LO INSTANCIA
+        help_button.py y las vistas (live_view, notifications_view…).
+
+    RESULTADO
+        No devuelve datos; es informativo. Se usa con `.exec()` (modal) y su
+        código de retorno (Accepted) no se consume.
+
+    DEPENDENCIAS
+        Ninguna externa: todo el contenido llega por parámetros.
+    """
 
     def __init__(self, title: str, sections: List[Tuple[str, str]], parent=None):
+        # title: título de la ventana y cabecera visible.
+        # sections: lista de pares (encabezado, cuerpo); el cuerpo admite saltos
+        #   de línea y se pinta con word-wrap dentro de un scroll vertical.
+        # parent: widget padre para herencia de modalidad/centrado.
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumSize(560, 480)
@@ -88,6 +131,8 @@ class InfoDialog(QDialog):
 
     @staticmethod
     def _section(title: str, body: str) -> QWidget:
+        # Construye un bloque de ayuda (encabezado azul + cuerpo con word-wrap)
+        # como QWidget independiente para apilarlo en el layout del scroll.
         w = QWidget()
         l = QVBoxLayout(w)
         l.setSpacing(4)

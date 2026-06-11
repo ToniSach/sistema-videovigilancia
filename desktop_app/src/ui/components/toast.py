@@ -1,14 +1,39 @@
 """
-Toast — notificación breve no intrusiva (estilo Android/Material).
+================================================================================
+MÓDULO: ui.components.toast — Notificación breve no intrusiva (toast)
+================================================================================
 
-Aparece flotando en la esquina inferior de una ventana, se desvanece solo tras
-unos segundos y no bloquea (a diferencia de QMessageBox). Útil para confirmar
-acciones ("Guardado ✓", "Imagen capturada") sin interrumpir al usuario.
+PROPÓSITO
+    Toast estilo Android/Material: mensaje breve que aparece flotando en la zona
+    inferior de una ventana, se desvanece solo (fade-in/fade-out) tras unos
+    segundos y NO bloquea (a diferencia de QMessageBox).
 
-Uso:
+RESPONSABILIDAD
+    La función show_toast() crea un QLabel flotante sobre la ventana del widget
+    indicado, lo posiciona, lo anima con QPropertyAnimation y programa su
+    autodestrucción. Útil para confirmar acciones ("Guardado", "Imagen
+    capturada") o avisos leves sin interrumpir al usuario.
+
+API PÚBLICA
+    show_toast(parent, message, level="info"|"success"|"error"|"warning",
+               msec=2800) -> QLabel | None
+
+DEPENDENCIAS
+    PySide6 (QLabel, QGraphicsOpacityEffect, QPropertyAnimation, QTimer). No usa
+    config: la paleta por nivel está en _LEVEL_COLORS (fondo, texto, borde).
+
+COMPONENTES RELACIONADOS
+    Lo invocan vistas y diálogos para feedback efímero (en paralelo al sistema de
+    notificaciones push, que es independiente).
+
+DÓNDE SE USA
+    En cualquier vista/diálogo tras una acción del usuario que merezca confirmación.
+
+USO
     from desktop_app.src.ui.components.toast import show_toast
     show_toast(self, "Guardado correctamente")
     show_toast(self, "Error al conectar", level="error")
+================================================================================
 """
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QPoint
 from PySide6.QtWidgets import QLabel, QGraphicsOpacityEffect
@@ -22,7 +47,18 @@ _LEVEL_COLORS = {
 
 
 def show_toast(parent, message: str, level: str = "info", msec: int = 2800):
-    """Muestra un toast sobre la ventana de `parent`. No bloquea."""
+    """Muestra un toast sobre la ventana de `parent`. No bloquea.
+
+    Inputs:
+        parent: widget cualquiera; el toast se ancla a su ventana de nivel
+            superior (parent.window()) para flotar sobre todo.
+        message: texto a mostrar (se ajusta a varias líneas y se limita en ancho).
+        level: estilo de color ('info' | 'success' | 'error' | 'warning').
+        msec: tiempo visible antes del fade-out (ms).
+    Outputs: el QLabel del toast (o None si parent no tiene ventana). Se
+        autodestruye solo al terminar el fade-out.
+    Llamado por: vistas/diálogos tras una acción del usuario.
+    """
     # Anclar a la ventana de nivel superior para que flote sobre todo.
     window = parent.window() if parent is not None else None
     if window is None:

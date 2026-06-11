@@ -1,3 +1,66 @@
+"""
+================================================================================
+MÓDULO: camera_manager — Ciclo de vida de cámaras (singleton de proceso)
+================================================================================
+
+PROPÓSITO
+    Orquesta el ALTA, ARRANQUE, PARADA y reinicio de TODAS las cámaras del
+    sistema. Es el punto central que decide qué cámaras están "activas" en
+    memoria y cablea su grabación e IA. Hoy delega el flujo de medios
+    (directo/grabación/IA) a go2rtc; el CameraManager solo lleva el registro de
+    cámaras vivas y conecta los servicios de fondo.
+
+RESPONSABILIDAD PRINCIPAL
+    - start_all_active(): arrancar al inicio del backend (pipeline #1) todas las
+      cámaras marcadas is_active=True en BD.
+    - start_camera() / start_dual_lens_camera(): registrar una cámara como activa
+      y cablear grabación continua + IA según su config en BD.
+    - stop_camera() / restart_camera() / stop_all(): apagado/reinicio ordenado,
+      cerrando grabación y soltando caches (PTZ).
+    - _on_permanent_failure(): auto-desactivar una cámara cuando su worker agota
+      reintentos (marcar inactiva en BD + evento camera_offline).
+
+DEPENDENCIAS IMPORTANTES
+    database.repositories.camera_repository ... CameraRepository (cámaras en BD)
+    container.get_container ................... RecordingManager, AIService
+    streaming.go2rtc_manager .................. capa de medios (directo/IA/rec)
+    cameras.ptz_controller.ptz_manager ........ cache PTZ a soltar al parar
+    cameras.time_sync ......................... sync hora ONVIF al arrancar
+    infrastructure.metrics.collector .......... registro/baja de cámaras
+    events.event_manager ...................... publica camera_offline
+
+COMPONENTES RELACIONADOS
+    - _Go2RtcCameraHandle: marcador ligero de "cámara activa" (sin decode local).
+    - main.py: arranca CameraManager().start_all_active() en un hilo +0.5s y
+      configura el stalled-camera monitor que llama a este manager.
+
+PIPELINES
+    #1  Inicio     — start_all_active() en el arranque.
+    #3  Live       — registra la cámara para que go2rtc sirva su directo.
+    #7  ONVIF      — _maybe_sync_time() empuja la hora vía ONVIF al arrancar.
+    #11 Grabación  — _wire_recording_manager() arranca grabación continua.
+    #9  IA         — _auto_start_ai_if_needed() reactiva IA si has_ai=True.
+
+ARQUITECTURA DEL FLUJO (post-migración a go2rtc)
+    ┌──────────┐   RTSP (1 sola conexión)   ┌──────────┐  WebRTC/RTSP/HLS  ┌────────┐
+    │  Cámara  │ ─────────────────────────▶ │  go2rtc  │ ────────────────▶ │ Clientes│
+    └──────────┘                            └────┬─────┘                   └────────┘
+                                                 │ restream RTSP local
+                                                 ├──▶ Grabación (-c copy)
+                                                 └──▶ IA (AIFrameSource → YOLO)
+
+    El antiguo pipeline de decode local (FFmpegWorker → CircularFrameBuffer →
+    FrameDistributor → DualLensSplitter) se ELIMINÓ: decodificaba para nadie y
+    competía por la única conexión RTSP de la cámara. CameraManager ya NO crea
+    buffers ni distribuidores; los dicts legacy (_buffers/_distributors) quedan
+    vacíos por compatibilidad de interfaz.
+
+NOTA HISTÓRICA — campos legacy
+    Los métodos get_distributor()/get_buffer() y los dicts _lens_* se conservan
+    para no romper llamadas antiguas, pero SIEMPRE devuelven None/vacío porque
+    ya no hay decode local. No asumir que entregan frames.
+================================================================================
+"""
 import threading
 import logging
 
@@ -43,12 +106,34 @@ class _Go2RtcCameraHandle:
 
 class CameraManager:
     """
-    Singleton que gestiona el ciclo de vida de todas las cámaras:
-    - Inicia/detiene workers FFmpeg
-    - Crea buffers y distribuidores por cámara
-    - Proporciona acceso centralizado a componentes de streaming
-    - SOPORTE DUAL LENS: Divide cámaras side-by-side en dos streams independientes
-      identificados por stream_id ('l1' / 'l2'), que go2rtc publica por separado.
+    SINGLETON de proceso que gestiona el ciclo de vida de todas las cámaras.
+
+    ROL
+        Único registro en memoria de qué cámaras están activas (dict
+        camera_id → _Go2RtcCameraHandle). Cablea por cámara la grabación
+        continua y la IA, y centraliza arranque/parada/reinicio.
+
+    POR QUÉ ES SINGLETON
+        Mantiene estado vivo de proceso (handles de cámara, flags de
+        auto-desactivación, locks de ciclo de vida). Debe haber UNA sola
+        instancia: por eso el backend corre como UN proceso (ver restricción en
+        main.py). El patrón __new__ + doble-check garantiza una instancia única
+        incluso si varios hilos lo construyen a la vez.
+
+    QUIÉN LO INSTANCIA / CONSUME
+        - main.py: lo arranca con start_all_active() (hilo +0.5s) y lo pasa al
+          stalled-camera monitor.
+        - api/routes/cameras.py: lo usa para start/stop/restart al editar cámaras.
+        - El propio worker (vía callback) llama _on_permanent_failure().
+
+    SOPORTE DUAL-LENS
+        Cámaras side-by-side (is_dual_lens=True) producen un único RTSP que
+        go2rtc divide en dos lentes lógicas (cam_X_l1 / cam_X_l2). El backend YA
+        NO decodifica ni divide localmente; solo registra la cámara como activa.
+
+    DEPENDENCIAS: CameraRepository, RecordingManager, AIService, go2rtc,
+    ptz_manager, EventManager, metrics_collector.
+    PIPELINES: #1 Inicio, #3 Live, #9 IA, #11 Grabación, #7 ONVIF (sync hora).
     """
 
     _instance = None
@@ -230,6 +315,20 @@ class CameraManager:
             pass
 
     def start_camera(self, camera: Camera) -> bool:
+        """
+        Registra una cámara mono como ACTIVA y cablea sus servicios de fondo.
+        (Pipeline #1 Inicio / #3 Live.)
+
+        Si la cámara es dual-lens, delega en start_dual_lens_camera(). En modo
+        go2rtc NO arranca decode local: crea un _Go2RtcCameraHandle, conecta el
+        RecordingManager (grabación continua + auto-IA) y sincroniza la hora por
+        ONVIF en segundo plano.
+
+        Inputs:  camera (entidad Camera de BD, con rtsp_url/credenciales).
+        Outputs: True si quedó registrada; False si ya estaba activa o falló.
+        Llamado por: start_all_active(), restart_camera(), rutas de alta/edición.
+        Llama a: _wire_recording_manager(), _maybe_sync_time(), clear_auto_disabled().
+        """
         if camera.is_dual_lens:
             return self.start_dual_lens_camera(camera)
 
@@ -256,6 +355,18 @@ class CameraManager:
                 return False
 
     def start_dual_lens_camera(self, parent_camera: Camera) -> bool:
+        """
+        Registra una cámara DUAL-LENS como activa. (Pipeline #1 / #3.)
+
+        El split en dos lentes (cam_X_l1 / cam_X_l2) lo hace go2rtc por hardware
+        (QSV); el backend ya NO decodifica ni divide el frame side-by-side.
+        Igual que start_camera() crea un único _Go2RtcCameraHandle para la
+        cámara padre y cablea grabación + auto-IA.
+
+        Inputs:  parent_camera (Camera con is_dual_lens=True).
+        Outputs: True si quedó registrada; False si ya estaba activa o falló.
+        Llamado por: start_camera() (cuando is_dual_lens).
+        """
         # Reset del flag de auto-desactivación: si la estamos re-arrancando es
         # porque el usuario corrigió la config.
         self.clear_auto_disabled(parent_camera.id)
@@ -281,6 +392,19 @@ class CameraManager:
                 return False
 
     def stop_camera(self, camera_id: int) -> bool:
+        """
+        Detiene una cámara activa y libera sus recursos. (Pipeline #1 / #11.)
+
+        Orden: para la grabación continua ANTES de matar el worker (cierra el
+        último segmento limpiamente), elimina el handle, limpia buffers/
+        distribuidores legacy (hoy vacíos) y suelta el cache PTZ por si la
+        cámara cambia de IP/credenciales.
+
+        Inputs:  camera_id.
+        Outputs: True siempre (idempotente; loguea si no estaba activa).
+        Llamado por: stop_all(), restart_camera(), _on_permanent_failure().
+        Llama a: RecordingManager.stop_continuous_recording(), ptz_manager.drop().
+        """
         with self._lifecycle_lock:
             if camera_id in self._workers:
                 # Parar grabación continua ANTES de matar el worker para que
@@ -292,6 +416,22 @@ class CameraManager:
                         rec_mgr.stop_continuous_recording(camera_id)
                 except Exception as e:
                     self._logger.debug(f"stop_continuous_recording: {e}")
+
+                # Apagar la IA de ESTA cámara (todos los lentes) ANTES de matar el
+                # worker. Sin esto, al desactivar/parar la cámara el AIFrameSource
+                # seguía vivo intentando leer un stream go2rtc que ya no existe →
+                # spam eterno de "[AISource cam=N] stream cortado; reconectando…"
+                # y un hilo + ffmpeg colgados por cada apagado (fuga de recursos).
+                # IMPORTANTE: usar stop_ai_runtime (NO deactivate_ai), que para la
+                # IA en runtime SIN poner has_ai=False en BD; así, al re-encender
+                # la cámara, _auto_start_ai_if_needed vuelve a arrancar la IA sola.
+                try:
+                    from ..container import get_container
+                    ai_svc = get_container().get("ai_service")
+                    if ai_svc is not None:
+                        ai_svc.stop_ai_runtime(camera_id)
+                except Exception as e:
+                    self._logger.debug(f"[STOP] detener IA en runtime: {e}")
 
                 try:
                     worker = self._workers.pop(camera_id)
@@ -346,6 +486,18 @@ class CameraManager:
             return True
 
     def restart_camera(self, camera_id: int) -> bool:
+        """
+        Reinicia una cámara: stop + 0.5s + start. (Usado al editar config.)
+
+        Adquiere el _lifecycle_lock (RLock reentrante) que también toma
+        stop_camera() dentro — con un Lock plano esto sería un deadlock seguro
+        (ver comentario en __init__). La pausa de 0.5s deja que go2rtc/recursos
+        se liberen antes de re-registrar.
+
+        Inputs:  camera_id.
+        Outputs: True si re-arrancó; False si la cámara no existe en BD.
+        Llamado por: api/routes/cameras.py (PUT /cameras/{id}).
+        """
         camera = self._camera_repo.get_by_id(camera_id)
         if not camera:
             self._logger.error(f"No se encontró cámara {camera_id} para reiniciar")
@@ -438,7 +590,8 @@ class CameraManager:
     def _auto_start_ai_if_needed(self, camera_id: int) -> None:
         """
         Si la cámara tiene has_ai=True en BD, activa IA automáticamente cuando
-        arranca el worker. Para dual-lens se activa en l1 por default.
+        arranca el worker. Para dual-lens restaura el ÚLTIMO lente elegido por el
+        usuario (persistido en SystemConfig); l1 por defecto si no hay ninguno.
         """
         try:
             camera = self._camera_repo.get_by_id(camera_id)
@@ -455,7 +608,15 @@ class CameraManager:
                     if ai_svc is None:
                         self._logger.warning(f"[AUTO-AI] AIService no disponible cam={camera_id}")
                         return
-                    lens = "l1" if camera.is_dual_lens else "main"
+                    if camera.is_dual_lens:
+                        # Restaurar el lente que el usuario tenía (l1/l2), no
+                        # siempre l1: antes cualquier reinicio "saltaba" a l1.
+                        try:
+                            lens = ai_svc.get_persisted_ai_lens(camera_id, default="l1")
+                        except Exception:
+                            lens = "l1"
+                    else:
+                        lens = "main"
                     ok = ai_svc.activate_ai(camera_id, lens=lens, mode="low_cpu")
                     if ok:
                         self._logger.info(
@@ -485,6 +646,17 @@ class CameraManager:
         return [f"{parent_id}_l1", f"{parent_id}_l2"]
 
     def start_all_active(self) -> None:
+        """
+        Arranca TODAS las cámaras con is_active=True en BD. (Pipeline #1 Inicio.)
+
+        Punto de entrada del subsistema de cámaras al arrancar el backend: lo
+        invoca main.py en un hilo daemon +0.5s para no bloquear el HTTP. Omite
+        cámaras sin rtsp_url (no se puede streamear sin origen).
+
+        Inputs:  ninguno (lee cámaras activas del repositorio).
+        Outputs: None (efecto: cada cámara queda registrada vía start_camera()).
+        Llamado por: main.create_app() → delayed_camera_startup().
+        """
         active_cameras = self._camera_repo.get_active_cameras()
         self._logger.info(f"Iniciando {len(active_cameras)} cámaras activas...")
         for camera in active_cameras:

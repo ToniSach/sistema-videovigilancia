@@ -1,9 +1,32 @@
 """
-Onboarding Wizard — tutorial inicial paso a paso.
+================================================================================
+MÓDULO: desktop_app.ui.dialogs.onboarding_wizard — Tutorial de primer uso
+================================================================================
 
-Se muestra automáticamente la primera vez que un usuario hace login en
-este equipo (usa QSettings para recordar que ya se vio). También se puede
-reabrir desde el botón «Tutorial» del sidebar.
+PROPÓSITO
+    Asistente (wizard) modal paginado que explica lo esencial del NVR en una
+    serie de pasos. Es puramente didáctico: NO toca el backend ni cambia
+    configuración; solo enseña dónde está cada cosa.
+
+RESPONSABILIDAD
+    - Mostrar la lista estática `STEPS` con navegación Atrás/Siguiente y puntos
+      de progreso.
+    - Persistir, vía QSettings, si el usuario ya lo vio o marcó «no mostrar
+      más», para no reabrirlo en cada login.
+
+DEPENDENCIAS
+    PySide6 (QDialog, QStackedWidget…) y QSettings para el flag persistente.
+    Sin api_client: todo el contenido es texto local.
+
+COMPONENTES RELACIONADOS
+    - main_window.py — lo abre automáticamente tras el login
+      (`maybe_show_onboarding`) y bajo demanda desde el botón «Tutorial»
+      (`show_onboarding(force=True)`).
+
+QUIÉN LO ABRE
+    MainWindow: automáticamente la primera vez (respetando QSettings) y al
+    pulsar «Tutorial» en el menú lateral.
+================================================================================
 """
 from __future__ import annotations
 
@@ -21,16 +44,22 @@ from PySide6.QtWidgets import (
 
 @dataclass
 class Step:
+    """Un paso del tutorial: contenido estático que pinta `_render_step`."""
     icon: str
     title: str
     body: str
-    hint: Optional[str] = None  # texto extra en cuadro destacado
+    hint: Optional[str] = None  # texto extra en cuadro destacado (opcional)
+
+
+# Guion completo del tutorial: orden y contenido de las páginas. Editar aquí
+# (no la UI) para cambiar qué se enseña; el wizard genera puntos de progreso y
+# navegación a partir de la longitud de esta lista.
 
 
 STEPS: List[Step] = [
     Step(
         icon="",
-        title="Bienvenido al NVR",
+        title="Bienvenido al Sistema de videovigilancia",
         body=(
             "Este sistema te permite ver, grabar y recibir alertas de tus "
             "cámaras IP — todo en tu red local, sin enviar nada a internet "
@@ -81,28 +110,35 @@ STEPS: List[Step] = [
     ),
     Step(
         icon="",
-        title="4. Activa la IA (para las alertas)",
+        title="4. Activa la IA (para las alertas de detección)",
         body=(
-            "Las notificaciones se generan a partir de lo que DETECTA la IA "
-            "(personas, vehículos…). Por eso, primero activa la IA en una "
-            "cámara: abre su panel en «En vivo» y pulsa «Activar IA».\n\n"
+            "Las alertas de DETECCIÓN se generan con la IA: puedes recibir "
+            "avisos de «Persona», «Vehículo» o «Movimiento» en general. Por eso, "
+            "primero activa la IA en una cámara: abre su panel en «En vivo» y "
+            "pulsa «Activar IA».\n\n"
             "Mientras no haya una cámara con IA activa, no se pueden crear "
-            "preferencias de notificación (te lo avisa la propia pantalla)."
+            "preferencias de detección (te lo avisa la propia pantalla). Los "
+            "avisos de «Cámara desconectada» SÍ funcionan aunque la IA esté "
+            "apagada."
         ),
-        hint="Solo una cámara usa IA a la vez. Las alertas son de esa cámara."
+        hint="Solo una cámara usa IA a la vez. Las alertas de detección son de "
+             "esa cámara."
     ),
     Step(
         icon="",
-        title="5. Notificaciones: escritorio vs. móvil",
+        title="5. Notificaciones (organizadas en pestañas)",
         body=(
-            "En «Notificaciones → Mis preferencias» eliges qué eventos te "
-            "interesan, en qué horario y días.\n\n"
-            "• En el ESCRITORIO las alertas se ven aquí mismo, en la app.\n"
-            "• Para recibirlas en TELEGRAM o en el MÓVIL, hazlo desde la "
-            "app móvil (allí vinculas Telegram y eliges esos canales)."
+            "La pantalla «Notificaciones» está dividida en pestañas:\n\n"
+            "• «Telegram»: conecta tu cuenta para recibir alertas en el móvil.\n"
+            "• «Usuarios y Telegram» (solo admin): resumen de cada usuario.\n"
+            "• «Mis preferencias»: elige qué eventos te interesan (persona, "
+            "vehículo, movimiento, cámara desconectada), de qué cámaras, en qué "
+            "horario y días.\n\n"
+            "En el ESCRITORIO las alertas se ven aquí mismo; para recibirlas en "
+            "TELEGRAM, vincula tu chat en la pestaña «Telegram»."
         ),
-        hint="El administrador configura el bot de Telegram una sola vez "
-             "en «Notificaciones → Configurar bot»."
+        hint="El administrador configura el bot de Telegram una sola vez con "
+             "«Configurar bot», en la pestaña «Telegram»."
     ),
     Step(
         icon="",
@@ -146,9 +182,27 @@ STEPS: List[Step] = [
 
 
 class OnboardingWizard(QDialog):
-    """Wizard modal con paginación y opción de no volver a mostrar."""
+    """Wizard modal paginado del tutorial de primer uso.
+
+    ROL
+        Recorrer `STEPS` con navegación Atrás/Siguiente, mostrar progreso y, al
+        terminar o saltar, exponer si el usuario marcó «no volver a mostrar».
+
+    QUIÉN LO INSTANCIA
+        Las funciones helper `show_onboarding` / `maybe_show_onboarding` de este
+        mismo módulo, que a su vez llama MainWindow.
+
+    RESULTADO QUE DEVUELVE
+        accept()/reject() según se finalice o se salte. El consumidor lee
+        `dont_show_again()` para decidir si persistir el flag en QSettings.
+
+    DEPENDENCIAS
+        Solo PySide6. No usa api_client.
+    """
 
     def __init__(self, parent=None, allow_dont_show_again: bool = True):
+        # allow_dont_show_again: si False (reapertura manual «Tutorial»), oculta
+        #   el checkbox «No volver a mostrar» para no re-silenciar el wizard.
         super().__init__(parent)
         self.setWindowTitle("Tutorial del NVR")
         self.setMinimumSize(620, 540)
@@ -286,6 +340,9 @@ class OnboardingWizard(QDialog):
 
     # ------------------------------------------------------------------
     def _render_step(self):
+        # Vuelca el paso `self._current` a los labels, recolorea los puntos de
+        # progreso (actual/visitado/pendiente) y ajusta el botón final
+        # («Finalizar» en el último paso, «Siguiente →» en el resto).
         step = STEPS[self._current]
         self.lbl_icon.setText(step.icon)
         self.lbl_title.setText(step.title)
@@ -314,6 +371,8 @@ class OnboardingWizard(QDialog):
             self._render_step()
 
     def _next(self):
+        # En el último paso «Siguiente» actúa como «Finalizar»: captura el flag
+        # del checkbox y cierra con accept(). En el resto, avanza una página.
         if self._current == len(STEPS) - 1:
             self._dont_show_again = self.chk_dont_show.isChecked()
             self.accept()
@@ -322,11 +381,17 @@ class OnboardingWizard(QDialog):
         self._render_step()
 
     def _on_skip(self):
+        # «Saltar tutorial»: también respeta el checkbox y cierra con reject().
         self._dont_show_again = self.chk_dont_show.isChecked()
         self.reject()
 
     # ------------------------------------------------------------------
     def dont_show_again(self) -> bool:
+        """Indica si el usuario marcó «No volver a mostrar».
+
+        Llamado por: show_onboarding/maybe_show_onboarding tras cerrar el
+        wizard, para decidir si persistir el flag con mark_tutorial_seen().
+        """
         return self._dont_show_again
 
 
@@ -349,14 +414,28 @@ def mark_tutorial_seen(seen: bool = True) -> None:
 
 
 def maybe_show_onboarding(parent=None) -> None:
-    """Muestra el wizard si nunca se ha visto; respeta el flag «no mostrar más»."""
+    """Muestra el wizard solo si nunca se vio (apertura automática post-login).
+
+    Inputs: parent (ventana sobre la que centrar el modal).
+    Outputs: ninguno; abre el wizard o no según QSettings.
+    Llamado por: MainWindow justo después del login.
+    """
     if has_seen_tutorial():
         return
     show_onboarding(parent=parent, force=False)
 
 
 def show_onboarding(parent=None, force: bool = False) -> None:
-    """Muestra el wizard. Si force=False permite guardar «no mostrar más»."""
+    """Crea y ejecuta el wizard, persistiendo el flag «ya visto» según el caso.
+
+    Inputs:
+        parent — ventana padre.
+        force  — True cuando lo abre el botón «Tutorial» (reapertura manual):
+                 oculta el checkbox «no mostrar más» y marca como visto siempre.
+                 False (auto post-login): respeta lo que marque el usuario.
+    Outputs: ninguno (bloquea con exec() hasta que se cierra).
+    Llamado por: maybe_show_onboarding y MainWindow (botón «Tutorial»).
+    """
     wiz = OnboardingWizard(parent=parent, allow_dont_show_again=not force)
     wiz.exec()
     if wiz.dont_show_again() or not force:

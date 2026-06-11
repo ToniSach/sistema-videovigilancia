@@ -1,14 +1,42 @@
 """
-Diálogo "Vincular Telegram".
+================================================================================
+MÓDULO: desktop_app.ui.dialogs.telegram_link_dialog — Vinculación de Telegram
+================================================================================
 
-Flujo:
-  1. Al abrir → POST /telegram/generate-code → recibe {code, bot_username,
-     telegram_deep_link, expires_in_seconds}.
-  2. Muestra el código en grande, instrucciones paso a paso y un botón
-     "Abrir Telegram" que usa el deep link t.me/<bot>?start=<code>.
+PROPÓSITO
+    Diálogo modal «Vincular Telegram»: pide un código de vinculación al backend,
+    lo muestra en grande con instrucciones y hace polling hasta que el usuario
+    lo envía al bot y el backend confirma. Parte del Pipeline #13
+    (notificaciones: alertas de cámara entregadas por Telegram).
+
+RESPONSABILIDAD
+    - Generar el código (POST /telegram/generate-code) en un hilo aparte.
+    - Mostrar código + deep link + botones «Abrir Telegram» / «Copiar».
+    - Sondear el estado (GET /telegram/link-status) cada 2s y cerrar al vincular.
+    - Llevar la cuenta atrás de validez y permitir regenerar al expirar.
+
+FLUJO
+  1. Al abrir → POST /telegram/generate-code → {code, bot_username,
+     telegram_deep_link, expires_in_seconds, bot_configured}.
+  2. Muestra el código en grande, los pasos y un botón «Abrir Telegram» que usa
+     el deep link t.me/<bot>?start=<code>.
   3. Cada 2s hace GET /telegram/link-status?code=XXX.
-  4. Cuando `linked=true` → estado de éxito + cierre automático en 2s.
-  5. Si el código expira → permite regenerar.
+  4. Cuando `linked=true` → estado de éxito + cierre automático (~2.5s).
+  5. Si el código expira → permite regenerar con «Nuevo código».
+
+DEPENDENCIAS
+    - services/api_client.py — solo para leer el access_token (las llamadas se
+      hacen con `requests` directo dentro de `_APIWorker`, no vía api_client).
+    - config.API_BASE_URL — base de la URL del backend.
+    - PySide6 (QThread para REST, varios QTimer: polling, cuenta atrás, cierre).
+
+COMPONENTES RELACIONADOS
+    - views/notifications_view.py — lo abre desde su botón de vincular Telegram.
+    - Backend: rutas `telegram/generate-code` y `telegram/link-status`.
+
+QUIÉN LO ABRE
+    notifications_view.py, desde la sección de canales de notificación.
+================================================================================
 """
 from __future__ import annotations
 
@@ -31,7 +59,16 @@ logger = logging.getLogger(__name__)
 
 
 class _APIWorker(QThread):
-    """Worker para llamadas REST sin bloquear UI."""
+    """Worker genérico que hace una llamada REST y emite el JSON resultante.
+
+    Reutilizable: lo usan tanto la generación del código como cada ronda de
+    polling. Lee el access_token del singleton api_client pero hace la petición
+    con `requests` directo (no pasa por api_client._make_request).
+
+    Señales:
+        ok(dict)     — JSON de respuesta en éxito (<400).
+        failed(str)  — mensaje de error (HTTP>=400 o excepción).
+    """
     ok = Signal(dict)
     failed = Signal(str)
 
@@ -71,7 +108,25 @@ class _APIWorker(QThread):
 
 
 class TelegramLinkDialog(QDialog):
-    """Diálogo modal de vinculación Telegram."""
+    """Diálogo modal de vinculación de Telegram.
+
+    ROL
+        Coordinar: generar código, mostrarlo, sondear estado y cerrarse solo al
+        confirmarse la vinculación. Gestiona tres QTimer (polling, cuenta atrás
+        de validez, cierre diferido) y delega cada llamada REST en `_APIWorker`.
+
+    QUIÉN LO INSTANCIA
+        notifications_view.py.
+
+    RESULTADO
+        Se cierra con accept() al vincular (o al pulsar «Cerrar»). El efecto real
+        (chat de Telegram asociado al usuario) lo persiste el backend; este
+        diálogo solo lo refleja.
+
+    DEPENDENCIAS
+        api_client (token), requests (vía _APIWorker), QTimer, QDesktopServices
+        (abrir el deep link), QClipboard (copiar el comando).
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -260,6 +315,14 @@ class TelegramLinkDialog(QDialog):
     # API
     # ------------------------------------------------------------------
     def _fetch_code(self):
+        """Pide un nuevo código de vinculación y reinicia el estado del diálogo.
+
+        Inputs: ninguno (lee api_client.tokens para validar sesión).
+        Outputs: lanza `_APIWorker`; el resultado llega a `_on_code_received` /
+            `_on_code_failed`. Detiene polling/cuenta atrás previos.
+        Llamado por: __init__ y el botón «Nuevo código».
+        Llama a (backend): POST /telegram/generate-code.
+        """
         if not api_client.tokens:
             self._show_error("Sesión expirada. Vuelve a iniciar sesión.")
             return
@@ -281,6 +344,10 @@ class TelegramLinkDialog(QDialog):
         self._worker.start()
 
     def _on_code_received(self, data: dict):
+        # Slot de éxito de la generación: vuelca código/deep-link a la UI,
+        # habilita botones y arranca cuenta atrás + polling. Si el bot no está
+        # configurado en el servidor, avisa y no inicia el sondeo.
+        # Llamado por: _APIWorker.ok (Qt.QueuedConnection → hilo UI).
         payload = data.get("data") or {}
         self._code = payload.get("code", "")
         self._bot_username = payload.get("bot_username", "")
@@ -322,6 +389,14 @@ class TelegramLinkDialog(QDialog):
     # Polling de status
     # ------------------------------------------------------------------
     def _poll_status(self):
+        """Sondea si el código ya fue vinculado (una llamada por cada tick).
+
+        Inputs: usa self._code.
+        Outputs: lanza un `_APIWorker` efímero; el resultado va a `_on_status`.
+            Los fallos de red se ignoran (la siguiente ronda reintenta).
+        Llamado por: el QTimer `_poll_timer` cada 2s.
+        Llama a (backend): GET /telegram/link-status?code=<code>.
+        """
         if not self._code:
             return
         worker = _APIWorker("GET", "/telegram/link-status",
@@ -333,6 +408,9 @@ class TelegramLinkDialog(QDialog):
         worker.start()
 
     def _on_status(self, data: dict):
+        # Slot del resultado del polling: si `linked` → muestra éxito y programa
+        # el cierre automático; si `expired` → para timers e invita a regenerar.
+        # Llamado por: _APIWorker.ok del worker de polling.
         payload = data.get("data") or {}
         if payload.get("linked"):
             self._poll_timer.stop()
@@ -371,10 +449,14 @@ class TelegramLinkDialog(QDialog):
         self._remaining_s -= 1
 
     def _open_telegram(self):
+        # Abre el deep link t.me/<bot>?start=<code> en la app/cliente de
+        # Telegram del sistema. Llamado por: botón «Abrir Telegram».
         if self._deep_link:
             QDesktopServices.openUrl(QUrl(self._deep_link))
 
     def _copy_code(self):
+        # Copia el comando «/vincular <code>» al portapapeles para pegarlo en el
+        # chat del bot. Llamado por: botón «Copiar».
         if not self._code:
             return
         QApplication.clipboard().setText(f"/vincular {self._code}")
@@ -392,6 +474,9 @@ class TelegramLinkDialog(QDialog):
 
     # ------------------------------------------------------------------
     def closeEvent(self, event):
+        # Limpieza al cerrar: detiene los tres timers (polling, cuenta atrás,
+        # cierre diferido) e interrumpe el worker en curso (máx. 0.5s) para no
+        # dejar hilos accediendo a widgets destruidos.
         self._poll_timer.stop()
         self._countdown.stop()
         self._close_timer.stop()

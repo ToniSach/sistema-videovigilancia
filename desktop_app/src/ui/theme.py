@@ -1,14 +1,40 @@
 """
-Tema global (QSS) de la app de escritorio.
+================================================================================
+MÓDULO: ui.theme — Tema global (QSS) del cliente desktop
+================================================================================
 
-Aplica UN stylesheet a toda la QApplication para que CADA widget tenga un
-aspecto cuidado y coherente (botones, inputs, desplegables, tablas, scrollbars,
-menús, checkboxes, sliders, diálogos…), no solo los que cada vista estiliza a
-mano. Las hojas de estilo inline de cada vista siguen teniendo prioridad sobre
-estas reglas (especificidad), así que esto es ADITIVO: mejora todo lo que hoy
-se ve "por defecto de Qt" sin romper lo ya estilizado.
+PROPÓSITO
+    Definir y aplicar UNA hoja de estilo (QSS) a toda la QApplication para que
+    CADA widget tenga un aspecto cuidado y coherente (botones, inputs,
+    desplegables, tablas, scrollbars, menús, checkboxes, sliders, diálogos…),
+    no solo los que cada vista estiliza a mano.
 
-Diseño: "dark premium" (slate + acento cian), coherente con la app móvil.
+RESPONSABILIDAD
+    - Centralizar la paleta de color "dark premium" (slate + acento cian),
+      coherente con desktop_app/src/config.py y con la app móvil.
+    - Construir el QSS global (`build_stylesheet`) y aplicarlo (`apply_theme`).
+    El estilo es ADITIVO: las hojas inline de cada vista tienen prioridad por
+    especificidad, así que esto mejora lo que se vería "por defecto de Qt" sin
+    romper lo ya estilizado.
+
+DEPENDENCIAS
+    Ninguna externa más allá de la QApplication que recibe `apply_theme`. Las
+    constantes de paleta son módulo-locales (duplican intencionadamente las de
+    config.py para que el tema sea autocontenido).
+
+COMPONENTES RELACIONADOS
+    main.py llama a `apply_theme(app)` justo después de fijar la fuente y antes
+    de crear la MainWindow. Convención de propiedades Qt que el QSS reconoce:
+    setProperty("accent", True) → botón de acción primaria;
+    setProperty("danger", True) → botón destructivo.
+
+PUNTO DE ENTRADA
+    `apply_theme(app)` (único punto público usado por main.py).
+
+ROL EN LA NAVEGACIÓN
+    Transversal: no participa en la navegación; viste todas las vistas y
+    diálogos por igual.
+================================================================================
 """
 from __future__ import annotations
 

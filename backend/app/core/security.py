@@ -1,6 +1,43 @@
 """
-Utilidades de seguridad para autenticación y autorización.
-Incluye hash de contraseñas, verificación JWT y decoradores de permisos.
+================================================================================
+MÓDULO: core.security — Utilidades de autenticación y autorización
+================================================================================
+
+PROPÓSITO
+    Funciones transversales de seguridad: hash/verificación de contraseñas,
+    lectura de la identidad del usuario desde el JWT y un decorador de
+    autorización por rol (admin). Es el "kit" de auth que usan rutas y servicios.
+
+RESPONSABILIDAD PRINCIPAL
+    - hash_password / verify_password: derivación segura de contraseñas
+      (PBKDF2-SHA256 vía werkzeug) — no se guardan contraseñas en claro.
+    - get_current_user_id: extraer el ID del usuario del token JWT del request.
+    - admin_required: cerrar rutas a usuarios sin rol admin.
+
+NOTA SOBRE EL NOMBRE
+    El docstring histórico menciona "bcrypt", pero el hashing real lo provee
+    werkzeug con el esquema pbkdf2:sha256 (ver generate_password_hash). El
+    resultado es autodescriptivo (lleva el método embebido), así que verify
+    sigue funcionando aunque cambie el algoritmo por defecto.
+
+DEPENDENCIAS
+    werkzeug.security ......... generate_password_hash / check_password_hash.
+    flask_jwt_extended ........ get_jwt_identity / verify_jwt_in_request / get_jwt.
+
+COMPONENTES RELACIONADOS
+    services.auth_service ..... emite y refresca los tokens; usa estos hashes.
+    core.jwt_blocklist ........ revocación de los tokens que aquí se leen.
+    api.routes.auth / rutas admin ... consumen get_current_user_id y
+                                @admin_required.
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    Módulo de funciones libres (sin estado/singleton). Se importa donde haga
+    falta validar credenciales o permisos.
+
+PIPELINE(S)
+    Pipeline #2 (Autenticación): hash/verify en login y cambio de contraseña;
+    get_current_user_id y admin_required en CADA request protegido (autorización).
+================================================================================
 """
 import logging
 from functools import wraps
@@ -14,13 +51,16 @@ logger = logging.getLogger(__name__)
 
 def hash_password(plain_text: str) -> str:
     """
-    Genera hash seguro de contraseña usando PBKDF2.
-    
-    Args:
-        plain_text: Contraseña en texto plano
-        
-    Returns:
-        str: Hash de la contraseña (método pbkdf2:sha256)
+    Genera el hash de una contraseña (pipeline #2: registro / cambio de clave).
+
+    Usa PBKDF2-SHA256 con salt aleatorio de 16 bytes; el string resultante
+    incluye método y salt, de modo que verify_password no necesita parámetros
+    extra. Nunca se almacena la contraseña en claro.
+
+    Inputs: plain_text — contraseña en texto plano.
+    Outputs: str — hash con formato "pbkdf2:sha256:...".
+    Excepciones: ValueError si werkzeug no puede procesar la entrada.
+    Llamado por: AuthService (alta de usuario y cambio de contraseña).
     """
     try:
         return generate_password_hash(plain_text, method='pbkdf2:sha256', salt_length=16)
@@ -31,14 +71,13 @@ def hash_password(plain_text: str) -> str:
 
 def verify_password(plain_text: str, hashed: str) -> bool:
     """
-    Verifica si una contraseña coincide con su hash almacenado.
-    
-    Args:
-        plain_text: Contraseña en texto plano a verificar
-        hashed: Hash almacenado en base de datos
-        
-    Returns:
-        bool: True si coincide, False en caso contrario
+    Verifica una contraseña contra su hash almacenado (pipeline #2: login).
+
+    Inputs: plain_text (clave introducida), hashed (hash guardado en BD).
+    Outputs: bool — True si coincide. Devuelve False (no lanza) ante cualquier
+        error de verificación, para no filtrar detalles del fallo al cliente.
+    Llamado por: AuthService durante el login y al validar la clave actual en
+        un cambio de contraseña.
     """
     try:
         return check_password_hash(hashed, plain_text)
@@ -49,14 +88,19 @@ def verify_password(plain_text: str, hashed: str) -> bool:
 
 def get_current_user_id() -> int:
     """
-    Obtiene el ID del usuario actual desde el token JWT válido.
-    Debe usarse dentro de un contexto donde @jwt_required esté activo.
-    
-    Returns:
-        int: ID numérico del usuario autenticado
-        
-    Raises:
-        RuntimeError: Si no hay token JWT válido en el contexto
+    Devuelve el ID del usuario autenticado a partir del JWT del request actual
+    (pipeline #2: autorización en cada endpoint protegido).
+
+    Precondición: debe llamarse dentro de un contexto con @jwt_required() activo
+    (el token ya validado por flask_jwt_extended).
+
+    Outputs: int — ID del usuario (la identidad del token, convertida a entero).
+    Excepciones:
+        RuntimeError — si no hay identidad JWT en el contexto.
+        ValueError — si la identidad del token no es numérica.
+    Llamado por: prácticamente todas las rutas protegidas para saber "quién pide"
+        (filtrar cámaras/eventos por dueño, aplicar permisos, etc.).
+    Llama a: flask_jwt_extended.get_jwt_identity.
     """
     try:
         identity = get_jwt_identity()
@@ -73,16 +117,20 @@ def get_current_user_id() -> int:
 
 def admin_required(fn: Callable[..., Any]) -> Callable[..., Any]:
     """
-    Decorador que verifica si el usuario autenticado tiene rol de administrador.
-    Debe usarse después de @jwt_required().
-    
-    Args:
-        fn: Función a decorar
-        
-    Returns:
-        Función wrapper que verifica permisos de admin
-        
-    Example:
+    Decorador de autorización por rol: exige rol "admin" (pipeline #2).
+
+    Verifica el JWT (verify_jwt_in_request) y lee el claim "role"; si no es
+    "admin" corta con 403. Si falta/expira el token, responde 401. Debe ir
+    DESPUÉS de @jwt_required() en la pila de decoradores.
+
+    Inputs: fn — la vista a proteger.
+    Outputs: wrapper que ejecuta fn solo si el usuario es admin; en caso
+        contrario un jsonify con 403 (rol insuficiente) o 401 (sin auth).
+    Llamado por: rutas de administración (gestión de usuarios, config del
+        sistema, etc.).
+    Llama a: flask_jwt_extended.verify_jwt_in_request / get_jwt.
+
+    Ejemplo:
         @jwt_required()
         @admin_required
         def delete_user(user_id):

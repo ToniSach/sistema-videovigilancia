@@ -69,7 +69,9 @@
     <string name="pref_event_camera_reconnected">Camara reconectada</string>
     <string name="pref_event_tampering">Manipulacion</string>
     <string name="pref_save_ok">Preferencia guardada</string>
+    <string name="pref_save_ok_telegram">Preferencia guardada. Si aun no vinculaste Telegram, hazlo en la pantalla de Telegram para recibir las alertas.</string>
     <string name="pref_save_failed">No se pudo guardar la preferencia</string>
+    <string name="pref_save_no_server">No se pudo guardar: falta la URL del servidor. Vuelve a vincular el dispositivo.</string>
     <string name="pref_load_failed">No se pudieron cargar las preferencias</string>
     <string name="pref_ai_inactive">La deteccion por IA no esta activa. Las notificaciones se generan a partir de lo que detecta la IA, asi que primero un administrador debe activarla en una camara. Mientras tanto no puedes personalizar notificaciones.</string>
     <string name="pref_days_label">Dias</string>

@@ -1,5 +1,44 @@
 """
-Servicio de gestión de dispositivos móviles.
+================================================================================
+MÓDULO: device_service — Registro y autenticación de dispositivos móviles
+================================================================================
+
+PROPÓSITO
+    Gestiona el ciclo de vida de los dispositivos móviles (app Android CamLink):
+    alta/actualización, emisión y validación de refresh tokens, baja lógica y
+    listado por usuario.
+
+RESPONSABILIDAD PRINCIPAL
+    - Registrar un móvil por su `device_uuid` (idempotente: si ya existe lo
+      reactiva y reasigna al usuario en lugar de duplicar).
+    - Emitir un par de tokens opacos (access + refresh) y persistir SOLO el
+      hash SHA-256 del refresh (nunca el token en claro).
+    - Validar el refresh token comparando hashes y refrescar `last_seen_at`.
+
+NOTA IMPORTANTE
+    Las notificaciones push por FCM/Firebase fueron ELIMINADAS del proyecto. El
+    móvil recibe alertas en tiempo real por WebSocket en la LAN mientras esté
+    conectado (ver WSNotificationBroker / Pipeline #13). Aquí no se guardan
+    tokens FCM.
+
+DEPENDENCIAS
+    database.models ........ MobileDevice, User
+    database.connection .... db_manager (una sesión por operación)
+    config.settings ........ configuración global (importada para uso futuro)
+    secrets / hashlib ...... generación de tokens y hashing
+
+COMPONENTES RELACIONADOS
+    - api.routes.devices / api.routes.mobile: exponen estos métodos como REST.
+    - QRService: tras validar el QR, el móvil llama a register_device.
+    - NotificationRouter: usa los dispositivos vivos para la entrega por WebSocket.
+
+PUNTO DE ENTRADA
+    Instancia `DeviceService()` desde las rutas; métodos autocontenidos.
+
+PIPELINE(S)
+    #13 Notificaciones (móvil) — etapa de provisión de dispositivos y de la
+    sesión móvil (refresh token) sobre la que viaja la entrega por WebSocket.
+================================================================================
 """
 import logging
 import secrets
@@ -28,10 +67,15 @@ class DeviceService:
     def register_device(self, user_id: int, device_uuid: str, device_name: str,
                        platform: str) -> tuple[MobileDevice, str, str]:
         """
-        Registra un nuevo dispositivo o actualiza uno existente.
-
-        Returns:
-            Tupla (device, access_token, refresh_token)
+        Propósito: alta o actualización idempotente de un dispositivo por su
+            device_uuid, emitiendo un par de tokens nuevos.
+        Inputs: user_id (dueño); device_uuid (id estable del aparato);
+            device_name; platform ('android'/'ios'/…).
+        Outputs: tupla (device desligado, access_token, refresh_token EN CLARO).
+            El refresh en claro se devuelve UNA sola vez al cliente; en BD solo
+            queda su hash SHA-256.
+        Excepciones: re-lanza errores de BD tras loguear.
+        Llamado por: ruta de registro/vinculación de dispositivos (tras QR).
         """
         try:
             with db_manager.get_session() as session:
@@ -73,7 +117,15 @@ class DeviceService:
             raise
     
     def validate_refresh_token(self, device_uuid: str, refresh_token: str) -> Optional[MobileDevice]:
-        """Valida refresh token y retorna dispositivo."""
+        """
+        Propósito: valida el refresh token de un móvil (compara hashes) para
+            emitir un nuevo access token; de paso refresca `last_seen_at`.
+        Inputs: device_uuid; refresh_token (en claro, recibido del cliente).
+        Outputs: MobileDevice (desligado) si es válido y está activo; None si no
+            existe, está inactivo o el hash no coincide.
+        Excepciones: capturadas → devuelve None (no propaga).
+        Llamado por: ruta de refresh de sesión móvil.
+        """
         try:
             with db_manager.get_session() as session:
                 device = session.query(MobileDevice).filter_by(device_uuid=device_uuid).first()
@@ -97,7 +149,12 @@ class DeviceService:
             return None
     
     def deactivate_device(self, device_id: int) -> bool:
-        """Desactiva dispositivo."""
+        """
+        Propósito: baja LÓGICA del dispositivo (is_active=False); deja de aceptar
+            su refresh token y de recibir notificaciones. Inputs: device_id.
+            Outputs: True si existía, False si no. Excepciones: re-lanza errores
+            de BD. Llamado por: ruta de baja/cierre de sesión del móvil.
+        """
         try:
             with db_manager.get_session() as session:
                 device = session.get(MobileDevice, device_id)
@@ -110,7 +167,11 @@ class DeviceService:
             raise
     
     def get_user_devices(self, user_id: int) -> List[MobileDevice]:
-        """Obtiene dispositivos de un usuario."""
+        """
+        Propósito: lista los dispositivos ACTIVOS de un usuario (desligados de la
+            sesión). Inputs: user_id. Outputs: List[MobileDevice]. Excepciones:
+            re-lanza errores de BD. Llamado por: ruta de listado de dispositivos.
+        """
         try:
             with db_manager.get_session() as session:
                 devices = session.query(MobileDevice).filter_by(

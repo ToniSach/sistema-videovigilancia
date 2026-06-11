@@ -201,7 +201,23 @@ def _xml_escape(s: str) -> str:
 # =============================================================================
 class ONVIFSoapClient:
     """
-    Cliente SOAP ONVIF mínimo.
+    Cliente SOAP ONVIF mínimo — el FAST PATH del descubrimiento. (Pipeline #7.)
+
+    ROL
+        Habla ONVIF construyendo los envelopes SOAP a mano (sin WSDL), lo que lo
+        hace rápido y tolerante con cámaras baratas que no cumplen el estándar.
+        Cada operación prueba PasswordText primero (compat con cámaras chinas) y
+        cae a PasswordDigest (ONVIF estricto) solo si el fallo fue de auth.
+
+    QUIÉN LO CONSUME
+        onvif_discovery.py (FAST PATH) vía los helpers probe_ip_all_ports() y
+        probe_to_camera_dict(). Es el camino preferido antes de caer a
+        onvif-zeep (SLOW PATH).
+
+    SERVICIOS ONVIF QUE TOCA
+        device_service (GetDeviceInformation / GetCapabilities), media
+        (GetProfiles / GetStreamUri). El endpoint media se autodescubre vía los
+        XAddr de GetCapabilities y, si no, se prueban rutas conocidas.
 
     Uso típico:
         client = ONVIFSoapClient("192.168.1.8", 8899, "admin", "admin")
@@ -330,6 +346,20 @@ class ONVIFSoapClient:
     # ------------------------------------------------------------------
     def get_device_information(self) -> tuple[Optional[DeviceInformation],
                                                 Optional[ONVIFError], str]:
+        """
+        Lee fabricante/modelo/firmware/serie de la cámara. (Pipeline #7 ONVIF.)
+
+        Es la PRUEBA DE VIDA ONVIF + validación de credenciales: si responde
+        OK, la cámara es ONVIF y las credenciales son válidas.
+
+        Solicitud SOAP: GetDeviceInformation (sin parámetros).
+        Respuesta esperada: GetDeviceInformationResponse con Manufacturer,
+            Model, FirmwareVersion, SerialNumber, HardwareId.
+        Servicio ONVIF: device_service.
+        Outputs: (DeviceInformation, error, auth_method) — auth_method indica si
+            funcionó con "PasswordText" o "PasswordDigest".
+        Llamado por: probe().
+        """
         body = '<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>'
         action = "http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation"
         root, err, auth = self._try_both_auth(self._device_url, body, action)
@@ -358,6 +388,18 @@ class ONVIFSoapClient:
             return None, ONVIFError("parse", f"Error parseando device info: {e}"), auth
 
     def get_capabilities(self) -> tuple[Optional[Capabilities], Optional[ONVIFError]]:
+        """
+        Descubre qué servicios soporta la cámara y sus URLs. (Pipeline #7.)
+
+        Solicitud SOAP: GetCapabilities con Category=All.
+        Respuesta esperada: Capabilities con secciones Media/PTZ/Imaging/Device,
+            cada una con su XAddr (URL del servicio). Esas URLs se cachean
+            (self._media_url/_ptz_url/_imaging_url) para las siguientes llamadas.
+        Servicio ONVIF: device_service.
+        Tolerancia: en cámaras baratas puede fallar sin ser fatal — probe() lo
+            trata como no crítico y sigue con GetProfiles.
+        Outputs: (Capabilities, error).
+        """
         body = (
             '<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
             '<tds:Category>All</tds:Category>'
@@ -404,6 +446,18 @@ class ONVIFSoapClient:
             return None, ONVIFError("parse", f"Error parseando capabilities: {e}")
 
     def get_profiles(self) -> tuple[list[Profile], Optional[ONVIFError]]:
+        """
+        Obtiene los perfiles de medios (resolución/codec/PTZ/audio). (Pipeline #7.)
+
+        Solicitud SOAP: GetProfiles (sin parámetros).
+        Respuesta esperada: lista de <Profiles> con VideoEncoderConfiguration y,
+            si los hay, PTZConfiguration / AudioEncoderConfiguration.
+        Servicio ONVIF: media.
+        Compatibilidad: prueba el XAddr media de GetCapabilities y, si no, las
+            rutas MEDIA_PATHS conocidas; también acepta el tag <Profiles> tanto
+            en el namespace media/wsdl como en el schema (variantes de cámaras).
+        Outputs: (lista de Profile, error).
+        """
         body = '<trt:GetProfiles xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>'
         action = "http://www.onvif.org/ver10/media/wsdl/GetProfiles"
         # Probar primero el endpoint Media declarado por GetCapabilities, luego variantes
@@ -471,6 +525,16 @@ class ONVIFSoapClient:
         )
 
     def get_stream_uri(self, profile_token: str) -> tuple[str, Optional[ONVIFError]]:
+        """
+        Resuelve la URL RTSP de un perfil. (Provee la URL al pipeline #3 Live.)
+
+        Solicitud SOAP: GetStreamUri con StreamSetup={Stream: RTP-Unicast,
+            Transport.Protocol: RTSP} y el ProfileToken indicado.
+        Respuesta esperada: <Uri> con la URL rtsp://...
+        Servicio ONVIF: media.
+        Outputs: (uri, error). En probe() se inyectan las credenciales en la URL
+            si la cámara no las incluye.
+        """
         body = (
             '<trt:GetStreamUri xmlns:trt="http://www.onvif.org/ver10/media/wsdl" '
             'xmlns:tt="http://www.onvif.org/ver10/schema">'

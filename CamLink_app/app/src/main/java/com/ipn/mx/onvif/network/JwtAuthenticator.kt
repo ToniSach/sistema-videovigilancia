@@ -1,3 +1,38 @@
+/*
+ * ============================================================================
+ * MÓDULO: network/JwtAuthenticator — refresh automático del JWT (OkHttp)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Authenticator de OkHttp que, ante una respuesta 401 en cualquier petición
+ *   autenticada, intenta renovar el access_token llamando a
+ *   `POST /api/v1/auth/refresh` con el refresh_token y reintenta la petición
+ *   original de forma transparente. Si el refresh falla, da la sesión por
+ *   perdida y avisa a la UI.
+ *
+ * RESPONSABILIDAD
+ *   - Detectar 401, refrescar el token y reintentar UNA sola vez (anti-bucle).
+ *   - Coalescer múltiples 401 simultáneos en UN único refresh (lock + cotejo
+ *     de token stale vs actual).
+ *   - Persistir el nuevo access_token en RetrofitClient + SharedPreferences.
+ *   - Emitir el broadcast local SESSION_EXPIRED cuando ya no se puede refrescar.
+ *
+ * DEPENDENCIAS
+ *   - okhttp3.Authenticator (lo invoca OkHttp en su pipeline de auth).
+ *   - RetrofitClient (token en memoria) + SharedPreferences "auth_prefs".
+ *   - model/RefreshResponse (Gson) para parsear la respuesta de refresh.
+ *
+ * COMPONENTES RELACIONADOS
+ *   - RetrofitClient.create(): registra este Authenticator en el OkHttpClient.
+ *   - MainActivity.sessionExpiredReceiver: escucha SESSION_EXPIRED y navega al
+ *     QrScanFragment.
+ *
+ * PUNTO DE ENTRADA
+ *   OkHttp llama a [authenticate] automáticamente tras un 401.
+ *
+ * PIPELINE: #2 Auth (lado móvil) — etapa de renovación de credenciales.
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.network
 
 import android.content.Context
@@ -60,6 +95,17 @@ class JwtAuthenticator(
 
     private val gson = Gson()
 
+    /**
+     * Punto de entrada del Authenticator: OkHttp lo invoca tras un 401.
+     * Decide cómo (o si) reintentar la petición fallida.
+     *
+     * @param route ruta de la conexión (no usada; lo exige la interfaz).
+     * @param response respuesta 401 con la petición original adjunta.
+     * @return la petición a reintentar con el nuevo Bearer, o null para
+     *         rendirse (ya reintentado, sin refresh_token, o refresh fallido).
+     * Llamado por: OkHttp (pipeline de autenticación).
+     * Llama a: [tryRefresh] y [emitSessionExpired].
+     */
     override fun authenticate(route: Route?, response: Response): Request? {
         // Cortar el bucle: si ya marcamos un reintento, no volver a intentar.
         if (response.request.header(HDR_RETRY) != null) {
@@ -97,7 +143,13 @@ class JwtAuthenticator(
 
     /**
      * Llama POST /auth/refresh con el refresh_token. Devuelve el nuevo access
-     * o null si falló (en cuyo caso la sesión está perdida).
+     * o null si falló (en cuyo caso la sesión está perdida). Usa
+     * [refreshHttpClient] (sin Authenticator) para no recurrir. Si tiene éxito,
+     * persiste el token en [RetrofitClient.accessToken] y en SharedPreferences.
+     *
+     * @return el nuevo access_token, o null si no hay refresh_token o el
+     *         servidor lo rechazó.
+     * Llamado por: [authenticate].
      */
     private fun tryRefresh(): String? {
         val prefs = appContext.getSharedPreferences("auth_prefs", Context.MODE_PRIVATE)
@@ -145,6 +197,14 @@ class JwtAuthenticator(
         }
     }
 
+    /**
+     * Extrae el token de una cabecera "Bearer <token>".
+     *
+     * @param header valor crudo de Authorization (puede ser null).
+     * @return el token sin el prefijo "Bearer ", o null si no aplica.
+     * Llamado por: [authenticate] para conocer el token con el que vino la
+     * petición fallida (y detectar si otro thread ya lo refrescó).
+     */
     private fun extractBearer(header: String?): String? {
         if (header.isNullOrBlank()) return null
         val parts = header.split(" ", limit = 2)
@@ -152,6 +212,13 @@ class JwtAuthenticator(
                else null
     }
 
+    /**
+     * Emite el broadcast local SESSION_EXPIRED ([ACTION_SESSION_EXPIRED],
+     * acotado al propio paquete) para que la UI vuelva al login por QR.
+     *
+     * Llamado por: [authenticate] cuando el refresh falla irrecuperablemente.
+     * Llama a: MainActivity.sessionExpiredReceiver (vía broadcast).
+     */
     private fun emitSessionExpired() {
         try {
             val intent = Intent(ACTION_SESSION_EXPIRED).setPackage(appContext.packageName)

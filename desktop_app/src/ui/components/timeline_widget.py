@@ -1,5 +1,44 @@
 """
-Widget de timeline interactivo para grabaciones.
+================================================================================
+MÓDULO: ui.components.timeline_widget — Línea de tiempo de grabaciones (#14)
+================================================================================
+
+PROPÓSITO
+    Línea de tiempo horizontal de 24 h, dibujada con QPainter, que visualiza los
+    segmentos de grabación de una cámara y permite hacer seek (click/arrastre) y
+    ver marcas de eventos. Es el control principal de navegación temporal de la
+    vista de Reproducción.
+
+RESPONSABILIDAD
+    - Pintar la rejilla horaria (00:00–24:00), los segmentos de grabación
+      coloreados por tipo (continuo / evento / clip), las marcas de eventos
+      (triángulos de color por tipo) y la línea roja de posición actual.
+    - Convertir píxeles ↔ segundos desde medianoche y emitir señales de
+      navegación cuando el usuario hace click o arrastra.
+
+PIPELINE
+    #14 Reproducción. La timeline NO reproduce: emite señales que la vista
+    traduce en seek sobre playback_service (que controla el VLC de video_player).
+    Flujo: click/drag → segment_clicked / position_changed → vista de
+    Reproducción → playback_service (carga grabación + seek) → VLC.
+
+MODELO DE DATOS
+    Trabaja sobre RecordingSegment (models/recording.py): start_seconds,
+    duration_seconds, recording_id, has_clip. Las marcas de evento son tuplas
+    (segundos_desde_medianoche, tipo_evento).
+
+DEPENDENCIAS
+    PySide6 (QWidget, QPainter, eventos de ratón/rueda, QToolTip),
+    models.recording.RecordingSegment, config (colores del tema).
+
+COMPONENTES RELACIONADOS
+    services/playback_service.py (ejecuta el seek que esta barra solicita),
+    video_player.py (superficie donde se ve el resultado), la vista de
+    Reproducción que cablea ambas.
+
+DÓNDE SE USA
+    En la vista de Reproducción (ui/views/playback_view), bajo el VideoPlayerWidget.
+================================================================================
 """
 import logging
 from datetime import datetime, timedelta
@@ -17,9 +56,26 @@ logger = logging.getLogger(__name__)
 
 class TimelineWidget(QWidget):
     """
-    Timeline horizontal interactivo para visualizar segmentos de grabación.
+    Timeline horizontal interactivo para visualizar segmentos de grabación y
+    navegar por ellos (seek por click/arrastre).
+
+    Rol: control de navegación temporal de la vista de Reproducción.
+
+    Quién la instancia/consume:
+        La vista de Reproducción la crea, le pasa los datos con
+        set_segments()/set_event_markers() y conecta sus señales para hacer
+        seek sobre playback_service.
+
+    SEÑALES Qt que EMITE:
+      - segment_clicked(recording_id: int, seconds_offset: int): al hacer click
+        DENTRO de un segmento; indica qué grabación abrir y en qué segundo.
+      - position_changed(seconds: int): al mover la posición actual (click o
+        arrastre); segundos desde medianoche (0-86399).
+    SEÑALES que RECIBE: ninguna (los datos entran por los setters públicos).
+
+    Dependencias: RecordingSegment (modelo), QPainter (render), config (colores).
     """
-    
+
     # Señales
     segment_clicked = Signal(int, int)  # recording_id, seconds_offset
     position_changed = Signal(int)  # segundos desde medianoche
@@ -63,18 +119,35 @@ class TimelineWidget(QWidget):
         self.setMouseTracking(True)
     
     def set_segments(self, segments: List[RecordingSegment]):
-        """Establece segmentos a mostrar."""
+        """Establece los segmentos de grabación a mostrar (los ordena por inicio).
+
+        Inputs: segments (lista de RecordingSegment del día seleccionado).
+        Outputs: ninguno (repinta).
+        Llamado por: la vista de Reproducción al cargar las grabaciones del día.
+        """
         self.segments = sorted(segments, key=lambda x: x.start)
         self.update()
-    
+
     def set_current_time(self, seconds: int):
-        """Actualiza línea de tiempo actual."""
+        """Mueve la línea de posición actual y notifica el cambio.
+
+        Inputs: seconds (segundos desde medianoche; se clampa a 0-duration).
+        Outputs: ninguno (repinta).
+        Señales: emite position_changed(seconds).
+        Llamado por: click/arrastre del usuario y por la vista al sincronizar
+            la barra con el avance de la reproducción.
+        """
         self.current_time = max(0, min(seconds, self.duration))
         self.update()
         self.position_changed.emit(self.current_time)
 
     def set_event_markers(self, markers: List[tuple]):
-        """Marcas de eventos: lista de (segundos_desde_medianoche, tipo)."""
+        """Fija las marcas de evento a dibujar sobre la barra.
+
+        Inputs: markers (lista de (segundos_desde_medianoche, tipo_evento)).
+        Outputs: ninguno (repinta).
+        Llamado por: la vista de Reproducción al cargar los eventos del día.
+        """
         self.event_markers = markers or []
         self.update()
     
@@ -86,10 +159,14 @@ class TimelineWidget(QWidget):
         # Fondo
         painter.fillRect(self.rect(), self.colors['background'])
         
-        # Calcular escala
+        # Calcular escala (evitar división por cero si aún no hay tamaño o la
+        # duración no es válida: el widget puede pintarse antes de tener ancho).
         width = self.width()
         height = self.height()
-        self.pixels_per_second = width / self.duration
+        if self.duration and self.duration > 0 and width > 0:
+            self.pixels_per_second = width / self.duration
+        else:
+            self.pixels_per_second = 0.0
         
         # Dibujar grid de horas
         self._draw_grid(painter, width, height)
@@ -111,7 +188,6 @@ class TimelineWidget(QWidget):
         "vehicle": QColor("#f59e0b"),
         "motion": QColor("#38bdf8"),
         "camera_offline": QColor("#fb7185"),
-        "tampering": QColor("#ef4444"),
     }
 
     def _draw_event_markers(self, painter: QPainter, height: int):
@@ -209,8 +285,22 @@ class TimelineWidget(QWidget):
         return f"{h:02d}:{m:02d}:{s:02d}"
     
     def mousePressEvent(self, event: QMouseEvent):
-        """Click en timeline."""
+        """Click en la timeline: traduce X→segundo, busca segmento e inicia drag.
+
+        Si el click cae dentro de un segmento, emite segment_clicked(recording_id,
+        offset) para que la vista abra ESA grabación en ese punto; en cualquier
+        caso mueve la posición actual y arranca el modo arrastre.
+
+        Inputs: event (QMouseEvent; usa botón izquierdo y posición X).
+        Señales: emite segment_clicked (si hay segmento) y position_changed.
+        Llamado por: Qt al pulsar el ratón sobre el widget.
+        Llama a: set_current_time.
+        """
         if event.button() == Qt.LeftButton:
+            # Si aún no se ha calculado la escala (widget sin pintar), ignorar
+            # el clic en vez de dividir por cero.
+            if not self.pixels_per_second or self.pixels_per_second <= 0:
+                return
             seconds = int(event.pos().x() / self.pixels_per_second)
             seconds = max(0, min(seconds, self.duration))
             
@@ -229,10 +319,19 @@ class TimelineWidget(QWidget):
             self._dragging = True
     
     def mouseMoveEvent(self, event: QMouseEvent):
-        """Movimiento de mouse (hover y drag)."""
+        """Movimiento del ratón: resalta el segmento bajo el cursor, muestra
+        tooltip de hora/duración y, si se está arrastrando, hace scrubbing.
+
+        Inputs: event (QMouseEvent; posición X y global para el tooltip).
+        Señales: position_changed (indirecta, vía set_current_time durante drag).
+        Llamado por: Qt al mover el ratón (mouseTracking activado).
+        Llama a: set_current_time (solo en drag), QToolTip.showText.
+        """
+        if not self.pixels_per_second or self.pixels_per_second <= 0:
+            return
         x = event.pos().x()
         seconds = int(x / self.pixels_per_second)
-        
+
         # Encontrar segmento bajo cursor
         old_hover = self._hover_segment
         self._hover_segment = None

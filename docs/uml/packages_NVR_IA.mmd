@@ -1,0 +1,19 @@
+classDiagram
+  class processing {
+  }
+  class ai {
+  }
+  class ai_frame_source {
+  }
+  class ai_scheduler {
+  }
+  class model_pool {
+  }
+  class motion {
+  }
+  class motion_detector {
+  }
+  ai --> ai_frame_source
+  ai --> ai_scheduler
+  ai_scheduler --> model_pool
+  motion --> motion_detector

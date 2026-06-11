@@ -1,5 +1,57 @@
 """
-Vista de playback de grabaciones con timeline.
+================================================================================
+MÓDULO: ui.views.playback_view — Reproducción histórica de grabaciones (Pipeline #14)
+================================================================================
+
+PROPÓSITO
+    Pantalla de REPRODUCCIÓN: permite recorrer las grabaciones de una cámara en
+    una fecha dada, navegando por una línea de tiempo (timeline) con segmentos
+    continuos (clips de ~2 min) y marcas de eventos. Reproduce, encadena
+    segmentos automáticamente, salta a un instante exacto (desde un evento) y
+    exporta el clip en curso.
+
+RESPONSABILIDAD
+    - Pedir el timeline del día al backend y materializarlo en `RecordingSegment`.
+    - Coordinar tres piezas: el `TimelineWidget` (barra de segmentos + marcas de
+      eventos), el `VideoPlayerWidget` (lienzo VLC) y el `playback_service`
+      (singleton que descarga el clip y maneja el player VLC real).
+    - Reproducción CONTINUA: al terminar un segmento encadena el siguiente
+      (`_on_playback_ended`), de modo que "Play" recorre el día entero.
+    - "Ver en playback" desde un evento: recibe (camera_id, datetime), carga el
+      día y hace seek al segundo exacto del evento (`jump_to_time`).
+    - Cámaras DUAL-LENS: la grabación es el stream COMBINADO (ambos lentes
+      apilados). El selector de lente recorta en el CLIENTE (VLC) sin re-descargar
+      ni reiniciar el segmento (`_on_lens_change`).
+    - Controles de transporte (play/pausa/stop, slider, velocidad, atajos de
+      teclado) y exportación a fichero.
+
+DEPENDENCIAS
+    - api_client (singleton): GET recordings/timeline (segmentos del día),
+      GET events/ (marcas de eventos sobre el timeline), get_stream_token()
+      (token go2rtc para autorizar la descarga del clip).
+    - playback_service (singleton): descarga el clip y controla el player VLC;
+      expone señales (state_changed, position_changed, time_changed, ended,
+      error, download_progress/finished/error) y métodos play_recording / stop /
+      set_lens / seek. Es la capa que realmente toca VLC.
+    - Componentes UI: TimelineWidget, VideoPlayerWidget, GlassCard, HelpButton,
+      icons.icon.
+    - models.recording.RecordingSegment / TimelineDay (DTOs locales del JSON).
+
+COMPONENTES RELACIONADOS
+    main_window la instancia (índice VIEW_PLAYBACK=3 del content_stack) e inyecta
+    las cámaras con `set_cameras`. El salto evento→reproducción llega vía
+    `MainWindow._on_jump_to_playback` → `jump_to_time`. events_view es el origen
+    de ese salto (emite `jump_to_playback`).
+
+PUNTO DE ENTRADA (en la app)
+    Sidebar «Reproducción» → MainWindow._switch_view(VIEW_PLAYBACK). O bien desde
+    un evento: events_view.jump_to_playback → MainWindow → jump_to_time().
+
+PIPELINE(S)
+    #14 Reproducción: timeline (backend) → segmentos → playback_service descarga
+    el clip → VideoPlayerWidget lo pinta con VLC → encadenado continuo de
+    segmentos. (Auth #2 subyace: todas las peticiones van con JWT.)
+================================================================================
 """
 import logging
 import os  # ← FALTABA ESTA IMPORTACIÓN
@@ -25,8 +77,32 @@ logger = logging.getLogger(__name__)
 
 
 class PlaybackView(QWidget):
-    """Vista de reproducción de grabaciones."""
-    
+    """Vista de reproducción histórica de grabaciones (Pipeline #14).
+
+    RESPONSABILIDAD / ROL
+        Página del content_stack que enlaza timeline + reproductor VLC +
+        playback_service para recorrer las grabaciones de un día, con
+        reproducción continua, salto a evento y recorte de lente dual.
+
+    QUIÉN LA INSTANCIA
+        main_window (índice VIEW_PLAYBACK=3). Recibe las cámaras por
+        `set_cameras` y los saltos desde evento por `jump_to_time`.
+
+    SEÑALES QT
+        No define señales propias (es un sumidero). CONSUME las del
+        `playback_service.get_player()` (state_changed, position_changed,
+        time_changed, ended, error) y las de descarga del propio servicio
+        (download_progress/finished/error), además de
+        `TimelineWidget.segment_clicked`.
+
+    ESTADO CLAVE
+        - current_camera_id / current_date: contexto del timeline cargado.
+        - segments: lista de RecordingSegment del día (orden cronológico).
+        - _current_segment_index: segmento en reproducción (para encadenar).
+        - _lens ("full"|"l1"|"l2") + _cam_dual: estado del recorte dual-lens.
+        - _pending_seek / _pending_jump_dt: seek diferido al cargar (eventos).
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         
@@ -202,11 +278,11 @@ class PlaybackView(QWidget):
         # Controles de playback
         playback_controls = QHBoxLayout()
         
-        self.btn_play = QPushButton("  Play")
+        self.btn_play = QPushButton("  Reproducir")
         self.btn_play.setIcon(icon("play"))
-        self.btn_pause = QPushButton("  Pause")
+        self.btn_pause = QPushButton("  Pausar")
         self.btn_pause.setIcon(icon("pause"))
-        self.btn_stop = QPushButton("  Stop")
+        self.btn_stop = QPushButton("  Detener")
         self.btn_stop.setIcon(icon("stop"))
         
         for btn in [self.btn_play, self.btn_pause, self.btn_stop]:
@@ -293,7 +369,12 @@ class PlaybackView(QWidget):
         playback_service.download_error.connect(self._on_download_error)
     
     def set_cameras(self, cameras: list):
-        """Carga lista de cámaras."""
+        """Rellena el selector de cámaras y memoriza cuáles son dual-lens.
+
+        Inputs: `cameras` (lista de DTOs Camera con id, name, is_dual_lens).
+        Outputs: combo de cámaras poblado; `_cam_dual` mapea id→bool.
+        Llamado por: MainWindow._load_cameras (tras login y tras editar cámaras).
+        """
         self.cmb_camera.clear()
         self._cam_dual.clear()
         for cam in cameras:
@@ -331,7 +412,16 @@ class PlaybackView(QWidget):
         playback_service.set_lens(self._lens_param())
     
     def _load_timeline(self):
-        """Carga timeline desde backend."""
+        """Carga el timeline del día seleccionado y lo pinta.
+
+        Propósito: pedir los segmentos de (cámara, fecha) al backend, ordenarlos
+        cronológicamente, dibujarlos en el TimelineWidget y, si veníamos de un
+        evento, disparar el seek pendiente.
+        Outputs: `self.segments` poblado; timeline actualizado; estado en label.
+        Señales: ninguna; usa callbacks async del api_client.
+        Llamado por: botón «Cargar Timeline» y `jump_to_time`.
+        Llama a: GET recordings/timeline?camera_id&date y `_load_event_markers`.
+        """
         camera_id = self.cmb_camera.currentData()
         if not camera_id:
             return
@@ -344,19 +434,32 @@ class PlaybackView(QWidget):
         
         def on_timeline(response):
             if response.success:
-                segments_data = response.data.get("segments", [])
-                self.segments = [
-                    RecordingSegment(
-                        recording_id=s["recording_id"],
-                        camera_id=camera_id,
-                        start=datetime.fromisoformat(s["start"]),
-                        end=datetime.fromisoformat(s["end"]) if s["end"] else None,
-                        duration_seconds=s["duration_seconds"],
-                        file_size_mb=s["file_size_mb"],
-                        has_clip=s["has_clip"]
-                    ) for s in segments_data
-                ]
-                
+                segments_data = (response.data or {}).get("segments", []) or []
+                # Construcción TOLERANTE: si un segmento llega incompleto o con
+                # una fecha mal formada, se omite ese segmento en vez de romper
+                # toda la carga del timeline.
+                parsed = []
+                for s in segments_data:
+                    try:
+                        if not isinstance(s, dict):
+                            continue
+                        start_raw = s.get("start")
+                        if not start_raw:
+                            continue  # sin inicio no se puede ubicar en la línea
+                        end_raw = s.get("end")
+                        parsed.append(RecordingSegment(
+                            recording_id=s.get("recording_id"),
+                            camera_id=camera_id,
+                            start=datetime.fromisoformat(start_raw),
+                            end=datetime.fromisoformat(end_raw) if end_raw else None,
+                            duration_seconds=int(s.get("duration_seconds") or 0),
+                            file_size_mb=float(s.get("file_size_mb") or 0),
+                            has_clip=bool(s.get("has_clip", False)),
+                        ))
+                    except (ValueError, TypeError, KeyError) as e:
+                        logger.warning(f"Segmento de grabación ignorado (datos inválidos): {e}")
+                self.segments = parsed
+
                 # Orden cronológico para que la reproducción continua avance
                 # del segmento más antiguo al más reciente.
                 self.segments.sort(key=lambda s: s.start)
@@ -460,8 +563,16 @@ class PlaybackView(QWidget):
         self._play_segment_index(target_idx, seek_seconds=offset)
 
     def _play_segment_index(self, idx: int, seek_seconds: float = 0.0):
-        """Reproduce el segmento `idx` de self.segments (descarga + play).
-        seek_seconds: posición a la que saltar al cargar (para eventos)."""
+        """Descarga y reproduce el segmento `idx` (núcleo de la reproducción).
+
+        Inputs: `idx` (posición en self.segments), `seek_seconds` (posición a la
+        que saltar al cargar; usado al venir de un evento).
+        Outputs: fija `_current_segment_index` y `_pending_seek`; muestra progreso.
+        Llamado por: `_on_play_clicked`, `_on_segment_click`, `_on_playback_ended`
+        (encadenado) y `_seek_to_pending_event`.
+        Llama a: `playback_service.play_recording(recording_id, base_url, token,
+        lens=...)` — el servicio descarga el clip y arranca VLC.
+        """
         if not (0 <= idx < len(self.segments)):
             return
         self._current_segment_index = idx
@@ -515,10 +626,16 @@ class PlaybackView(QWidget):
             self.lbl_status.setText("Reproduciendo…")
 
     def jump_to_time(self, camera_id: int, when: datetime):
-        """
-        "Ver en playback" desde un evento: selecciona la cámara, carga el
-        timeline de ESE día y reproduce el segmento que contiene el instante
-        `when`, saltando al segundo exacto del evento.
+        """Punto de entrada del salto evento→reproducción (Pipeline #14).
+
+        Propósito: dado un evento, posicionar la reproducción en su instante
+        exacto. Selecciona la cámara, fija la fecha del evento, recuerda el
+        instante (`_pending_jump_dt`) y carga el timeline; al llegar los
+        segmentos, `_seek_to_pending_event` localiza el segmento y hace seek.
+        Inputs: `camera_id`, `when` (datetime del evento).
+        Llamado por: `MainWindow._on_jump_to_playback` (diferido 200ms), que a su
+        vez responde a `events_view.jump_to_playback`.
+        Llama a: `_load_timeline`.
         """
         # Seleccionar cámara
         for i in range(self.cmb_camera.count()):

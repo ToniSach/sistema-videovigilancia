@@ -45,6 +45,7 @@
             app:iconTint="@color/accent_cyan" />
     </LinearLayout>
 
+
     <!-- Selector de lente (solo cámaras dual-lens). El recorte se hace en el
          reproductor (client-side), sin coste de servidor. -->
     <com.google.android.material.button.MaterialButtonToggleGroup

@@ -1,13 +1,70 @@
 """
-Ventana principal de la aplicación NVR.
+================================================================================
+MÓDULO: ui.main_window — Shell raíz de la UI del cliente desktop (PySide6)
+================================================================================
 
-Layout:
-  [ Sidebar ] | [ Stack de vistas según opción seleccionada ]
+PROPÓSITO
+    Contenedor raíz de toda la interfaz: orquesta el ciclo login → app → logout,
+    construye la barra de navegación lateral y el QStackedWidget con TODAS las
+    vistas, y reacciona a la expiración de sesión devolviendo al usuario al
+    login. Es la única QMainWindow de la app; la instancia main.py tras aplicar
+    el tema global.
 
-Sidebar agrupa las opciones en secciones:
-  📡 MONITOREO       En vivo · Eventos · Reproducción
-  ⚙ CONFIGURACIÓN    Cámaras · Notificaciones · Sistema
-  👥 ADMINISTRACIÓN  Usuarios · Permisos
+RESPONSABILIDAD
+    - Mantener DOS niveles de stack:
+        * `self.stack` (nivel externo): índice 0 = login_view, índice 1 = app.
+        * `self.content_stack` (nivel interno, dentro de la vista de app): una
+          página por cada pantalla (live, eventos, playback, cámaras, …).
+    - Reaccionar a la expiración de sesión: el api_client emite `auth_error`
+      cuando el refresh del token falla. Esa señal la escucha login_view (no
+      esta ventana) para mostrar "Sesión expirada"; el retorno efectivo al
+      login lo provoca el usuario (logout) o un re-login desde esa pantalla.
+      MainWindow, por su parte, escucha `request_error` para feedback de fallos
+      transitorios en la barra de estado.
+    - Instanciar una sola vez cada vista y conectar sus señales Qt a los hooks
+      de navegación de esta ventana (p.ej. saltar de un evento a su playback).
+    - Conmutar entre vistas (`_switch_view`) y mantener el botón de sidebar
+      "checked" coherente con la página visible.
+    - Aplicar control de acceso por rol en la UI: ocultar/mostrar las opciones
+      "admin_only" tras autenticarse.
+    - Limpiar recursos pesados (VLC, QPixmaps GPU, workers del thread pool) al
+      cerrar sesión para evitar fugas en ciclos login/logout repetidos.
+
+ROL EN LA NAVEGACIÓN
+    Es el ENRUTADOR de la app: las vistas no se conocen entre sí; emiten señales
+    (p.ej. `jump_to_playback`, `ptz_requested`) que esta ventana traduce en
+    cambios de página del content_stack. Las constantes VIEW_* son los índices
+    canónicos de ese stack y DEBEN coincidir con el orden de inserción en
+    `_create_main_view`.
+
+DEPENDENCIAS
+    - services/api_client.py (singleton): toda la I/O REST + señal
+      `request_error` (errores de red/HTTP → statusbar). El logout limpia
+      tokens aquí y vacía el QThreadPool global de respuestas pendientes.
+    - ui/views/* : todas las pantallas que se montan en el content_stack.
+    - ui/components/glass_card.GlassCard : superficie de la sidebar.
+    - ui/icons.icon : iconos de los botones de navegación.
+    - models/user.User , models/camera.Camera : DTOs locales del backend.
+    - config : paleta de tema (THEME_*) usada en los QSS inline de la sidebar.
+
+COMPONENTES RELACIONADOS
+    main.py la crea y la muestra. login_view emite `login_successful`; el resto
+    de vistas emiten las señales que se cablean en `_create_main_view`. Los
+    diálogos (onboarding_wizard, qr_link_dialog) se abren bajo demanda.
+
+PUNTO DE ENTRADA
+    `MainWindow()` (desde main.py) → `__init__` arranca en login. El flujo real
+    empieza en `_on_login_success` cuando login_view confirma credenciales.
+
+LAYOUT
+    [ Sidebar (240px) ] | [ content_stack con la vista activa ]
+
+    La sidebar agrupa la navegación en secciones:
+      MONITOREO       Inicio · En vivo · Eventos · Reproducción
+      CONFIGURACIÓN   Cámaras · Notificaciones · Sistema
+      ADMINISTRACIÓN  Usuarios · Permisos · Dispositivos Telegram · Ajustes
+                      (sección visible solo para el rol admin)
+================================================================================
 """
 import logging
 from typing import Optional
@@ -49,7 +106,10 @@ from desktop_app.src.ui.components.glass_card import GlassCard
 logger = logging.getLogger(__name__)
 
 
-# Índices del stack de vistas (deben coincidir con el orden en _create_main_view)
+# Índices canónicos del content_stack. Son el "mapa de rutas" de la app: cada
+# constante es la página a la que navega un botón de sidebar o un hook de vista.
+# CRÍTICO: el valor de cada constante DEBE coincidir con el orden en que la
+# vista se añade en _create_main_view (el comentario "# N" de cada addWidget).
 VIEW_LIVE = 0
 VIEW_CONTROL = 1  # vista dedicada de una cámara (no aparece en sidebar)
 VIEW_EVENTS = 2
@@ -65,12 +125,40 @@ VIEW_TELEGRAM_DEVICES = 11  # tabla de dispositivos Telegram (solo admin)
 
 
 class MainWindow(QMainWindow):
-    """Ventana principal del sistema NVR."""
+    """
+    Ventana principal y enrutador de la UI del cliente NVR.
+
+    RESPONSABILIDAD / ROL
+        Shell que aloja el login y, una vez autenticado, la app completa
+        (sidebar + content_stack). Centraliza la navegación entre vistas y la
+        gestión de sesión (login/logout/expiración).
+
+    QUIÉN LA INSTANCIA / CONSUME
+        La crea `main()` en main.py (única instancia). No la consume nadie más;
+        es la cima del árbol de widgets.
+
+    SEÑALES QT
+        - Escucha `login_view.login_successful(dict)` → `_on_login_success`.
+        - Escucha `api_client.request_error(str)` → `_on_api_error` (muestra el
+          error en la barra de estado). La señal de expiración de sesión
+          (`api_client.auth_error`, tras un refresh fallido) la escucha
+          login_view, no esta ventana; `show_login` es el punto de retorno
+          común a login para logout y re-autenticación.
+        - Escucha las señales de cada vista cableadas en `_create_main_view`
+          (p.ej. `events_view.jump_to_playback`, `live_view.ptz_requested`,
+          `camera_control_view.back_requested`, las `dashboard_view.open_*`).
+        - No define señales propias: actúa como sumidero/enrutador.
+
+    ESTADO
+        - `current_user`: User del login (rol → gating admin de la sidebar).
+        - `cameras`: lista de Camera cacheada; se reparte a live/playback.
+        - `_nav_buttons`: {índice_vista: QPushButton} para sincronizar "checked".
+    """
 
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("NVR VMS Professional")
+        self.setWindowTitle("Sistema de videovigilancia")
         self.setMinimumSize(1280, 720)
         self.resize(1600, 900)
 
@@ -107,6 +195,14 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.main_view)
 
     def _create_main_view(self):
+        """Construye la página de "app" (índice 1 de self.stack): sidebar +
+        content_stack con todas las vistas instanciadas una sola vez.
+
+        Aquí se realiza el CABLEADO de navegación: cada vista emite señales y se
+        conectan a los hooks de esta ventana (saltar a control de cámara, a
+        playback de un evento, volver atrás, abrir páginas del dashboard…). El
+        ORDEN de los addWidget es contractual: fija los índices VIEW_* (ver los
+        comentarios "# N"). Llamado una vez desde `_setup_ui`."""
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -189,10 +285,11 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 16, 12, 12)
 
         # Logo
-        lbl_logo = QLabel("NVR VMS")
+        lbl_logo = QLabel("Sistema de videovigilancia")
+        lbl_logo.setWordWrap(True)
         lbl_logo.setStyleSheet(f"""
             color: {config.THEME_ACCENT};
-            font-size: 20px;
+            font-size: 18px;
             font-weight: bold;
             padding: 4px 8px;
         """)
@@ -291,6 +388,13 @@ class MainWindow(QMainWindow):
     def _add_nav(self, layout: QVBoxLayout, text: str, view_index: int,
                  active: bool = False, admin_only: bool = False,
                  icon_name: str = None):
+        """Crea un botón de navegación de la sidebar y lo registra.
+
+        El botón es "checkable" (se ilumina la página activa) y al pulsarlo
+        llama a `_switch_view(view_index)`. Si `admin_only`, marca la propiedad
+        Qt "admin_only" y nace oculto: `_on_login_success` lo revela solo si el
+        usuario es admin. Guarda el botón en `_nav_buttons[view_index]` para que
+        `_switch_view` pueda sincronizar el estado "checked"."""
         btn = QPushButton("  " + text if icon_name else text)
         if icon_name:
             btn.setIcon(icon(icon_name))
@@ -364,18 +468,43 @@ class MainWindow(QMainWindow):
         self.statusbar.showMessage("Listo")
 
     def _connect_signals(self):
+        """Suscribe la ventana a los errores generales del cliente HTTP.
+        `api_client.request_error(str)` se emite ante fallos de red/HTTP no
+        atados a la sesión; se enruta a `_on_api_error`, que los muestra en la
+        barra de estado. La señal de sesión expirada (`auth_error`) la consume
+        login_view, no esta ventana."""
         api_client.request_error.connect(self._on_api_error)
 
     # ------------------------------------------------------------------
     # Login / Logout
     # ------------------------------------------------------------------
     def show_login(self):
+        """Vuelve a la pantalla de login (índice 0 del stack externo).
+
+        Es el punto de retorno tras un logout o una expiración de sesión:
+        resetea el formulario de login, oculta el menú y la barra de estado
+        (no procede sin sesión) y muestra la vista de login. NO toca tokens —
+        eso es responsabilidad de `_logout`/api_client. Llamado por `__init__`
+        (arranque) y `_logout`."""
         self.stack.setCurrentIndex(0)
         self.login_view.reset()
         self.menuBar().setVisible(False)
         self.statusbar.setVisible(False)
 
     def _on_login_success(self, user_data: dict):
+        """Slot del éxito de login: arranca la app autenticada.
+
+        Propósito: materializar el usuario, aplicar gating por rol en la
+        sidebar, inicializar las vistas que dependen del rol, cargar las
+        cámaras y conmutar del login a la app mostrando el Dashboard.
+
+        Inputs: `user_data` (dict del backend con id/username/role/
+        accessible_cameras), emitido por `login_view.login_successful`.
+
+        Señales: conectado a `LoginView.login_successful`.
+        Llama a: `_load_cameras`, `_switch_view(VIEW_DASHBOARD)`, y de forma
+        diferida (QTimer) al onboarding y a `_maybe_prompt_recordings_path`.
+        Efectos: pasa `self.stack` al índice 1 (app) y revela menú/statusbar."""
         role = user_data.get("role", "user")
         self.current_user = User(
             id=user_data.get("id"),
@@ -519,6 +648,20 @@ class MainWindow(QMainWindow):
             )
 
     def _logout(self):
+        """Cierra la sesión de forma ordenada y vuelve al login.
+
+        Secuencia (orden importante para evitar fugas y callbacks huérfanos):
+          1. Confirma con el usuario.
+          2. Destruye los widgets de live_view → para VLC y libera QPixmaps de
+             GPU (sin esto, login/logout repetidos hacían crecer la VRAM).
+          3. Vacía el QThreadPool global del api_client (cancela pendientes,
+             espera ≤2s a los activos) ANTES de invalidar el token: así ninguna
+             respuesta tardía toca widgets ya destruidos.
+          4. Limpia los tokens (`api_client.clear_tokens`) y muestra el login.
+
+        Llamado por: botón "Cerrar sesión" de la sidebar. Llama a:
+        `live_view._destroy_all_widgets`, `api_client.clear_tokens`,
+        `show_login`."""
         ans = QMessageBox.question(
             self, "Cerrar sesión", "¿Seguro que quieres cerrar la sesión?"
         )
@@ -550,6 +693,14 @@ class MainWindow(QMainWindow):
     # Datos
     # ------------------------------------------------------------------
     def _load_cameras(self):
+        """Pide la lista de cámaras al backend y la reparte a las vistas.
+
+        Async: `api_client.get("cameras/", …)` ejecuta en el QThreadPool y el
+        callback `on_cameras` corre en el hilo de UI. Cachea las cámaras en
+        `self.cameras` (DTOs Camera tolerantes a campos extra del backend) y las
+        inyecta en live_view (con un token de stream de go2rtc) y playback_view.
+        Llamado por: `_on_login_success` y `_reload_cameras` (tras editar
+        cámaras en CameraManagementView)."""
         def on_cameras(response):
             if not response.success:
                 logger.warning(f"No se pudieron cargar cámaras: {response.error}")
@@ -571,6 +722,15 @@ class MainWindow(QMainWindow):
     # Navegación
     # ------------------------------------------------------------------
     def _switch_view(self, index: int):
+        """Conmuta la página visible del content_stack (núcleo de la navegación).
+
+        Inputs: `index` = una constante VIEW_*. Efectos: si se entra a LIVE,
+        reinicia el grid de streams con un token fresco de go2rtc; sincroniza el
+        estado "checked" de los botones de sidebar; y pone el content_stack en
+        esa página. Llamado por: todos los botones de navegación, los hooks de
+        vista (`_open_camera_control`, `_on_jump_to_playback`) y los `open_*` del
+        dashboard. No detiene el directo al salir: cada vista cachea su player en
+        su hideEvent (go2rtc multiplexa una sola conexión por cámara)."""
         # El directo lo gestiona cada vista con VLC (go2rtc). Al salir del live
         # view, su hideEvent mantiene los players en cache (go2rtc multiplexa
         # una sola conexión a la cámara, así que no penaliza). No hace falta
@@ -612,8 +772,13 @@ class MainWindow(QMainWindow):
         self._switch_view(VIEW_CONTROL)
 
     def _on_jump_to_playback(self, camera_id: int, timestamp):
-        """Doble-click/«ver en playback» en un evento → abre playback en esa
-        cámara, carga el día del evento y salta al segundo exacto del evento."""
+        """Hook: ir de un evento a su reproducción exacta.
+
+        Slot de `events_view.jump_to_playback(camera_id, timestamp)`. Conmuta a
+        la vista de reproducción y, diferido 200ms (para que la vista ya esté
+        visible antes del seek), pide a playback_view cargar la cámara/día y
+        saltar al segundo del evento. Llama a: `_switch_view(VIEW_PLAYBACK)`,
+        `playback_view.jump_to_time`."""
         self._switch_view(VIEW_PLAYBACK)
         # Deferir un poco para que la vista esté visible antes de cargar/seek.
         QTimer.singleShot(
@@ -621,13 +786,17 @@ class MainWindow(QMainWindow):
         )
 
     def _on_api_error(self, error: str):
+        """Slot de `api_client.request_error`: muestra el fallo HTTP/red en la
+        barra de estado durante 5s. Feedback global no intrusivo de errores
+        transitorios. La expiración de sesión (refresh fallido) viaja por la
+        señal `auth_error`, que escucha login_view, no este slot."""
         self.statusbar.showMessage(f"Error: {error}", 5000)
 
     def _show_about(self):
         QMessageBox.about(
             self, "Acerca de",
-            "<b>NVR VMS Professional v2.0</b><br>"
-            "Sistema de Videovigilancia profesional<br>"
+            "<b>Sistema de videovigilancia v2.0</b><br>"
+            "Videovigilancia profesional<br>"
             "para redes LAN.<br><br>"
             "<i>Soporta cámaras ONVIF, detección de objetos por IA, "
             "PTZ, audio bidireccional, grabación continua "

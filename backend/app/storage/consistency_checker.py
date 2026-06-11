@@ -1,6 +1,53 @@
 """
-Storage Consistency Checker - Reconciliación entre base de datos y filesystem.
-Ejecuta jobs periódicos para detectar y limpiar inconsistencias.
+================================================================================
+MÓDULO: consistency_checker — Reconciliación filesystem ↔ base de datos
+================================================================================
+
+PROPÓSITO
+    Garantizar la coherencia entre lo que dice la BD (tabla `recordings`) y lo
+    que hay realmente en disco. Detecta y opcionalmente limpia dos clases de
+    inconsistencia que aparecen tras crashes, borrados manuales o fallos de
+    escritura:
+      - REGISTROS HUÉRFANOS: filas en BD cuyo archivo físico ya no existe.
+      - ARCHIVOS HUÉRFANOS: archivos en disco sin fila en BD (no indexados).
+
+RESPONSABILIDAD PRINCIPAL
+    Ejecutar un job periódico (cada 24 h) que recorre la BD en lotes y el árbol
+    de grabaciones, reportando estadísticas y, si AUTO_CLEANUP está activo,
+    eliminando los huérfanos de ambos lados.
+
+DEPENDENCIAS IMPORTANTES
+    db_manager ............... sesiones de BD (consulta/borrado en lotes)
+    Recording (modelo) ....... tabla de grabaciones
+    RecordingRepository ...... acceso a grabaciones
+    settings ................. RECORDINGS_PATH (raíz del árbol a escanear)
+
+COMPONENTES RELACIONADOS
+    - RecordingManager produce los archivos/filas que aquí se reconcilian.
+    - StorageManager borra por CUOTA (LRU); este borra por INCONSISTENCIA. Son
+      complementarios y no se solapan: StorageManager hace borrado atómico que
+      deja todo coherente; este recoge los casos que se descoordinaron.
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    Instancia GLOBAL a nivel de módulo (`consistency_checker`). main.py la
+    arranca (start) en el arranque y la detiene (stop) en el apagado. No es
+    singleton `__new__`, pero el módulo expone una única instancia compartida.
+
+PIPELINE Y ETAPA
+    #11 Grabación — fase de MANTENIMIENTO/integridad: corre en paralelo, no
+    participa en captura/clips; sanea el almacenamiento que aquéllos generan.
+
+FLUJO DE RECONCILIACIÓN (ASCII)
+    _check_loop (cada 24 h)
+         │
+         ▼
+    run_check():
+       (1) BD en lotes ─▶ ¿file_path existe en disco?  no ─▶ huérfano BD ─▶ delete fila
+       (2) walk(RECORDINGS_PATH) ─▶ ¿path está en BD?  no ─▶ huérfano FS ─▶ remove archivo
+         │
+         ▼
+       stats {orphan_records, orphan_files, cleaned_*, errors}
+================================================================================
 """
 import os
 import threading
@@ -19,12 +66,30 @@ logger = logging.getLogger(__name__)
 
 class ConsistencyChecker:
     """
-    Verifica periódicamente la integridad del almacenamiento:
-    - Registros en BD sin archivo físico (huérfanos)
-    - Archivos físicos sin registro en BD (no indexados)
-    Opcionalmente limpia automáticamente.
+    Verificador periódico de integridad del almacenamiento (mantenimiento #11).
+
+    ROL
+        Reconciliar BD ↔ filesystem: detectar registros sin archivo y archivos
+        sin registro, y (si AUTO_CLEANUP) limpiarlos. Procesa la BD en LOTES
+        (BATCH_SIZE) con commit por lote para no mantener una transacción larga
+        que bloquee writes concurrentes.
+
+    QUIÉN LO INSTANCIA / CONSUME
+        - Instancia GLOBAL del módulo (`consistency_checker`), arrancada y
+          detenida por main.py. No es singleton `__new__`; la unicidad la da
+          el módulo (una sola instancia importable).
+        - Consumido por main.py (start/stop) y potencialmente por rutas que
+          pidan get_stats().
+
+    DEPENDENCIAS
+        db_manager (sesiones), Recording (tabla), RecordingRepository,
+        settings.RECORDINGS_PATH.
+
+    CONCURRENCIA
+        _stop_event (Event) permite despertar el hilo al instante en shutdown
+        (antes había que esperar hasta 24 h al próximo CHECK_INTERVAL).
     """
-    
+
     CHECK_INTERVAL = 86400  # 24 horas
     AUTO_CLEANUP = True      # Si True, elimina registros huérfanos y archivos no indexados
     BATCH_SIZE = 200         # Procesar registros en lotes para no bloquear BD
@@ -44,7 +109,11 @@ class ConsistencyChecker:
         return self._thread is not None and not self._stop_event.is_set()
 
     def start(self):
-        """Inicia el checker en segundo plano."""
+        """
+        Arranca el hilo daemon de verificación periódica (idempotente).
+
+        Llamado por: main.py en el arranque. Llama a: crea el hilo _check_loop.
+        """
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
@@ -53,6 +122,8 @@ class ConsistencyChecker:
         logger.info("ConsistencyChecker iniciado")
 
     def stop(self):
+        """Detiene el hilo despertándolo al instante (set del Event) y hace
+        join. Llamado por main.py en el apagado ordenado."""
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
@@ -70,8 +141,19 @@ class ConsistencyChecker:
     
     def run_check(self) -> dict:
         """
-        Ejecuta una verificación completa.
-        Retorna estadísticas de lo encontrado.
+        Ejecuta UNA verificación completa de consistencia (mantenimiento #11).
+
+        Propósito: (1) recorrer la BD en lotes y marcar/borrar registros cuyo
+            archivo no existe; (2) recorrer el árbol de grabaciones y
+            marcar/borrar archivos (.mp4/.ts/.m3u8) sin fila en BD. Salta los
+            temporales `.deleting` (en proceso por StorageManager). El borrado
+            sólo ocurre si AUTO_CLEANUP está activo.
+        Inputs: ninguno (lee estado de BD y FS).
+        Outputs: dict de estadísticas (orphan_records, orphan_files,
+            cleaned_records, cleaned_files, errors).
+        Excepciones: capturadas por bloque; incrementa stats["errors"] y sigue.
+        Llamado por: _check_loop() (periódico) y get_stats() (modo solo lectura).
+        Llama a: db_manager.get_session(), os.walk(), session.delete()/os.remove().
         """
         logger.info("Iniciando consistency check de almacenamiento...")
         
@@ -166,7 +248,17 @@ class ConsistencyChecker:
         return stats
     
     def get_stats(self) -> dict:
-        """Retorna estadísticas actuales (última ejecución o en tiempo real)."""
+        """
+        Devuelve estadísticas de consistencia SIN limpiar (modo solo lectura).
+
+        Propósito: ejecutar run_check() desactivando temporalmente AUTO_CLEANUP
+            para reportar inconsistencias sin tocar BD ni disco. Protegido por
+            _lock para no solapar con el job periódico.
+        Inputs: ninguno.
+        Outputs: dict de estadísticas (igual estructura que run_check()).
+        Llamado por: rutas/diagnóstico que quieran el estado actual.
+        Llama a: run_check() con AUTO_CLEANUP=False temporal.
+        """
         # Podría almacenar último resultado, por simplicidad ejecutamos un check rápido
         # (sin limpieza) para reportar.
         with self._lock:

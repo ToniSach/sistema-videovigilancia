@@ -1,3 +1,49 @@
+"""
+================================================================================
+MÓDULO: api.routes.events — Blueprint REST de eventos y snapshots
+================================================================================
+
+PROPÓSITO
+    Capa HTTP del Pipeline #10 (Eventos). Lista los eventos detectados (IA,
+    movimiento, cámara offline...), permite verlos en detalle,
+    reconocerlos (acknowledge), consultar estadísticas y descargar el snapshot
+    JPEG asociado a cada evento.
+
+RESPONSABILIDAD
+    Contrato HTTP de lectura/consulta de eventos. La GENERACIÓN de eventos NO
+    ocurre aquí: los workers (IA/movimiento/FFmpeg) publican EventData en
+    EventManager, y EventService los persiste en BD. Este blueprint solo los
+    expone de vuelta a los clientes.
+
+DEPENDENCIAS
+    services.event_service.EventService (vía DI; fallback a instancia nueva si el
+        contenedor no inicializó) → get_events/acknowledge_event/get_stats.
+    database.repositories.event_repository.EventRepository → get_by_id.
+    services.permission_service.PermissionService → check_permission para el
+        snapshot (autorización por cámara del evento).
+    config.settings.RECORDINGS_PATH → raíz permitida para servir snapshots.
+
+SEGURIDAD DEL SNAPSHOT (FIX F0.4 / F0.5)
+    get_event_snapshot valida (a) permiso 'view' sobre la cámara del evento y
+    (b) que el path resuelto del snapshot caiga DENTRO de RECORDINGS_PATH/snapshots
+    (pathlib.resolve + startswith), bloqueando path traversal y symlinks que
+    escapen del área permitida.
+
+PUNTO DE ENTRADA
+    Registrado en main.register_blueprints() como "events_bp". url_prefix=
+    /api/v1/events. get_events está EXENTO del rate limiter (polling de la UI).
+
+PIPELINE(S)
+    #10 Eventos — listado, detalle, acknowledge, stats, snapshot.
+
+ENDPOINTS DEL BLUEPRINT
+    GET   /                       → lista de eventos (filtros)            [JWT]
+    GET   /<event_id>             → detalle de un evento                  [JWT]
+    PATCH /<event_id>/acknowledge → marca el evento como reconocido       [JWT]
+    GET   /stats                  → estadísticas agregadas                [JWT]
+    GET   /<event_id>/snapshot    → JPEG del evento (permiso por cámara)  [JWT]
+================================================================================
+"""
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
@@ -32,6 +78,20 @@ def get_event_service():
 @events_bp.route("/", methods=["GET"])
 @jwt_required()
 def get_events():
+    """
+    Propósito: lista de eventos detectados, con filtros (Pipeline #10, consulta).
+        Lo poletea la UI (exento del rate limiter).
+    Método+Ruta: GET /api/v1/events/
+    Inputs (query):
+        camera_id?: int — filtra por cámara.
+        event_type?: str — person|vehicle|motion|... .
+        hours?: int (def 24) — ventana hacia atrás.
+        limit?: int (def 50). Permiso: @jwt_required().
+    Outputs:
+        200 → {"success": true, "data": [<evento>...], "count": int}.
+        500 → {"success": false, "error": <str(e)>}.
+    Llama a: EventService.get_events(camera_id, event_type, hours, limit).
+    """
     try:
         camera_id = request.args.get("camera_id", type=int)
         event_type = request.args.get("event_type", type=str)
@@ -62,6 +122,18 @@ def get_events():
 @events_bp.route("/<int:event_id>", methods=["GET"])
 @jwt_required()
 def get_event(event_id):
+    """
+    Propósito: detalle de UN evento (Pipeline #10).
+    Método+Ruta: GET /api/v1/events/<event_id>
+    Inputs: path event_id. Permiso: @jwt_required().
+    Outputs:
+        200 → {"success": true, "data": event.to_dict()}.
+        404 → evento no encontrado.
+        500 → {"success": false, "error": <str(e)>}.
+    Llama a: EventRepository.get_by_id().
+    Nota: NO revalida permiso por cámara (solo el snapshot lo hace); el detalle
+        textual se considera de baja sensibilidad.
+    """
     try:
         event_repo = EventRepository()
         event = event_repo.get_by_id(event_id)
@@ -87,6 +159,17 @@ def get_event(event_id):
 @events_bp.route("/<int:event_id>/acknowledge", methods=["PATCH"])
 @jwt_required()
 def acknowledge_event(event_id):
+    """
+    Propósito: marca un evento como reconocido/atendido por el operador
+        (Pipeline #10, gestión). Apaga su badge de "no leído" en la UI.
+    Método+Ruta: PATCH /api/v1/events/<event_id>/acknowledge
+    Inputs: path event_id. Permiso: @jwt_required().
+    Outputs:
+        200 → {"success": true, "message": "Evento reconocido"}.
+        400 → no se pudo reconocer (no existe / ya reconocido).
+        500 → {"success": false, "error": <str(e)>}.
+    Llama a: EventService.acknowledge_event(event_id).
+    """
     try:
         service = get_event_service()
         success = service.acknowledge_event(event_id)
@@ -112,6 +195,16 @@ def acknowledge_event(event_id):
 @events_bp.route("/stats", methods=["GET"])
 @jwt_required()
 def get_stats():
+    """
+    Propósito: estadísticas agregadas de eventos (conteos por tipo/cámara para
+        dashboards). Pipeline #10.
+    Método+Ruta: GET /api/v1/events/stats
+    Inputs: ninguno. Permiso: @jwt_required().
+    Outputs:
+        200 → {"success": true, "data": <stats de EventService>}.
+        500 → {"success": false, "error": <str(e)>}.
+    Llama a: EventService.get_stats().
+    """
     try:
         service = get_event_service()
         stats = service.get_stats()
@@ -136,8 +229,22 @@ def get_stats():
 @jwt_required()
 def get_event_snapshot(event_id):
     """
-    Retorna la imagen snapshot asociada a un evento.
-    Valida permisos sobre la cámara del evento y previene path traversal.
+    Propósito: sirve el JPEG snapshot capturado en el instante del evento
+        (Pipeline #10, evidencia visual). Endpoint sensible: aplica doble defensa
+        (permiso por cámara + anti path-traversal).
+    Método+Ruta: GET /api/v1/events/<event_id>/snapshot
+    Inputs: path event_id. Permiso: @jwt_required() + check_permission 'view'
+        sobre event.camera_id.
+    Outputs:
+        200 → image/jpeg (con soporte conditional/ETag).
+        400 → path inválido (OSError/ValueError al resolver).
+        403 → sin permiso 'view', o path fuera de RECORDINGS_PATH/snapshots
+              (traversal o symlink que escapa).
+        404 → evento sin snapshot, o archivo inexistente/no-fichero.
+        500 → error interno.
+    Llama a: EventRepository.get_by_id(), PermissionService.check_permission().
+    Seguridad: resuelve el path con pathlib.resolve() y exige que empiece por
+        (RECORDINGS_PATH/snapshots) resuelto; re-chequea si es symlink.
     """
     try:
         user_id = int(get_jwt_identity())

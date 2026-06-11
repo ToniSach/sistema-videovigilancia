@@ -1,0 +1,30 @@
+classDiagram
+  class cameras {
+  }
+  class audio_controller {
+  }
+  class camera_heuristics {
+  }
+  class camera_manager {
+  }
+  class led_controller {
+  }
+  class onvif_common {
+  }
+  class onvif_discovery {
+  }
+  class onvif_soap {
+  }
+  class ptz_controller {
+  }
+  class time_sync {
+  }
+  cameras --> audio_controller
+  cameras --> led_controller
+  cameras --> ptz_controller
+  audio_controller --> onvif_common
+  camera_manager --> ptz_controller
+  led_controller --> onvif_common
+  onvif_discovery --> onvif_soap
+  ptz_controller --> onvif_common
+  time_sync --> onvif_common

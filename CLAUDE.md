@@ -32,23 +32,24 @@ The backend runs on Flask's built-in server (`app.run`, threaded). It is a
 single-process app by design (see CRITICAL constraint below) — there is no
 Gunicorn/Waitress layer, and adding one is unnecessary for this LAN appliance.
 
-**Docker (Windows & Linux):** `docker compose up -d --build` brings up PostgreSQL +
-the backend (which bundles FFmpeg and the go2rtc binary). See [DOCKER.md](DOCKER.md).
-Uses **bridge networking with published ports** (works on Docker Desktop/Windows,
-not just Linux); set `HOST_LAN_IP` in `.env.docker` for WebRTC ICE. Installs from
-[requirements-backend.txt](requirements-backend.txt) (no PySide6; the desktop GUI
-runs natively). Entry: [Dockerfile](Dockerfile), [docker-compose.yml](docker-compose.yml),
-[docker/entrypoint.sh](docker/entrypoint.sh).
+> Docker and the `backend/tests/` suite were **removed** to ship a clean
+> Windows product. There is no container build anymore.
 
-### Tests
-The canonical test runner is [backend/tests/run_tests.py](backend/tests/run_tests.py) (plain `unittest`, not pytest):
+### Empaquetado a .exe de Windows (producto final)
+The app ships as a single Windows folder with `NVR-VMS.exe`. See
+[packaging/README.md](packaging/README.md). Build it with:
 ```powershell
-python backend/tests/run_tests.py            # all tests
-python backend/tests/run_tests.py -v         # verbose
-python backend/tests/run_tests.py -t TestCircularFrameBuffer            # single class
-python backend/tests/run_tests.py -t TestCircularFrameBuffer.test_clear # single method
+packaging\build.bat        # produce C:\NVR-VMS-build\dist\NVR-VMS\
 ```
-Many other files in `backend/tests/` (`a.py`, `g.py`, `l.py`, `nt.py`, `nvt*.py`, `test-*.py`, `todo.py`, etc.) are **ad-hoc exploration scripts**, not part of the suite — do not assume they run cleanly or represent canonical behavior.
+Key pieces of the frozen build (all **no-ops in development**, gated on `sys.frozen`):
+- [backend/app/runtime.py](backend/app/runtime.py) — writable data dir under
+  `%LOCALAPPDATA%\NVR-VMS`, auto-generated secrets, PATH with bundled binaries,
+  YOLO model copied to a writable dir.
+- [backend/app/database/pg_embedded.py](backend/app/database/pg_embedded.py) —
+  bundled **portable PostgreSQL** (initdb + start/stop on port 5433).
+- [desktop_app/src/launcher.py](desktop_app/src/launcher.py) — `NVR-VMS.exe`
+  entry point: starts `backend/NVR-Backend.exe`, shows a splash, and only opens
+  the GUI once `GET /api/v1/health` returns 200.
 
 ### Database migrations
 PostgreSQL via Alembic. Config at [alembic.ini](alembic.ini), scripts in [backend/app/database/migrations/](backend/app/database/migrations/). Note that [backend/app/main.py:145](backend/app/main.py#L145) also calls `Base.metadata.create_all()` on startup, so a fresh DB will work even without running `alembic upgrade head`.
@@ -124,7 +125,7 @@ Workers (FFmpeg, AI, motion) publish `EventData` to `EventManager.publish(...)`,
 
 - **Do not run multiple backend processes** against the same data dir — see "process-wide singleton state" above.
 - The `env/` directory in the repo root is a checked-in virtualenv. Don't edit anything under it; ignore it for searches.
-- `backend/tests/` mixes the real suite (`run_tests.py`) with one-off scripts. When writing new tests, add classes to `run_tests.py` rather than creating new files unless you're extending the structured suite.
+- There is no automated test suite anymore (`backend/tests/` was removed). Validate changes by running the app (`python backend/app/main.py`) and hitting `/api/v1/health`.
 - Blueprint registration is best-effort — if you add a new route file, verify it loaded by hitting `/api/v1/health` (returns the `blueprints` list).
 - Recordings, snapshots, models (`*.pt`), and the DB are gitignored; the repo contains code only.
 

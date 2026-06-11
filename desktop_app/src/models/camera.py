@@ -1,8 +1,38 @@
 """
-Modelos de datos para cámaras.
+================================================================================
+MÓDULO: desktop_app.models.camera — DTO de cámara (lado cliente)
+================================================================================
 
-Importante: el constructor tolera campos EXTRA que el backend pueda añadir
-en futuras versiones (no rompe el frontend si la API gana columnas).
+PROPÓSITO
+    Definir el DTO `Camera` del cliente (espejo del JSON de /cameras) y el
+    pequeño value-object `PTZCommand`. Es lo que las vistas (dashboard, live,
+    gestión de cámaras) manejan tras pedir cámaras por api_client.
+
+RESPONSABILIDAD
+    - Camera: agrupar identidad/red, URLs de stream (live por go2rtc), flags de
+      capacidades (ptz/leds/audio/ia/dual_lens), estado, datos ONVIF/diagnóstico
+      y los permisos del usuario actual sobre la cámara.
+    - from_dict: construir tolerando campos EXTRA que el backend añada (forward-
+      compatibility: no rompe el cliente si la API gana columnas).
+    - to_dict: serializar el subconjunto editable para PUT/POST al backend.
+    - PTZCommand: dirección + velocidad de un movimiento PTZ.
+
+DEPENDENCIAS
+    - dataclasses, typing, datetime (sin Qt ni backend).
+
+COMPONENTES RELACIONADOS
+    - Las vistas lo construyen con Camera.from_dict(resp.data) sobre la respuesta
+      de api_client. stream_url / stream_url_l1/l2 / stream_urls los rellena el
+      backend cuando GO2RTC_ENABLED=true; rtsp_video.py los reproduce con VLC
+      (pipeline #3 Live), no van por api_client.
+
+PUNTO DE ENTRADA
+    `from desktop_app.src.models.camera import Camera, PTZCommand`.
+
+SINCRONIZACIÓN
+    Mantener en línea con backend/app/database/models.py:Camera (campos y
+    semántica de is_dual_lens, permisos, etc.).
+================================================================================
 """
 from dataclasses import dataclass, field, fields
 from typing import Optional, Dict, Any
@@ -106,6 +136,12 @@ class Camera:
 
 @dataclass
 class PTZCommand:
-    """Comando PTZ."""
+    """
+    NIVEL 2 — DTO de un comando PTZ (pan/tilt/zoom).
+
+    Rol: encapsular un movimiento de cámara que el joystick PTZ envía al backend
+    (que lo traduce a ONVIF). `direction` es uno de up/down/left/right/zoom_in/
+    zoom_out/stop; `speed` ∈ [0,1]. Lo serializa la vista al hacer el POST PTZ.
+    """
     direction: str  # up, down, left, right, zoom_in, zoom_out, stop
     speed: float = 0.5

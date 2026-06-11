@@ -1,0 +1,50 @@
+classDiagram
+  class AIFrameSource {
+    camera_id : int
+    fps : int
+    height : int
+    lens : NoneType
+    quality : str
+    width : int
+    get_latest() Tuple[int, Optional[np.ndarray]]
+    is_alive() bool
+    start() bool
+    stop() None
+  }
+  class AIScheduler {
+    camera_id : int
+    mode : str
+    get_stats() dict
+    reset_cooldown(class_name: str | None) None
+    set_detection_callback(callback: Callable[[int, str, float, object, dict], None]) None
+    set_mode(mode: str) None
+    start(frame_source) None
+    stop() None
+  }
+  class Detection {
+    class_name : str
+    confidence : float
+    x1 : int
+    x2 : int
+    y1 : int
+    y2 : int
+  }
+  class MotionDetector {
+    camera_id : int
+    sensitivity : float
+    detect(frame: np.ndarray) MotionResult
+    reset() None
+  }
+  class MotionResult {
+    has_motion : bool
+    motion_mask : ndarray
+    motion_score : float
+  }
+  class YLOModelPool {
+    CLASSES_OF_INTEREST : dict
+    check_dependencies() tuple[bool, str]
+    detect(frame: np.ndarray, conf: Optional[float]) List[Detection]
+    draw_detections(frame: np.ndarray, detections: List[Detection]) np.ndarray
+    get_stats() dict
+    warmup() None
+  }

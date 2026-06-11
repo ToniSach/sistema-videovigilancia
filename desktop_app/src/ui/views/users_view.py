@@ -1,6 +1,41 @@
 """
-Vista de gestión de usuarios (solo admin).
-CRUD completo + cambio de rol + reset de password.
+================================================================================
+MÓDULO: ui.views.users_view — Gestión de usuarios (CRUD, solo admin)
+================================================================================
+
+PROPÓSITO
+    Pantalla (solo administradores) para administrar las cuentas de usuario del
+    sistema: crear, editar (rol, estado activo, reset de password), eliminar y
+    listar. Es la cara de UI del modelo `User` (admin/user) del backend.
+
+RESPONSABILIDAD
+    - Listar usuarios en una tabla (id, usuario, rol, estado, creado).
+    - Crear/editar usuarios mediante `UserEditDialog` (username read-only al
+      editar; password opcional al editar = "no cambiar").
+    - Eliminar usuarios (con confirmación; impide auto-eliminarse).
+    - Gating de rol: si no es admin, deshabilita acciones y muestra aviso.
+    - Exporta dos estilos QSS COMPARTIDOS (`_TABLE_STYLE`, `_DIALOG_STYLE`) que
+      reutilizan otras vistas admin (permissions, notifications, system,
+      telegram_devices).
+
+DEPENDENCIAS (endpoints consumidos)
+    - GET    users/ ......... lista de usuarios.
+    - POST   users/ ......... crea un usuario.
+    - PUT    users/{id} ..... actualiza rol/estado/password.
+    - DELETE users/{id} ..... elimina un usuario.
+
+COMPONENTES RELACIONADOS
+    main_window la instancia (índice VIEW_USERS=7) y le pasa el usuario actual
+    con `set_current_user` (para gating y para impedir auto-borrado). Usa
+    GlassCard e icons.icon.
+
+PUNTO DE ENTRADA (en la app)
+    Sidebar «Usuarios» (solo admin) → MainWindow._switch_view(VIEW_USERS).
+
+PIPELINE(S)
+    #2 Auth: gestiona las cuentas (`User`) sobre las que opera el login JWT y la
+    autorización; los permisos finos por cámara se editan en permissions_view.
+================================================================================
 """
 import logging
 from typing import Optional, List
@@ -21,7 +56,13 @@ logger = logging.getLogger(__name__)
 
 
 class UserEditDialog(QDialog):
-    """Diálogo para crear o editar un usuario."""
+    """Diálogo modal para crear o editar un usuario.
+
+    ROL: recoge username, password (opcional al editar), rol y estado activo, y
+    los devuelve como dict vía `get_data()`. No habla con el backend; el POST/PUT
+    lo hace UsersView. En modo edición el username es read-only.
+    QUIÉN LO INSTANCIA: UsersView («Nuevo usuario» / «Editar» / doble clic).
+    """
 
     def __init__(self, user: Optional[dict] = None, parent=None):
         super().__init__(parent)
@@ -94,6 +135,8 @@ class UserEditDialog(QDialog):
         self.accept()
 
     def get_data(self) -> dict:
+        """Serializa el formulario (username, role, is_active y password solo si
+        se escribió). Llamado por UsersView._add/_edit al aceptar."""
         data = {
             "username": self.txt_username.text().strip(),
             "role": self.cmb_role.currentText(),
@@ -106,7 +149,24 @@ class UserEditDialog(QDialog):
 
 
 class UsersView(QWidget):
-    """Vista principal de usuarios (admin only)."""
+    """Vista de gestión de usuarios (CRUD, solo admin; Pipeline #2 Auth).
+
+    RESPONSABILIDAD / ROL
+        Página del content_stack que administra las cuentas `User`: tabla +
+        diálogo de alta/edición + borrado, con gating por rol.
+
+    QUIÉN LA INSTANCIA
+        main_window (índice VIEW_USERS=7). Recibe el usuario actual vía
+        `set_current_user` (gating y bloqueo de auto-borrado).
+
+    SEÑALES QT
+        No define señales propias. Reacciona a botones, selección y doble clic;
+        I/O por callbacks async del api_client.
+
+    ESTADO
+        _users: caché de la API. _is_admin: gating. _current_user_id: id propio
+        (para impedir eliminarse a sí mismo).
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -196,6 +256,9 @@ class UsersView(QWidget):
             self.refresh()
 
     def refresh(self):
+        """Recarga la lista de usuarios (GET users/) y repuebla la tabla.
+        Un 403 muestra el aviso de "solo admin". Llamado por: `set_current_user`
+        (si admin), el botón «Refrescar» y tras cada alta/edición/borrado."""
         def on_users(response):
             if not response.success:
                 if response.status_code == 403:
@@ -238,6 +301,8 @@ class UsersView(QWidget):
         return next((u for u in self._users if u.get("id") == uid), None)
 
     def _add(self):
+        """Crea un usuario: abre UserEditDialog y hace POST users/ al aceptar.
+        Recarga la tabla al éxito. Llamado por: botón «Nuevo usuario»."""
         dlg = UserEditDialog(parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
@@ -250,6 +315,9 @@ class UsersView(QWidget):
         api_client.post("users/", on_create, data=dlg.get_data())
 
     def _edit(self):
+        """Edita el usuario seleccionado: abre el diálogo y hace PUT users/{id}.
+        El username no se reenvía (es read-only). Llamado por: botón «Editar» y
+        doble clic en la fila."""
         u = self._selected_user()
         if not u:
             return
@@ -268,6 +336,9 @@ class UsersView(QWidget):
         api_client.put(f"users/{u['id']}", on_update, data=data)
 
     def _delete(self):
+        """Elimina el usuario seleccionado (DELETE users/{id}) con confirmación.
+        Impide auto-eliminarse. Recarga la tabla al éxito. Llamado por: botón
+        «Eliminar»."""
         u = self._selected_user()
         if not u:
             return
@@ -291,7 +362,10 @@ class UsersView(QWidget):
 
 
 # =============================================================================
-# Estilos compartidos (los reuso en otras vistas administrativas)
+# Estilos QSS COMPARTIDOS — fuente única de estilo para las vistas admin.
+# `_TABLE_STYLE` lo importan permissions/notifications/system/telegram_devices
+# (de ahí que esos módulos importen desde users_view); `_DIALOG_STYLE` lo usa el
+# UserEditDialog. Centralizarlos evita divergencias de aspecto entre tablas.
 # =============================================================================
 _TABLE_STYLE = f"""
 QTableWidget {{

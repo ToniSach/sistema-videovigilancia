@@ -24,6 +24,23 @@ Salida (carpeta `telemetry/` por defecto, o TELEMETRY_PATH):
 Activado por defecto (TELEMETRY_ENABLED=true). No interfiere con el Ctrl-C de
 werkzeug (no registra handlers de señal): confía en el flush por fila + atexit +
 el cierre desde main.py.
+
+--------------------------------------------------------------------------------
+FICHA DE MÓDULO (referencia rápida)
+    PROPÓSITO: caja negra de observabilidad del backend en producción; deja un
+        rastro a disco de carga (CPU/RAM), actividad de go2rtc, IA, grabación y
+        executor para diagnosticar problemas a posteriori.
+    RESPONSABILIDAD: muestrear sin bloquear y persistir a prueba de crashes; NO
+        toma decisiones ni altera el sistema (solo observa).
+    DEPENDENCIAS: psutil (CPU/RAM por proceso); urllib (API HTTP de go2rtc);
+        DependencyContainer (ai_service, recording_manager — SOLO si ya construido);
+        core.executor, notifications.ws_broker, config.settings.
+    COMPONENTES RELACIONADOS: main.py (lo arranca en paso 12 y lo detiene primero
+        en el finally); MetricsCollector (métrica de salud "en vivo", complementaria);
+        go2rtc_manager (fuente de streams/consumidores).
+    PUNTO DE ENTRADA: singleton global `telemetry_recorder` (al final del módulo).
+    PIPELINE(S): transversal de observabilidad; arranca en Pipeline #1 (Inicio).
+--------------------------------------------------------------------------------
 """
 from __future__ import annotations
 
@@ -40,6 +57,11 @@ import psutil
 
 logger = logging.getLogger(__name__)
 
+# Columnas del CSV (orden fijo): una fila por muestra. Agrupadas por subsistema:
+# tiempo, sistema, procesos backend vs go2rtc, conteo de ffmpeg, streams/consumidores
+# de go2rtc, IA (activos/frames/latencia/fuente viva), WebSocket, executor,
+# grabaciones activas y nº de hilos del proceso. Si se añade un campo, añadirlo
+# aquí (los faltantes se rellenan vacíos en `_loop` por seguridad).
 _CSV_FIELDS = [
     "t", "clock",
     "sys_cpu", "sys_ram_pct", "sys_ram_used_mb",
@@ -57,6 +79,27 @@ _CSV_FIELDS = [
 
 
 class TelemetryRecorder:
+    """
+    SINGLETON grabador de telemetría a disco (arranca en main, paso 12).
+
+    ROL: muestrea periódicamente el estado de todos los subsistemas y lo escribe
+    fila-a-fila (CSV + snapshots JSONL) con flush/fsync → caja negra resistente a
+    crashes. Es OBSERVADOR puro: no modifica nada del sistema.
+
+    SINGLETON (patrón `__new__` con doble-check lock): una instancia por proceso;
+    `_init()` corre una sola vez. Se expone como `telemetry_recorder` al final del
+    módulo. Lo arranca/detiene main.py; nadie más debería instanciarlo.
+
+    HILOS: usa DOS hilos daemon —
+        `_loop`        : muestreo principal cada `interval` s (escribe CSV/JSONL).
+        `_go2rtc_loop` : refresca en caché la consulta HTTP a go2rtc cada ~3s, AISLADA
+                         para que un go2rtc lento/caído no frene el muestreo principal.
+
+    DEPENDENCIAS: psutil; container (ai_service/recording_manager solo si ya
+    construido — no lo fuerza para no cargar torch desde aquí); executor; ws_broker.
+
+    PIPELINE: transversal de observabilidad (arranca en Pipeline #1).
+    """
     _instance: Optional["TelemetryRecorder"] = None
     _new_lock = threading.Lock()
 
@@ -87,6 +130,16 @@ class TelemetryRecorder:
 
     # ------------------------------------------------------------------
     def start(self, interval: float = 2.0, out_dir: str = "") -> bool:
+        """
+        Propósito: abrir los ficheros de salida y lanzar los dos hilos de muestreo.
+            Etapa: Pipeline #1 (lo llama main, paso 12). Idempotente (no-op si ya corre).
+        Inputs: interval (s entre muestras, clamp a >=0.5); out_dir (default
+            `<repo>/telemetry/`, o TELEMETRY_PATH del .env).
+        Outputs: bool — True si arrancó (o ya estaba), False si falló al abrir ficheros.
+        Efectos: crea telemetry_<fecha>.csv + .jsonl, registra `stop` en atexit.
+        Excepciones: capturadas → devuelve False y loguea.
+        Llamado por: main.py. Llama a: threading (hilos _loop y _go2rtc_loop).
+        """
         if self._running:
             return True
         try:
@@ -315,6 +368,14 @@ class TelemetryRecorder:
 
     # ------------------------------------------------------------------
     def stop(self) -> None:
+        """
+        Propósito: apagado ordenado — baja `_running`, hace join de ambos hilos
+            (salvo si se llama desde uno de ellos, p.ej. atexit), y cierra los
+            ficheros con flush+fsync para no perder la última muestra. Etapa:
+            Pipeline #1 (main lo invoca PRIMERO en el finally; también vía atexit).
+        Inputs/Outputs: ninguno. Idempotente. Excepciones: capturadas al cerrar.
+        Llamado por: main.py (finally) y atexit.
+        """
         if not self._running:
             return
         self._running = False

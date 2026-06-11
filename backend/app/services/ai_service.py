@@ -1,3 +1,49 @@
+"""
+================================================================================
+MÓDULO: services.ai_service — Servicio de inferencia IA (Pipeline #9)
+================================================================================
+
+PROPÓSITO
+    Gestiona el ciclo de vida de la detección por IA (YOLOv8): activar/desactivar
+    por cámara (y por lente en cámaras dual), enrutar las detecciones hacia el
+    EventManager y mantener el estado de los schedulers activos.
+
+RESPONSABILIDAD PRINCIPAL
+    Ser el orquestador entre la fuente de frames de IA y el bus de eventos:
+      AIFrameSource (ffmpeg ligero del substream go2rtc)
+        → AIScheduler (motion-gated YOLO, cooldown por clase)
+        → _handle_detection → guarda snapshot → event_manager.emit()
+    Verifica las dependencias (torch/ultralytics) UPFRONT para que el endpoint
+    devuelva 503 + AI_DEPENDENCIES_MISSING en vez de morir en el hilo worker.
+
+DEPENDENCIAS
+    processing.ai.ai_scheduler ... AIScheduler (worker que corre YOLO)
+    processing.ai.ai_frame_source  AIFrameSource (lee el substream bajo de go2rtc)
+    processing.ai.model_pool ..... YLOModelPool.check_dependencies / warmup
+    events.event_manager ......... emite EventData (Pipeline #10 Eventos)
+    cameras.camera_manager ....... resuelve nombre/flags de cámara
+    container.recording_manager .. grabación continua (clip por splice)
+
+COMPONENTES RELACIONADOS
+    Lo INSTANCIA: DependencyContainer (container.py) con CameraManager →
+        singleton `ai_service`.
+    Lo CONSUME: blueprint `ai_bp` (api/routes/ai.py) — activate/deactivate/
+        status/change_mode.
+
+CLAVE INTERNA
+    Los schedulers/fuentes se indexan por (camera_id, lens) con lens ∈
+    {"main","l1","l2"}. Regla de EXCLUSIVIDAD: solo un lente por cámara puede
+    tener IA a la vez (la inferencia es cara y la alerta es la misma).
+
+PUNTO DE ENTRADA
+    `AIService(...).activate_ai(camera_id, lens, mode)` arranca el Pipeline #9.
+
+PIPELINE(S)
+    #9 IA — etapa completa: motion → YOLO → detección. Encadena con #10 Eventos
+    (emite EventData) y con #11 Grabación (fuerza grabación continua para poder
+    extraer el clip del evento por splice).
+================================================================================
+"""
 import time
 import logging
 import threading
@@ -16,10 +62,17 @@ _VALID_LENSES = ("main", "l1", "l2")
 
 class AIService:
     """
-    Servicio singleton que gestiona el procesamiento de IA para cámaras.
+    Servicio singleton que gestiona el procesamiento de IA para cámaras (#9).
 
-    Las cámaras dual-lens pueden activar IA por lente (l1, l2) por separado.
-    La clave interna de schedulers es (camera_id, lens).
+    Rol: dueño de los schedulers de IA y puente hacia el bus de eventos. Cada IA
+    activa tiene su propia AIFrameSource (independiente del FrameDistributor del
+    CameraManager) que lee el substream bajo de go2rtc → así corre aunque la
+    cámara no esté "activa" en el CameraManager.
+
+    Lo instancia: container.py con CameraManager (singleton `ai_service`).
+    Lo consume: api/routes/ai.py (ai_bp).
+    Estado vivo: _schedulers y _sources, indexados por (camera_id, lens) y
+        protegidos por self._lock.
     """
 
     def __init__(self, camera_manager: CameraManager):
@@ -87,6 +140,16 @@ class AIService:
         frame,
         metadata: Optional[dict] = None
     ) -> None:
+        """
+        Puente detección IA → bus de eventos (#9 → #10). Lo invoca el
+        AIScheduler en cada detección confirmada.
+
+        Guarda el SNAPSHOT en disco ANTES de emitir el evento (con ruta ABSOLUTA)
+        para evitar una race condition: event_manager.emit() dispara a TODOS los
+        subscribers en paralelo, así que si dejáramos que EventService lo guardara
+        después, TelegramNotifier/NotificationRouter podrían recibir
+        snapshot_path=None y mandar solo texto.
+        """
         metadata = metadata or {}
 
         if self._event_callback:
@@ -175,14 +238,24 @@ class AIService:
     def activate_ai(self, camera_id: int, lens: str = "main",
                     mode: str = "low_cpu") -> bool:
         """
-        Activa IA en una cámara (y opcionalmente en un lente concreto).
+        Activa la IA en una cámara/lente — etapa de arranque del Pipeline #9.
+
+        Flujo: verifica dependencias UPFRONT → valida exclusividad de lente →
+        crea AIFrameSource + AIScheduler → registra callback de detección →
+        persiste has_ai=True → fuerza grabación continua (para el clip por splice).
 
         Para cámaras mono → lens="main".
         Para cámaras dual-lens → lens="l1" o "l2" para procesar solo ese lente.
 
-        Devuelve False si faltan dependencias (torch/ultralytics) o la cámara
-        no tiene distributor activo. Lanza RuntimeError si faltan dependencias
-        para que el endpoint HTTP pueda devolver un 503 con mensaje útil.
+        Inputs: camera_id; lens ∈ {"main","l1","l2"}; mode (p.ej. "low_cpu").
+        Outputs: True si se activó; False si se superó el límite (sin GPU) o el
+            lente es inválido para una cámara no dual.
+        Excepciones: RuntimeError si faltan dependencias (torch/ultralytics) → el
+            endpoint lo traduce a 503 + AI_DEPENDENCIES_MISSING; o si ya hay IA
+            activa en OTRO lente de la misma cámara (exclusividad).
+        Llamado por: POST /api/v1/ai/<id>/activate (ai_bp).
+        Llama a: YLOModelPool.check_dependencies/warmup, AIFrameSource,
+            AIScheduler, recording_manager.start_continuous_recording.
         """
         # Validación temprana de dependencias — falla rápido y con mensaje claro
         from ..processing.ai.model_pool import YLOModelPool
@@ -282,6 +355,11 @@ class AIService:
         logger.info(f"IA activada | cámara={camera_id} | lens={lens} | modo={mode}")
         # Persistir has_ai=True para reactivar en el próximo arranque del backend
         self._persist_has_ai(camera_id, True)
+        # Persistir el LENTE elegido (dual-lens) para restaurarlo al rearrancar.
+        # Sin esto, el auto-arranque usaba siempre l1 y "perdía" la elección del
+        # usuario (l2) en cualquier reinicio de la cámara o del backend.
+        if lens in ("l1", "l2"):
+            self._persist_ai_lens(camera_id, lens)
 
         # La IA SIEMPRE debe ir acompañada de grabación continua: el clip del
         # evento detectado se extrae por splice del archivo continuo. Si no está
@@ -309,7 +387,50 @@ class AIService:
         except Exception as e:
             logger.warning(f"No se pudo persistir has_ai={has_ai} cam={camera_id}: {e}")
 
+    def _persist_ai_lens(self, camera_id: int, lens: str) -> None:
+        """Guarda el LENTE de IA activo (dual-lens) en SystemConfig (clave
+        ai_lens_<id>) para restaurarlo al rearrancar la cámara/backend. Usa
+        SystemConfig (clave-valor) para no requerir una migración de esquema."""
+        try:
+            from backend.app.database.connection import db_manager
+            from backend.app.database.models import SystemConfig
+            key = f"ai_lens_{camera_id}"
+            with db_manager.get_session() as session:
+                row = session.query(SystemConfig).filter_by(key=key).first()
+                if row is None:
+                    session.add(SystemConfig(key=key, value=lens))
+                else:
+                    row.value = lens
+                session.commit()
+        except Exception as e:
+            logger.debug(f"No se pudo persistir ai_lens cam={camera_id}: {e}")
+
+    def get_persisted_ai_lens(self, camera_id: int, default: str = "l1") -> str:
+        """Lee el lente de IA persistido (dual-lens) para restaurarlo en el
+        auto-arranque. Devuelve `default` ('l1') si no hay nada guardado."""
+        try:
+            from backend.app.database.connection import db_manager
+            from backend.app.database.models import SystemConfig
+            key = f"ai_lens_{camera_id}"
+            with db_manager.get_session() as session:
+                row = session.query(SystemConfig).filter_by(key=key).first()
+                if row and row.value in ("l1", "l2"):
+                    return row.value
+        except Exception as e:
+            logger.debug(f"No se pudo leer ai_lens cam={camera_id}: {e}")
+        return default
+
     def deactivate_ai(self, camera_id: int, lens: str = "main") -> bool:
+        """
+        Detiene la IA de una cámara/lente: para el scheduler y su fuente.
+
+        Solo desmarca has_ai en BD si NO queda otro lente con IA activa en la
+        misma cámara (en dual-lens podría quedar el otro lente corriendo).
+
+        Inputs: camera_id, lens.
+        Outputs: True si había IA activa y se detuvo; False si no la había.
+        Llamado por: POST /api/v1/ai/<id>/deactivate (ai_bp).
+        """
         lens = self._normalize_lens(lens)
         key = (camera_id, lens)
 
@@ -341,7 +462,56 @@ class AIService:
             self._persist_has_ai(camera_id, False)
         return True
 
+    def stop_ai_runtime(self, camera_id: int) -> bool:
+        """
+        Detiene la IA EN RUNTIME (scheduler + fuente) de TODOS los lentes de una
+        cámara, SIN tocar has_ai en BD.
+
+        Diferencia con deactivate_ai: aquel persiste has_ai=False (es una
+        desactivación deliberada del usuario). Este se usa al PARAR/apagar la
+        cámara: la IA debe dejar de consumir recursos (si no, el AIFrameSource
+        seguiría reconectando a un stream go2rtc inexistente), pero has_ai debe
+        CONSERVARSE para que, al re-encender la cámara, _auto_start_ai_if_needed
+        vuelva a arrancar la IA sola.
+
+        Inputs: camera_id.
+        Outputs: True si se detuvo alguna instancia de IA; False si no había.
+        Llamado por: CameraManager.stop_camera().
+        """
+        with self._lock:
+            keys = {k for k in self._schedulers if k[0] == camera_id} | \
+                   {k for k in self._sources if k[0] == camera_id}
+
+        stopped = False
+        for key in keys:
+            with self._lock:
+                scheduler = self._schedulers.pop(key, None)
+                source = self._sources.pop(key, None)
+            if scheduler:
+                try:
+                    scheduler.stop()
+                except Exception as e:
+                    logger.error(f"Error deteniendo scheduler: {e}")
+                stopped = True
+            if source:
+                try:
+                    source.stop()
+                except Exception as e:
+                    logger.error(f"Error deteniendo fuente IA: {e}")
+                stopped = True
+
+        if stopped:
+            logger.info(
+                f"IA detenida en runtime (has_ai intacto) | cámara={camera_id}"
+            )
+        return stopped
+
     def change_mode(self, camera_id: int, mode: str, lens: str = "main") -> bool:
+        """
+        Cambia el modo del scheduler en caliente (sin reiniciar la fuente).
+        Outputs: True si hay IA activa en ese (camera_id, lens); False si no.
+        Llamado por: endpoint de cambio de modo de ai_bp.
+        """
         lens = self._normalize_lens(lens)
         with self._lock:
             scheduler = self._schedulers.get((camera_id, lens))
@@ -359,6 +529,13 @@ class AIService:
             return (camera_id, lens) in self._schedulers
 
     def get_ai_status(self) -> dict:
+        """
+        Estado global de IA: lista de (camera_id, lens) activos, conteo, GPU y
+        stats por scheduler.
+
+        Outputs: dict {active, active_count, gpu_available, schedulers}.
+        Llamado por: GET /api/v1/ai/status (ai_bp, endpoint de polling de la UI).
+        """
         with self._lock:
             snapshot = dict(self._schedulers)
 
@@ -382,6 +559,8 @@ class AIService:
     # Shutdown
     # ------------------------------------------------------------------
     def stop_all(self) -> None:
+        """Apagado ordenado: detiene todos los schedulers y fuentes de IA.
+        Usado en el shutdown del backend; no persiste cambios de has_ai."""
         with self._lock:
             sched_snap = dict(self._schedulers)
             src_snap = dict(self._sources)

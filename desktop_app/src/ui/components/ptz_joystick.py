@@ -1,10 +1,42 @@
 """
-Control PTZ tipo joystick con layout 3×3 + zoom + control de velocidad.
+================================================================================
+MÓDULO: ui.components.ptz_joystick — Joystick PTZ (control de movimiento, #8)
+================================================================================
 
-Patrón estándar NVR (Hikvision, Dahua, Milestone): press → start continuous
-move; release → stop. NO usa auto-repeat — el ONVIF `ContinuousMove` ya
-mueve la cámara continuamente hasta recibir `Stop`. El auto-repeat causaba
-spam de requests y rate-limit.
+PROPÓSITO
+    Control PTZ tipo joystick con layout 3×3 (8 direcciones + stop) + zoom
+    in/out + slider de velocidad. Es un widget PURAMENTE de presentación:
+    emite SEÑALES Qt con la dirección y la velocidad; NO conoce la cámara ni
+    hace ninguna llamada REST.
+
+RESPONSABILIDAD
+    - Pintar los botones direccionales, de zoom y el slider de velocidad.
+    - Traducir press/release de cada botón en señales move(direction, speed) /
+      stop() que la vista (o CameraControlPanel) traduce en llamadas al backend.
+
+PIPELINE
+    #8 PTZ. El flujo es: usuario pulsa → este widget emite move/stop →
+    CameraControlPanel._on_ptz_move/_on_ptz_stop → api_client.post →
+    POST /api/v1/cameras/<id>/ptz/<direction|stop> → backend ptz_controller
+    → ONVIF ContinuousMove/Stop a la cámara.
+
+PATRÓN DE INTERACCIÓN — POR QUÉ SIN AUTO-REPEAT
+    Patrón estándar NVR (Hikvision, Dahua, Milestone): press → start continuous
+    move; release → stop. NO usa auto-repeat — el ONVIF `ContinuousMove` ya
+    mueve la cámara continuamente hasta recibir `Stop`. El auto-repeat causaba
+    spam de requests y rate-limit.
+
+DEPENDENCIAS
+    PySide6 (QWidget/QGridLayout/QSlider/QPushButton/Signal), config (colores
+    del tema para los estilos QSS).
+
+COMPONENTES RELACIONADOS
+    camera_control_panel.py (lo instancia en la pestaña "Movimiento" y conecta
+    sus señales a las llamadas REST PTZ).
+
+DÓNDE SE USA
+    Dentro de CameraControlPanel._build_movement_tab(); no se usa suelto.
+================================================================================
 """
 import logging
 
@@ -23,9 +55,21 @@ class PTZJoystick(QWidget):
     """
     Joystick PTZ visual con 8 direcciones + stop + zoom + velocidad.
 
-    Emite:
-      - move(direction: str, speed: float) cuando se presiona un botón direccional
-      - stop()                              cuando se suelta
+    Rol: widget de presentación del control PTZ (no habla con el backend).
+
+    Quién la instancia/consume:
+        CameraControlPanel la crea en la pestaña "Movimiento" y conecta sus
+        señales move/stop a _on_ptz_move/_on_ptz_stop, que sí hacen el POST REST.
+
+    SEÑALES Qt que EMITE:
+      - move(direction: str, speed: float): al presionar un botón direccional o
+        de zoom. `direction` ∈ {up, down, left, right, up_left, up_right,
+        down_left, down_right, zoom_in, zoom_out} (compatible con el backend
+        ptz_controller); `speed` ∈ 0.1-1.0 (del slider de velocidad).
+      - stop(): al soltar cualquier botón o pulsar el botón central rojo.
+    SEÑALES que RECIBE: ninguna (es fuente de eventos, no consumidor).
+
+    Dependencias: config (estilos QSS), logging (traza de press/release/stop).
     """
 
     move = Signal(str, float)
@@ -223,19 +267,29 @@ class PTZJoystick(QWidget):
     # ------------------------------------------------------------------
     def _on_press(self, direction: str):
         """
-        Envía UN solo comando ContinuousMove cuando se presiona el botón.
-        La cámara seguirá moviéndose hasta recibir Stop (al release).
+        Emite move(direction, speed) UNA vez al presionar el botón. La cámara
+        seguirá moviéndose (ContinuousMove) hasta recibir Stop (en el release).
+
+        Inputs: direction (clave de dirección/zoom del botón pulsado).
+        Señales: emite move(direction, self._speed).
+        Llamado por: el slot pressed de cada botón direccional/zoom.
         """
         logger.debug(f"PTZ press: {direction} @ speed={self._speed:.2f}")
         self.move.emit(direction, self._speed)
 
     def _on_release(self):
-        """Envía Stop cuando se suelta el botón."""
+        """Emite stop() al soltar el botón (detiene el ContinuousMove).
+
+        Señales: emite stop(). Llamado por: el slot released de los botones.
+        """
         logger.debug("PTZ release → stop")
         self.stop.emit()
 
     def _on_stop_click(self):
-        """Botón central rojo: stop explícito (por si quedó moviéndose)."""
+        """Botón central rojo: stop explícito (por si quedó moviéndose).
+
+        Señales: emite stop(). Llamado por: clicked del botón central.
+        """
         logger.debug("PTZ stop (manual)")
         self.stop.emit()
 

@@ -1,3 +1,36 @@
+/*
+ * ============================================================================
+ * MÓDULO: RecordingsFragment — Lista plana de grabaciones (CamLink)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Pantalla que lista TODAS las grabaciones disponibles (sin filtro de cámara
+ *   ni fecha) en un RecyclerView, con pull-to-refresh y estados de carga/vacío/
+ *   error. Tocar una grabación la abre en PlaybackFragment.
+ *
+ * RESPONSABILIDAD
+ *   - Pedir las grabaciones al backend (GET /recordings) y volcarlas al adapter.
+ *   - Gestionar los estados visuales (cargando, contenido, vacío, error+reintento).
+ *   - Navegar a la reproducción pasando solo el `recordingId` (modo legado, una
+ *     única grabación).
+ *
+ * DEPENDENCIAS
+ *   - RetrofitClient + ApiService.getRecordings(): origen de datos.
+ *   - RecordingAdapter: render de cada fila.
+ *   - BaseMenuFragment: base común (menú de opciones de la toolbar).
+ *
+ * COMPONENTES RELACIONADOS
+ *   - RecordingsHostFragment / TimelineFragment: vistas hermanas de grabaciones
+ *     (con selector de cámara/fecha y reproducción en cadena del día).
+ *   - PlaybackFragment: destino de la reproducción.
+ *
+ * PUNTO DE ENTRADA
+ *   Destino de Navigation que muestra la lista global de grabaciones.
+ *
+ * PIPELINE(S)
+ *   #14 Reproducción histórica — etapa de listado (consume /recordings).
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.os.Bundle
@@ -18,6 +51,16 @@ import com.ipn.mx.onvif.R
 import com.ipn.mx.onvif.network.RetrofitClient
 import kotlinx.coroutines.launch
 
+/**
+ * Fragment de la lista global de grabaciones.
+ *
+ * Rol: vista de listado simple del Pipeline #14. La instancia el NavController;
+ * en onViewCreated cablea el RecyclerView + SwipeRefresh y dispara la primera
+ * carga. Usa `viewLifecycleOwner.lifecycleScope` para que las corrutinas de red
+ * se cancelen al destruirse la vista.
+ *
+ * Dependencias: RecordingAdapter (filas) y ApiService.getRecordings (datos).
+ */
 class RecordingsFragment : BaseMenuFragment() {
 
     private lateinit var adapter: RecordingAdapter
@@ -67,6 +110,15 @@ class RecordingsFragment : BaseMenuFragment() {
         loadRecordings()
     }
 
+    /**
+     * Carga la lista de grabaciones del backend y actualiza la UI según el
+     * resultado (contenido / vacío / error).
+     *
+     * @param refresh true cuando viene del pull-to-refresh (no muestra el estado
+     *   de "cargando" a pantalla completa, solo el spinner del SwipeRefresh).
+     * Llamado por: onViewCreated (carga inicial), pull-to-refresh y botón de
+     * reintento. Usa endpoint GET /recordings (ApiService.getRecordings).
+     */
     private fun loadRecordings(refresh: Boolean = false) {
         if (!refresh) showLoading()
         val baseUrl = RetrofitClient.buildBaseUrl(requireContext()) ?: run {

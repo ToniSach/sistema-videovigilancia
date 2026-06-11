@@ -1,17 +1,46 @@
 """
-Blocklist de JWT revocados (logout, cambio de contraseña).
+================================================================================
+MÓDULO: core.jwt_blocklist — Revocación de JWT en dos capas (logout/cambio clave)
+================================================================================
 
-Capa primaria: diccionario en memoria {jti: exp_timestamp}, thread-safe,
-con GC automático que descarta entradas vencidas.
+PROPÓSITO
+    Mantener la lista de tokens JWT revocados para que un logout (o un cambio de
+    contraseña) invalide tokens que aún no han expirado por su `exp`. flask_jwt_
+    extended consulta `is_revoked(jti)` en cada request protegido.
 
-Capa de persistencia opcional: tabla `revoked_tokens` en la BD principal.
-- Cuando se revoca un jti se intenta persistir (best-effort: si falla, sólo
-  queda en memoria y se loguea warning).
-- Al arrancar `rehydrate_from_db()` carga los jti aún vigentes para que un
-  logout no se "olvide" si el backend se reinicia 5 min después.
+RESPONSABILIDAD PRINCIPAL
+    Capa primaria: diccionario en memoria {jti: exp_timestamp}, thread-safe,
+    con GC automático que descarta entradas vencidas.
 
-Esto cubre el caso típico de LAN single-process. Para multi-proceso o alta
-sensibilidad → Redis con TTL (refactor menor en esta misma clase).
+    Capa de persistencia opcional: tabla `revoked_tokens` en la BD principal.
+    - Cuando se revoca un jti se intenta persistir (best-effort: si falla, sólo
+      queda en memoria y se loguea warning).
+    - Al arrancar `rehydrate_from_db()` carga los jti aún vigentes para que un
+      logout no se "olvide" si el backend se reinicia 5 min después.
+
+    Esto cubre el caso típico de LAN single-process. Para multi-proceso o alta
+    sensibilidad → Redis con TTL (refactor menor en esta misma clase).
+
+DEPENDENCIAS
+    threading ................. lock e instancia thread-safe.
+    database.connection ....... db_manager (sesiones) — import diferido.
+    database.models.RevokedToken ... tabla de persistencia — import diferido.
+
+COMPONENTES RELACIONADOS
+    main.create_app() ......... registra @jwt.token_in_blocklist_loader →
+                                is_revoked, y llama rehydrate_from_db() al
+                                arrancar (paso 5 del pipeline #1).
+    services.auth_service ..... llama revoke() en logout / cambio de contraseña.
+
+PUNTO DE ENTRADA EN LA ARQUITECTURA
+    Singleton global `jwt_blocklist` al pie del módulo. Estado vivo en memoria de
+    proceso (encaja con la restricción de PROCESO ÚNICO); la BD es solo respaldo
+    para sobrevivir reinicios.
+
+PIPELINE(S)
+    Pipeline #2 (Autenticación): revoke() al cerrar sesión; is_revoked() en cada
+    request protegido; rehydrate_from_db() en el arranque (#1, paso 5).
+================================================================================
 """
 from __future__ import annotations
 
@@ -24,11 +53,26 @@ logger = logging.getLogger(__name__)
 
 
 class JWTBlocklist:
-    """Singleton thread-safe con persistencia opcional a BD."""
+    """
+    Registro de jti revocados, thread-safe, con persistencia opcional a BD.
+
+    ROL: responder is_revoked(jti) para el loader de flask_jwt_extended y
+    registrar revocaciones en logout/cambio de clave.
+
+    SINGLETON (por qué): debe haber UN solo registro de revocaciones por proceso
+    para que cualquier hilo que atienda un request vea las mismas revocaciones.
+    Doble-check con `_instance_lock` para que sea seguro bajo concurrencia. El
+    estado vive en memoria (encaja con PROCESO ÚNICO) y se respalda en la tabla
+    `revoked_tokens` para sobrevivir reinicios.
+
+    QUIÉN LO INSTANCIA / CONSUME: instancia global `jwt_blocklist` al pie del
+    módulo; lo consumen el loader JWT (is_revoked) y AuthService (revoke).
+    """
     _instance = None
     _instance_lock = threading.Lock()
 
     def __new__(cls):
+        """Devuelve el singleton, creándolo bajo lock la primera vez."""
         if cls._instance is None:
             with cls._instance_lock:
                 if cls._instance is None:
@@ -36,6 +80,8 @@ class JWTBlocklist:
         return cls._instance
 
     def __init__(self):
+        """Inicializa el dict de revocados, el lock y el estado de GC/rehidrtado
+        una sola vez (idempotente: protegido por el flag `_initialized`)."""
         if hasattr(self, "_initialized"):
             return
         self._initialized = True
@@ -49,8 +95,15 @@ class JWTBlocklist:
     def revoke(self, jti: str, exp: float, user_id: int | None = None,
                 reason: str = "logout") -> None:
         """
-        Marca un jti como revocado hasta su exp original. Persiste en BD
-        si la tabla existe (best-effort: nunca rompe el flujo de logout).
+        Revoca un token por su jti hasta su exp original (pipeline #2).
+
+        Inputs: jti (id único del token), exp (timestamp UNIX de expiración),
+            user_id (opcional, para auditoría), reason ("logout"/"password_change"
+            /...). No hace nada si jti o exp son falsy.
+        Outputs: None. Añade el jti en memoria y lo persiste en BD best-effort
+            (un fallo de BD se loguea pero NO rompe el logout).
+        Llamado por: AuthService al cerrar sesión o cambiar contraseña.
+        Llama a: _persist_revocation, _maybe_gc.
         """
         if not jti or not exp:
             return
@@ -61,6 +114,15 @@ class JWTBlocklist:
         self._persist_revocation(jti, float(exp), user_id, reason)
 
     def is_revoked(self, jti: str) -> bool:
+        """
+        Indica si un token está revocado (consultado en CADA request protegido).
+
+        Inputs: jti del token a comprobar.
+        Outputs: bool — True solo si el jti está revocado Y todavía vigente. Si
+            ya pasó su exp, se descarta del dict y devuelve False (el token caduca
+            por sí solo). Dispara un GC oportunista de entradas vencidas.
+        Llamado por: el loader @jwt.token_in_blocklist_loader de main.create_app().
+        """
         if not jti:
             return False
         now = time.time()
@@ -76,6 +138,7 @@ class JWTBlocklist:
             return True
 
     def size(self) -> int:
+        """Número de tokens revocados actualmente en memoria (diagnóstico)."""
         with self._lock:
             return len(self._revoked)
 
@@ -83,8 +146,15 @@ class JWTBlocklist:
 
     def rehydrate_from_db(self) -> int:
         """
-        Lee tokens revocados vigentes de la BD al arrancar y los carga en
-        memoria. Devuelve cuántos se cargaron. Llamar UNA vez en startup.
+        Rehidrata la blocklist desde la BD al arrancar (pipeline #1, paso 5).
+
+        Carga en memoria los `revoked_tokens` aún vigentes y purga de la tabla
+        los ya expirados (GC oportunista). Idempotente: solo actúa la 1ª vez
+        (flag `_rehydrated`).
+
+        Outputs: int — nº de tokens cargados. Si la tabla no existe (BD sin
+            migrar) NO falla: loguea warning y la blocklist queda solo en memoria.
+        Llamado por: main.create_app() tras init_db().
         """
         if self._rehydrated:
             return 0

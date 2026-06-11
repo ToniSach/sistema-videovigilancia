@@ -1,3 +1,33 @@
+/*
+ * ============================================================================
+ * MÓDULO: RecordingAdapter — Adaptador RecyclerView de grabaciones (CamLink)
+ * ============================================================================
+ *
+ * PROPÓSITO
+ *   Adaptador que pinta cada grabación (RecordingResponse) como una fila
+ *   (item_recording): título con fecha/hora legible, subtítulo con duración y
+ *   cámara, icono de alerta y botón de favorito.
+ *
+ * RESPONSABILIDAD
+ *   - Enlazar los datos de cada RecordingResponse a su ViewHolder.
+ *   - Propagar los gestos a los callbacks `onPlay` (tocar fila/botón play) y
+ *     `onFavorite` (estrella).
+ *   - Formatear fecha/hora (ISO → "dd MMM yyyy · HH:mm") y duración (m:ss).
+ *
+ * DEPENDENCIAS
+ *   - model.RecordingResponse: DTO de cada grabación.
+ *   - Layout item_recording (vistas de la fila).
+ *
+ * COMPONENTES RELACIONADOS
+ *   - RecordingsFragment: lo crea y le inyecta los callbacks de navegación.
+ *
+ * PUNTO DE ENTRADA
+ *   Se instancia desde RecordingsFragment.onViewCreated.
+ *
+ * PIPELINE(S)
+ *   #14 Reproducción histórica — etapa de listado (UI).
+ * ============================================================================
+ */
 package com.ipn.mx.onvif.ui
 
 import android.view.LayoutInflater
@@ -12,6 +42,16 @@ import com.ipn.mx.onvif.model.RecordingResponse
 import java.text.SimpleDateFormat
 import java.util.Locale
 
+/**
+ * Adaptador de la lista de grabaciones.
+ *
+ * Rol: render del listado del Pipeline #14. Lo crea RecordingsFragment, que le
+ * pasa los callbacks de interacción.
+ *
+ * @property items lista mutable interna de grabaciones (se reemplaza vía submitList).
+ * @property onPlay invocado al tocar la fila o el botón play (abre PlaybackFragment).
+ * @property onFavorite invocado al tocar la estrella (marcar/desmarcar favorito).
+ */
 class RecordingAdapter(
     private val items: MutableList<RecordingResponse> = mutableListOf(),
     private val onPlay:     (RecordingResponse) -> Unit,
