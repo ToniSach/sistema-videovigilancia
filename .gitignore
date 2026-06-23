@@ -91,7 +91,16 @@ htmlcov/
 backend/tests/img3.jpg
 backend/tests/img4.jpg
 backend/tests/img5.jpg
-.env.example
+
+# ----- Plantilla de entorno (SÍ se versiona; plantilla SIN secretos) -----
+!.env.example
+
+# ----- Telemetría / benchmarking (datos generados, no versionar) -----
+telemetry/*.csv
+telemetry/*.jsonl
+
+# ----- Empaquetado del producto final (.exe) -----
+NVR-VMS-build/
 
 
 
